@@ -20,14 +20,13 @@ void test_configured_opus_jitter_applies_to_all_supported_frame_sizes() {
           opus_network_clock::FAST_FRAME_COUNT,
           opus_network_clock::BALANCED_FRAME_COUNT,
           opus_network_clock::STABLE_FRAME_COUNT}) {
-        require(jitter_floor_packets_for_audio(AudioCodec::Opus, frame_count, 12) == 12,
+        require(jitter_floor_packets_for_audio(frame_count, 12) == 12,
                 "configured Opus jitter should apply to every supported Opus frame size");
     }
 }
 
 void test_configured_opus_jitter_is_clamped() {
-    require(jitter_floor_packets_for_audio(AudioCodec::Opus,
-                                           opus_network_clock::FAST_FRAME_COUNT, 999) ==
+    require(jitter_floor_packets_for_audio(opus_network_clock::FAST_FRAME_COUNT, 999) ==
                 MAX_OPUS_JITTER_PACKETS,
             "configured Opus jitter should be clamped to the maximum");
 }
@@ -98,36 +97,30 @@ void test_jitter_packet_count_round_trips_to_effective_ms() {
 
 void test_auto_start_target_does_not_snap_to_floor_before_ready() {
     require(!jitter_target_should_snap_to_floor(
-                AudioCodec::Opus, false, true, false,
+                false, true, false,
                 DEFAULT_OPUS_AUTO_START_JITTER_PACKETS, DEFAULT_OPUS_JITTER_PACKETS),
             "auto jitter should preserve the startup cushion before the buffer is ready");
 }
 
 void test_non_auto_target_snaps_to_floor_before_ready() {
     require(jitter_target_should_snap_to_floor(
-                AudioCodec::Opus, false, false, false,
+                false, false, false,
                 DEFAULT_OPUS_AUTO_START_JITTER_PACKETS, DEFAULT_OPUS_JITTER_PACKETS),
             "non-auto jitter should snap a not-ready target back to the configured floor");
 }
 
 void test_target_raises_when_floor_increases() {
     require(jitter_target_should_snap_to_floor(
-                AudioCodec::Opus, false, true, true,
+                false, true, true,
                 DEFAULT_OPUS_JITTER_PACKETS, DEFAULT_OPUS_AUTO_START_JITTER_PACKETS),
             "jitter target should rise when the configured floor rises above the target");
 }
 
 void test_manual_opus_target_is_owned_by_manual_override() {
     require(!jitter_target_should_snap_to_floor(
-                AudioCodec::Opus, true, false, false,
+                true, false, false,
                 DEFAULT_OPUS_JITTER_PACKETS, DEFAULT_OPUS_AUTO_START_JITTER_PACKETS),
             "manual Opus jitter should not be overwritten by packet floor updates");
-}
-
-void test_low_latency_pcm_keeps_smaller_floor() {
-    require(jitter_floor_packets_for_audio(AudioCodec::PcmInt16, 120,
-                                           DEFAULT_OPUS_JITTER_PACKETS) == 2,
-            "small PCM packets should keep the low latency PCM floor");
 }
 
 }  // namespace
@@ -145,7 +138,6 @@ int main() {
     test_non_auto_target_snaps_to_floor_before_ready();
     test_target_raises_when_floor_increases();
     test_manual_opus_target_is_owned_by_manual_override();
-    test_low_latency_pcm_keeps_smaller_floor();
 
     std::cout << "jitter policy self-test passed\n";
     return 0;

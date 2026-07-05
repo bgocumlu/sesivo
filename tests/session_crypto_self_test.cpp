@@ -57,7 +57,7 @@ void test_seal_open_round_trip_and_tamper_rejection() {
 
     const std::array<unsigned char, 4> payload{0x11, 0x22, 0x33, 0x44};
     const auto audio = audio_packet::create_audio_packet_v3(
-        AudioCodec::Opus, 42, 48000, 120, 1, payload.data(),
+        42, 48000, 120, 1, payload.data(),
         static_cast<uint16_t>(payload.size()), 123456789LL);
     require(audio != nullptr, "audio packet should build");
 

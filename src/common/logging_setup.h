@@ -12,6 +12,8 @@ constexpr int FLUSH_INTERVAL_MS = 3000;
 constexpr size_t DEFAULT_ROTATING_LOG_MAX_BYTES = 10ULL * 1024ULL * 1024ULL;
 constexpr size_t DEFAULT_ROTATING_LOG_MAX_FILES = 5;
 
+spdlog::level::level_enum default_level();
+
 void init(bool use_stdout = true, bool use_stderr = true, bool use_file = false,
           const std::string& file_path = "logs/app.log",
           spdlog::level::level_enum level = spdlog::level::debug,

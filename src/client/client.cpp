@@ -73,20 +73,6 @@
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
-static int normalized_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
-    (void)codec;
-    return frames_per_buffer;
-}
-
-static int normalize_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
-    const int normalized = normalized_buffer_frames_for_codec(codec, frames_per_buffer);
-    if (normalized != frames_per_buffer) {
-        spdlog::info("Normalizing buffer from {} to {} frames for Opus network pacing",
-                  frames_per_buffer, normalized);
-    }
-    return normalized;
-}
-
 constexpr uint32_t AUDIO_PATH_FEEDBACK_MIN_PACKETS = 20;
 constexpr double AUDIO_PATH_FEEDBACK_UNSTABLE_GAP_RATE = 0.05;
 constexpr double AUDIO_PATH_FEEDBACK_SEVERE_GAP_RATE = 0.25;
@@ -339,10 +325,8 @@ public:
     bool start_audio_stream(AudioStream::DeviceIndex input_device,
                             AudioStream::DeviceIndex output_device,
                             const AudioStream::AudioConfig& config = AudioStream::AudioConfig{}) {
-        stop_pcm_sender_thread();
+        stop_audio_sender_thread();
         AudioStream::AudioConfig runtime_config = config;
-        runtime_config.frames_per_buffer =
-            normalize_buffer_frames_for_codec(get_audio_codec(), runtime_config.frames_per_buffer);
 
         // Get input channel count from device info before creating encoder
         // (audio_.get_input_channel_count() returns 0 before stream starts)
@@ -397,7 +381,7 @@ public:
             audio_.start_audio_stream(input_device, output_device, runtime_config, audio_callback,
                                       this);
         if (success) {
-            start_pcm_sender_thread();
+            start_audio_sender_thread();
             audio_.print_latency_info();
         } else {
             // Clean up encoder if stream start failed
@@ -408,7 +392,7 @@ public:
 
     void stop_audio_stream() {
         audio_.stop_audio_stream();
-        stop_pcm_sender_thread();
+        stop_audio_sender_thread();
         stop_recording();
     }
 
@@ -724,8 +708,7 @@ public:
 
     void set_requested_frames_per_buffer(int frames_per_buffer) {
         auto config = get_audio_config();
-        config.frames_per_buffer =
-            normalize_buffer_frames_for_codec(get_audio_codec(), frames_per_buffer);
+        config.frames_per_buffer = frames_per_buffer;
         publish_audio_config(config);
     }
 
@@ -1094,18 +1077,6 @@ public:
         info.callback_count = callback_count_.load(std::memory_order_relaxed);
         info.over_deadline_count = callback_over_deadline_count_.load(std::memory_order_relaxed);
         return info;
-    }
-
-    AudioCodec get_audio_codec() const {
-        return audio_codec_.load(std::memory_order_acquire);
-    }
-
-    void set_audio_codec(AudioCodec codec) {
-        audio_codec_.store(codec, std::memory_order_release);
-        auto config = get_audio_config();
-        config.frames_per_buffer =
-            normalize_buffer_frames_for_codec(codec, config.frames_per_buffer);
-        publish_audio_config(config);
     }
 
     struct MetronomeState {
@@ -1766,12 +1737,9 @@ private:
 
     void clear_audio_path_queues() {
         // Precondition: the audio stream must be stopped. This resets decoder
-        // and PCM state that the audio callback mutates without locks; running
+        // state that the audio callback mutates without locks; running
         // it concurrently with the callback is undefined behavior.
         assert(!audio_.is_stream_active());
-        PcmSendFrame discarded_pcm;
-        while (pcm_send_queue_.try_dequeue(discarded_pcm)) {
-        }
         OpusSendFrame discarded_opus;
         while (opus_send_queue_.try_dequeue(discarded_opus)) {
         }
@@ -1789,8 +1757,6 @@ private:
             clear_opus_capture_chunks(participant);
             participant.opus_pcm_buffered_frames_observed.store(
                 0, std::memory_order_relaxed);
-            participant.last_pcm_valid = false;
-            participant.pcm_concealment_used = false;
             participant.buffer_ready.store(false, std::memory_order_relaxed);
             participant.opus_consecutive_empty_callbacks.store(
                 0, std::memory_order_relaxed);
@@ -1988,14 +1954,6 @@ private:
         return std::string(bytes.begin(), end);
     }
 
-    struct PcmSendFrame {
-        std::array<unsigned char, AUDIO_BUF_SIZE> payload{};
-        uint16_t payload_bytes = 0;
-        uint16_t frame_count = 0;
-        uint32_t sample_rate = 48000;
-        std::chrono::steady_clock::time_point capture_time;
-    };
-
     struct OpusSendFrame {
         std::array<float, 960> samples{};
         uint16_t frame_count = 0;
@@ -2120,14 +2078,14 @@ private:
         return steady_time_ns(time) + offset_ns;
     }
 
-    bool build_audio_packet_into(TxPacketBuffer& out, AudioCodec codec, uint32_t sequence,
-                                 uint32_t sample_rate, uint16_t frame_count,
-                                 uint8_t channels, const unsigned char* payload,
+    bool build_audio_packet_into(TxPacketBuffer& out, uint32_t sequence, uint32_t sample_rate,
+                                 uint16_t frame_count, uint8_t channels,
+                                 const unsigned char* payload,
                                  uint16_t payload_bytes,
                                  std::chrono::steady_clock::time_point capture_time) const {
         const auto capture_server_time_ns = server_time_for_steady_time_ns_if_ready(capture_time);
         return audio_packet::write_audio_packet_v3(
-            codec, sequence, sample_rate, frame_count, channels, payload, payload_bytes,
+            sequence, sample_rate, frame_count, channels, payload, payload_bytes,
             capture_server_time_ns.value_or(0), out.data(), out.capacity(), out.size);
     }
 
@@ -2169,25 +2127,22 @@ private:
                             next_metronome_boundary_beat());
     }
 
-    void start_pcm_sender_thread() {
-        if (pcm_sender_running_.exchange(true, std::memory_order_acq_rel)) {
+    void start_audio_sender_thread() {
+        if (audio_sender_running_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
 
-        pcm_sender_thread_ = std::thread([this]() { pcm_sender_loop(); });
+        audio_sender_thread_ = std::thread([this]() { audio_sender_loop(); });
     }
 
-    void stop_pcm_sender_thread() {
-        pcm_sender_running_.store(false, std::memory_order_release);
-        pcm_sender_wake_.store(true, std::memory_order_release);
-        pcm_sender_cv_.notify_one();
-        if (pcm_sender_thread_.joinable()) {
-            pcm_sender_thread_.join();
+    void stop_audio_sender_thread() {
+        audio_sender_running_.store(false, std::memory_order_release);
+        audio_sender_wake_.store(true, std::memory_order_release);
+        audio_sender_cv_.notify_one();
+        if (audio_sender_thread_.joinable()) {
+            audio_sender_thread_.join();
         }
 
-        PcmSendFrame discarded;
-        while (pcm_send_queue_.try_dequeue(discarded)) {
-        }
         OpusSendFrame discarded_opus;
         while (opus_send_queue_.try_dequeue(discarded_opus)) {
         }
@@ -2195,7 +2150,7 @@ private:
 
     void request_recent_opus_audio_packets_reset() {
         recent_opus_audio_packets_reset_requested_.store(true, std::memory_order_release);
-        wake_pcm_sender_thread();
+        wake_audio_sender_thread();
     }
 
     bool consume_recent_opus_audio_packets_reset_request_on_sender_thread() {
@@ -2238,39 +2193,13 @@ private:
 #endif
     };
 
-    void pcm_sender_loop() {
+    void audio_sender_loop() {
         ScopedSenderThreadPriority sender_priority;
         TxPacketBufferPool packet_pool;
         std::array<unsigned char, AUDIO_BUF_SIZE> encoded_data{};
 
-        while (pcm_sender_running_.load(std::memory_order_acquire)) {
+        while (audio_sender_running_.load(std::memory_order_acquire)) {
             consume_recent_opus_audio_packets_reset_request_on_sender_thread();
-
-            PcmSendFrame frame;
-            if (pcm_send_queue_.try_dequeue(frame)) {
-                if (!join_state_.can_send_audio()) {
-                    continue;
-                }
-                observe_pcm_send_queue_age(frame.capture_time);
-                TxPacketLease packet(packet_pool);
-                if (packet.get() == nullptr) {
-                    pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-
-                const uint32_t seq =
-                    audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
-                if (!build_audio_packet_into(
-                        *packet, AudioCodec::PcmInt16, seq, frame.sample_rate,
-                        frame.frame_count, 1, frame.payload.data(), frame.payload_bytes,
-                        frame.capture_time)) {
-                    pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-                observe_audio_packet_send_pacing();
-                send_audio_packet_sync(packet->data(), packet->size);
-                continue;
-            }
 
             OpusSendFrame opus_frame;
             if (opus_send_queue_.try_dequeue(opus_frame)) {
@@ -2295,7 +2224,7 @@ private:
                     const uint32_t seq =
                         audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
                     if (!build_audio_packet_into(
-                            *packet, AudioCodec::Opus, seq, opus_frame.sample_rate,
+                            *packet, seq, opus_frame.sample_rate,
                             opus_frame.frame_count, 1, encoded_data.data(), encoded_bytes,
                             opus_frame.capture_time)) {
                         opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
@@ -2317,10 +2246,10 @@ private:
                 continue;
             }
 
-            std::unique_lock<std::mutex> lock(pcm_sender_wait_mutex_);
-            pcm_sender_cv_.wait_for(lock, 1ms, [this]() {
-                return !pcm_sender_running_.load(std::memory_order_acquire) ||
-                       pcm_sender_wake_.exchange(false, std::memory_order_acq_rel);
+            std::unique_lock<std::mutex> lock(audio_sender_wait_mutex_);
+            audio_sender_cv_.wait_for(lock, 1ms, [this]() {
+                return !audio_sender_running_.load(std::memory_order_acquire) ||
+                       audio_sender_wake_.exchange(false, std::memory_order_acq_rel);
             });
         }
     }
@@ -2393,31 +2322,6 @@ private:
         return 3;
     }
 
-    void enqueue_pcm_send_frame(const unsigned char* payload, uint16_t payload_bytes,
-                                uint16_t frame_count, uint32_t sample_rate,
-                                std::chrono::steady_clock::time_point capture_time) {
-        const size_t max_queue_frames = max_send_queue_frames(frame_count);
-        while (pcm_send_queue_.size_approx() >= max_queue_frames) {
-            PcmSendFrame discarded;
-            if (!pcm_send_queue_.try_dequeue(discarded)) {
-                break;
-            }
-            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
-        }
-
-        PcmSendFrame frame;
-        std::memcpy(frame.payload.data(), payload, payload_bytes);
-        frame.payload_bytes = payload_bytes;
-        frame.frame_count = frame_count;
-        frame.sample_rate = sample_rate;
-        frame.capture_time = capture_time;
-        if (!pcm_send_queue_.try_enqueue(frame)) {
-            pcm_send_drops_.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        wake_pcm_sender_thread();
-    }
-
     void enqueue_opus_send_frame(const float* samples, uint16_t frame_count, uint32_t sample_rate,
                                  std::chrono::steady_clock::time_point capture_time) {
         if (!OpusEncoderWrapper::is_legal_frame_size(static_cast<int>(sample_rate), frame_count)) {
@@ -2443,7 +2347,7 @@ private:
             opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        wake_pcm_sender_thread();
+        wake_audio_sender_thread();
     }
 
     static uint16_t preferred_opus_tx_frame_count(uint32_t sample_rate,
@@ -2521,10 +2425,10 @@ private:
         }
     }
 
-    void wake_pcm_sender_thread() {
-        pcm_sender_wake_.store(true, std::memory_order_release);
+    void wake_audio_sender_thread() {
+        audio_sender_wake_.store(true, std::memory_order_release);
         if constexpr (AUDIO_CALLBACK_NOTIFY_ENABLED) {
-            pcm_sender_cv_.notify_one();
+            audio_sender_cv_.notify_one();
         }
     }
 
@@ -2916,19 +2820,12 @@ private:
         if (packet.frame_count <= 128) {
             base_limit = 8;
         }
-        if (packet.codec == AudioCodec::Opus) {
-            base_limit = std::max(base_limit, opus_queue_limit);
-        }
+        base_limit = std::max(base_limit, opus_queue_limit);
         return std::min(base_limit, MAX_OPUS_QUEUE_SIZE);
     }
 
     size_t jitter_floor_for_packet(const OpusPacket& packet) const {
-        return jitter_floor_packets_for_audio(packet.codec, packet.frame_count,
-                                              get_opus_jitter_buffer_packets());
-    }
-
-    static size_t pcm_drift_drop_threshold(const ParticipantData& participant) {
-        return participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) + 3;
+        return jitter_floor_packets_for_audio(packet.frame_count, get_opus_jitter_buffer_packets());
     }
 
     static size_t opus_latency_trim_threshold_packets(const ParticipantData& participant) {
@@ -2977,7 +2874,6 @@ private:
         const size_t current_target =
             participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
         if (jitter_target_should_snap_to_floor(
-                packet.codec,
                 participant.opus_jitter_manual_override.load(std::memory_order_relaxed),
                 participant.opus_jitter_auto_enabled.load(std::memory_order_relaxed),
                 participant.buffer_ready.load(std::memory_order_relaxed), current_target,
@@ -2985,18 +2881,6 @@ private:
             participant.jitter_buffer_min_packets.store(floor_packets,
                                                         std::memory_order_relaxed);
         }
-    }
-
-    void observe_pcm_send_queue_age(std::chrono::steady_clock::time_point capture_time) {
-        if (capture_time.time_since_epoch().count() == 0) {
-            return;
-        }
-
-        const auto age_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - capture_time)
-                                .count();
-        observe_latency_sample(pcm_send_queue_age_last_ns_, pcm_send_queue_age_avg_ns_,
-                               pcm_send_queue_age_max_ns_, age_ns);
     }
 
     void observe_opus_send_queue_age(std::chrono::steady_clock::time_point capture_time) {
@@ -3186,12 +3070,9 @@ private:
 
     void log_audio_diagnostics() {
         struct DropRate {
-            double pcm_send_per_sec;
             double opus_send_per_sec;
             double jitter_depth_per_sec;
             double jitter_age_per_sec;
-            double pcm_hold_per_sec;
-            double pcm_drift_drop_per_sec;
         };
 
         auto calculate_rate = [](uint64_t current, uint64_t previous, double elapsed_sec) {
@@ -3208,18 +3089,14 @@ private:
         }
         last_audio_health_log_time_ = now;
 
-        const uint64_t pcm_send_drops = pcm_send_drops_.load(std::memory_order_relaxed);
         const uint64_t opus_send_drops = opus_send_drops_.load(std::memory_order_relaxed);
         const uint64_t outbound_malformed_audio_drops =
             outbound_malformed_audio_drops_.load(std::memory_order_relaxed);
-        const double pcm_send_drop_rate =
-            calculate_rate(pcm_send_drops, last_pcm_send_drops_, elapsed_sec);
         const double opus_send_drop_rate =
             calculate_rate(opus_send_drops, last_opus_send_drops_, elapsed_sec);
         const double outbound_malformed_audio_drop_rate =
             calculate_rate(outbound_malformed_audio_drops,
                            last_outbound_malformed_audio_drops_, elapsed_sec);
-        last_pcm_send_drops_ = pcm_send_drops;
         last_opus_send_drops_ = opus_send_drops;
         last_outbound_malformed_audio_drops_ = outbound_malformed_audio_drops;
 
@@ -3229,25 +3106,25 @@ private:
         };
 
         spdlog::info(
-            "Audio diag: frames={} tx_packets={} tx_drops pcm/opus={}/{} "
+            "Audio diag: frames={} tx_packets={} tx_drops opus={} "
             "tx_malformed={} ({:.1f}/s) "
-            "sendq_age_ms last/avg/max/opus_p99={:.2f}/{:.2f}/{:.2f}/{:.2f} rx_bytes={} tx_bytes={}",
+            "sendq_age_ms opus_last/avg/max/p99={:.2f}/{:.2f}/{:.2f}/{:.2f} "
+            "rx_bytes={} tx_bytes={}",
                   current_audio_frames_per_buffer(),
                   audio_tx_sequence_.load(std::memory_order_relaxed),
-                  pcm_send_drops,
                   opus_send_drops,
                   outbound_malformed_audio_drops,
                   outbound_malformed_audio_drop_rate,
-                  ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
-                  ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
-                  ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
+                  ns_to_ms(opus_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
+                  ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
+                  ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
                   ns_to_ms(opus_send_queue_age_p99_ns_.load(std::memory_order_relaxed)),
                   total_bytes_rx_.load(std::memory_order_relaxed),
                   total_bytes_tx_.load(std::memory_order_relaxed));
 
         spdlog::info(
             "Latency diag: callback_ms last/avg/max/deadline={:.3f}/{:.3f}/{:.3f}/{:.3f} "
-            "over={} txq_ms pcm={:.3f}/{:.3f}/{:.3f} opus={:.3f}/{:.3f}/{:.3f} opus_p99={:.3f} "
+            "over={} txq_ms opus={:.3f}/{:.3f}/{:.3f} opus_p99={:.3f} "
             "encode_ms={:.3f}/{:.3f}/{:.3f} send_pace_ms={:.3f}/{:.3f}/{:.3f} "
             "rx_decode_ms={:.3f}/{:.3f}/{:.3f} rx_playout_ms={:.3f}/{:.3f}/{:.3f}",
             ns_to_ms(callback_last_ns_.load(std::memory_order_relaxed)),
@@ -3255,9 +3132,6 @@ private:
             ns_to_ms(callback_max_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(callback_deadline_ns_.load(std::memory_order_relaxed)),
             callback_over_deadline_count_.load(std::memory_order_relaxed),
-            ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(opus_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
             ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
@@ -3278,13 +3152,9 @@ private:
         for (const auto& p: participants) {
             auto& previous = participant_drop_snapshots_[p.id];
             DropRate drop_rate{
-                pcm_send_drop_rate,
                 opus_send_drop_rate,
                 calculate_rate(p.jitter_depth_drops, previous.jitter_depth_drops, elapsed_sec),
                 calculate_rate(p.jitter_age_drops, previous.jitter_age_drops, elapsed_sec),
-                calculate_rate(p.pcm_concealment_frames, previous.pcm_concealment_frames,
-                               elapsed_sec),
-                calculate_rate(p.pcm_drift_drops, previous.pcm_drift_drops, elapsed_sec),
             };
             const auto decoded_packet_rate = calculate_rate(
                 p.opus_packets_decoded_in_callback,
@@ -3300,8 +3170,6 @@ private:
                 p.opus_target_trim_drops, previous.opus_target_trim_drops, elapsed_sec);
             previous.jitter_depth_drops = p.jitter_depth_drops;
             previous.jitter_age_drops = p.jitter_age_drops;
-            previous.pcm_concealment_frames = p.pcm_concealment_frames;
-            previous.pcm_drift_drops = p.pcm_drift_drops;
             previous.opus_packets_decoded_in_callback = p.opus_packets_decoded_in_callback;
             previous.opus_queue_limit_drops = p.opus_queue_limit_drops;
             previous.opus_age_limit_drops = p.opus_age_limit_drops;
@@ -3311,8 +3179,8 @@ private:
 
             spdlog::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
-                "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} e2e_avg_ms={:.1f} e2e_max_ms={:.1f} drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/recovered/unresolved/late={}/{}/{}/{} "
-                "target_trim={} drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
+                "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} e2e_avg_ms={:.1f} e2e_max_ms={:.1f} drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/recovered/unresolved/late={}/{}/{}/{} "
+                "target_trim={} drop_rate opus/q/age={:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.jitter_buffer_min_packets,
                 p.opus_queue_limit_packets, p.last_packet_frame_count,
@@ -3322,13 +3190,13 @@ private:
                 p.capture_to_playout_latency_max_ms,
                 p.receiver_drift_ppm_last, p.receiver_drift_ppm_avg,
                 p.receiver_drift_ppm_abs_max,
-                p.underrun_count, p.pcm_concealment_frames, p.pcm_drift_drops,
-                p.jitter_depth_drops, p.jitter_age_drops, p.opus_queue_limit_drops,
+                p.underrun_count, p.jitter_depth_drops, p.jitter_age_drops,
+                p.opus_queue_limit_drops,
                 p.opus_age_limit_drops, p.opus_decode_buffer_overflow_drops,
                 p.sequence_gaps, p.sequence_gap_recoveries, p.sequence_unresolved_gaps,
                 p.sequence_late_or_reordered, p.opus_target_trim_drops,
-                drop_rate.pcm_send_per_sec, drop_rate.jitter_depth_per_sec,
-                drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec);
+                drop_rate.opus_send_per_sec, drop_rate.jitter_depth_per_sec,
+                drop_rate.jitter_age_per_sec);
             spdlog::info(
                 "Participant playout rates {}: decoded_packets={:.1f}/s ratio={:.4f} correction_callbacks={} drops limit/age/overflow/target={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, decoded_packet_rate, p.opus_playout_rate_ratio,
@@ -3336,19 +3204,15 @@ private:
                 decode_overflow_drop_rate, target_trim_rate);
 
             if (elapsed_sec > 0.0 &&
-                (drop_rate.pcm_send_per_sec > 5.0 ||
+                (drop_rate.opus_send_per_sec > 5.0 ||
                  drop_rate.jitter_depth_per_sec > 100.0 ||
-                 drop_rate.jitter_age_per_sec > 5.0 ||
-                 drop_rate.pcm_hold_per_sec > 5.0 ||
-                 drop_rate.pcm_drift_drop_per_sec > 5.0)) {
+                 drop_rate.jitter_age_per_sec > 5.0)) {
                 spdlog::warn(
                     "Audio health warning for participant {}: likely corrupt/robotic risk "
-                    "(pcm_drop_rate={:.1f}/s opus_drop_rate={:.1f}/s "
-                    "queue_drop_rate={:.1f}/s age_drop_rate={:.1f}/s "
-                    "pcm_hold_rate={:.1f}/s pcm_drift_drop_rate={:.1f}/s)",
-                    p.id, drop_rate.pcm_send_per_sec, drop_rate.opus_send_per_sec,
-                    drop_rate.jitter_depth_per_sec, drop_rate.jitter_age_per_sec,
-                    drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec);
+                    "(opus_drop_rate={:.1f}/s queue_drop_rate={:.1f}/s "
+                    "age_drop_rate={:.1f}/s)",
+                    p.id, drop_rate.opus_send_per_sec,
+                    drop_rate.jitter_depth_per_sec, drop_rate.jitter_age_per_sec);
             }
         }
     }
@@ -3531,9 +3395,6 @@ private:
             }
             case CtrlHdr::Cmd::JOIN_REQUIRED: {
                 join_state_.mark_join_required();
-                PcmSendFrame discarded_pcm;
-                while (pcm_send_queue_.try_dequeue(discarded_pcm)) {
-                }
                 OpusSendFrame discarded_opus;
                 while (opus_send_queue_.try_dequeue(discarded_opus)) {
                 }
@@ -3571,22 +3432,15 @@ private:
     }
 
     void log_rt_callback_diagnostics() {
-        const uint64_t shape = rt_diag_pcm_shape_mismatches_.load(std::memory_order_relaxed);
-        const uint64_t size = rt_diag_pcm_size_mismatches_.load(std::memory_order_relaxed);
         const uint64_t mix = rt_diag_mix_size_mismatches_.load(std::memory_order_relaxed);
         const uint64_t decode = rt_diag_decode_failures_.load(std::memory_order_relaxed);
-        if (shape == rt_diag_logged_pcm_shape_mismatches_ &&
-            size == rt_diag_logged_pcm_size_mismatches_ &&
-            mix == rt_diag_logged_mix_size_mismatches_ &&
+        if (mix == rt_diag_logged_mix_size_mismatches_ &&
             decode == rt_diag_logged_decode_failures_) {
             return;
         }
         spdlog::warn(
-            "Audio callback diagnostics: pcm_shape_mismatches={} pcm_size_mismatches={} "
-            "mix_size_mismatches={} decode_failures={}",
-            shape, size, mix, decode);
-        rt_diag_logged_pcm_shape_mismatches_ = shape;
-        rt_diag_logged_pcm_size_mismatches_ = size;
+            "Audio callback diagnostics: mix_size_mismatches={} decode_failures={}",
+            mix, decode);
         rt_diag_logged_mix_size_mismatches_ = mix;
         rt_diag_logged_decode_failures_ = decode;
     }
@@ -4316,7 +4170,7 @@ private:
                     participant.opus_resample_phase = 0.0;
                     observe_auto_jitter_instability(participant);
                 }
-                if (opus_packet.loss_concealment && opus_packet.codec == AudioCodec::Opus) {
+                if (opus_packet.loss_concealment) {
                     const int decode_frame_count =
                         opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
                                                     : static_cast<int>(frame_count);
@@ -4329,34 +4183,6 @@ private:
                         participant.plc_count.fetch_add(1, std::memory_order_relaxed);
                         observe_auto_jitter_instability(participant);
                     }
-                } else if (opus_packet.loss_concealment) {
-                    decoded_samples = 0;
-                } else if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    const size_t packet_frame_count =
-                        opus_packet.frame_count > 0 ? opus_packet.frame_count : frame_count;
-                    const size_t packet_channels =
-                        opus_packet.channels > 0 ? opus_packet.channels : 1;
-                    if (packet_channels != 1 ||
-                        packet_frame_count > participant.pcm_buffer.size()) {
-                        client->rt_diag_pcm_shape_mismatches_.fetch_add(
-                            1, std::memory_order_relaxed);
-                        return;
-                    }
-
-                    const size_t expected_bytes =
-                        packet_frame_count * packet_channels * sizeof(int16_t);
-                    if (opus_packet.get_size() != expected_bytes) {
-                        client->rt_diag_pcm_size_mismatches_.fetch_add(
-                            1, std::memory_order_relaxed);
-                        return;
-                    }
-                    for (size_t i = 0; i < packet_frame_count; ++i) {
-                        int16_t sample = 0;
-                        std::memcpy(&sample, opus_packet.get_data() + i * sizeof(sample),
-                                    sizeof(sample));
-                        participant.pcm_buffer[i] = static_cast<float>(sample) / 32767.0F;
-                    }
-                    decoded_samples = static_cast<int>(packet_frame_count);
                 } else {
                     const int decode_frame_count =
                         opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
@@ -4384,7 +4210,7 @@ private:
                                               static_cast<size_t>(decoded_samples));
                 }
 
-                if (opus_packet.codec == AudioCodec::Opus) {
+                {
                     const size_t decoded_frames = static_cast<size_t>(decoded_samples);
                     if (participant.opus_pcm_buffered_frames + decoded_frames <=
                         participant.opus_pcm_buffer.size()) {
@@ -4413,8 +4239,7 @@ private:
                     while (participant.opus_pcm_buffered_frames < required_input_frames) {
                         OpusPacket next_packet;
                         if (!participant.opus_queue.try_dequeue(next_packet,
-                                                                playout_gap_wait_packets) ||
-                            next_packet.codec != AudioCodec::Opus) {
+                                                                playout_gap_wait_packets)) {
                             break;
                         }
 
@@ -4527,63 +4352,6 @@ private:
                     return;
                 }
 
-                if (opus_packet.codec == AudioCodec::PcmInt16 &&
-                    decoded_samples <= static_cast<int>(participant.last_pcm_buffer.size())) {
-                    std::copy_n(participant.pcm_buffer.begin(), decoded_samples,
-                                participant.last_pcm_buffer.begin());
-                    participant.last_pcm_samples = static_cast<size_t>(decoded_samples);
-                    participant.last_pcm_valid = true;
-                    participant.pcm_concealment_used = false;
-                }
-
-                if (opus_packet.codec == AudioCodec::PcmInt16) {
-                    client->observe_capture_to_playout_latency_if_clock_ready(
-                        participant, opus_packet, playout_start);
-                }
-
-                // Calculate audio level (RMS) for voice activity detection
-                float rms =
-                    audio_analysis::calculate_rms(participant.pcm_buffer.data(), decoded_samples);
-                participant.current_level.store(rms, std::memory_order_relaxed);
-
-                // Voice Activity Detection (simple threshold-based)
-                const bool is_speaking = audio_analysis::detect_voice_activity(rms);
-                participant.is_speaking.store(is_speaking, std::memory_order_relaxed);
-
-                // Mix into output with participant's gain
-                size_t expected_samples = frame_count * out_channels;
-                if (static_cast<size_t>(decoded_samples) == expected_samples) {
-                    audio_analysis::mix_with_gain(output_buffer, participant.pcm_buffer.data(),
-                                                  decoded_samples, participant_gain);
-                    active_count++;
-                } else if (static_cast<size_t>(decoded_samples) == frame_count) {
-                    // Mono input, stereo output - duplicate channel
-                    audio_analysis::mix_mono_to_stereo(output_buffer, participant.pcm_buffer.data(),
-                                                       frame_count, out_channels,
-                                                       participant_gain);
-                    active_count++;
-                } else {
-                    client->rt_diag_mix_size_mismatches_.fetch_add(1,
-                                                                   std::memory_order_relaxed);
-                }
-
-                // Track queue size history for diagnostics. Opus trims old backlog down to the
-                // latency target; PCM keeps its existing drift-drop policy.
-                size_t current_queue_size = participant.opus_queue.size_approx();
-                if (opus_packet.codec == AudioCodec::Opus) {
-                    current_queue_size = trim_opus_queue_to_latency_target(participant);
-                } else if (opus_packet.codec == AudioCodec::PcmInt16 &&
-                           current_queue_size > pcm_drift_drop_threshold(participant)) {
-                    if (participant.opus_queue.discard_oldest_actual_packet()) {
-                        current_queue_size--;
-                        participant.pcm_drift_drops.fetch_add(1, std::memory_order_relaxed);
-                        participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-                observe_participant_queue_depth(participant, current_queue_size);
-                participant.queue_size_history[participant.history_index] = current_queue_size;
-                participant.history_index =
-                    (participant.history_index + 1) % participant.queue_size_history.size();
             } else {
                 // Empty queues use PLC; temporary sequence-gap waits must not advance
                 // the Opus decoder because the missing packet may still arrive.
@@ -4648,30 +4416,6 @@ private:
                     }
                     participant.plc_count.fetch_add(1, std::memory_order_relaxed);
                     observe_auto_jitter_instability(participant);
-                }
-
-                // PCM has no PLC fallback. A transient empty queue should produce one silent
-                // callback, then keep trying next callback instead of permanently disabling
-                // playback while packets keep arriving.
-                if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::PcmInt16) {
-                    if (participant.last_pcm_valid && !participant.pcm_concealment_used &&
-                        participant.last_pcm_samples == frame_count) {
-                        constexpr float concealment_gain = 0.5F;
-                        if (out_channels == 1) {
-                            audio_analysis::mix_with_gain(
-                                output_buffer, participant.last_pcm_buffer.data(), frame_count,
-                                participant_gain * concealment_gain);
-                        } else {
-                            audio_analysis::mix_mono_to_stereo(
-                                output_buffer, participant.last_pcm_buffer.data(), frame_count,
-                                out_channels, participant_gain * concealment_gain);
-                        }
-                        participant.pcm_concealment_used = true;
-                        participant.pcm_concealment_frames.fetch_add(
-                            1, std::memory_order_relaxed);
-                        participant.underrun_count.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    return;
                 }
 
                 // Handle Opus rebuffering state. Short empty callbacks are covered by
@@ -4756,49 +4500,6 @@ private:
         // Encode and send own audio (always send to maintain timing, even if silence)
         // Mix WAV with microphone input before encoding
         if (client->audio_.is_stream_active() && client->join_state_.can_send_audio()) {
-            if (client->audio_codec_.load(std::memory_order_acquire) == AudioCodec::PcmInt16) {
-                client->opus_tx_accumulated_frames_ = 0;
-
-                std::array<float, 960> pcm_input{};
-                if (wav_active && wav_frames_read > 0) {
-                    float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
-                    for (int i = 0; i < wav_frames_read; ++i) {
-                        pcm_input[static_cast<size_t>(i)] = wav_buffer[static_cast<size_t>(i)] * wav_gain;
-                    }
-                }
-                if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
-                    float input_gain = client->input_gain_.load(std::memory_order_acquire);
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        float mic_sample = input_buffer[i] * input_gain;
-                        pcm_input[i] = wav_active ? (pcm_input[i] + mic_sample) * 0.5F : mic_sample;
-                    }
-                } else if (wav_active) {
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        pcm_input[i] *= 0.5F;
-                    }
-                }
-
-                float rms = audio_analysis::calculate_rms(pcm_input.data(), frame_count);
-                client->own_audio_level_.store(rms);
-                client->record_mono_block(RecordingWriter::TrackKind::Self, 0, pcm_input.data(),
-                                          frame_count);
-
-                const size_t payload_bytes = frame_count * sizeof(int16_t);
-                if (payload_bytes <= AUDIO_BUF_SIZE) {
-                    std::array<unsigned char, AUDIO_BUF_SIZE> pcm_payload{};
-                    for (unsigned long i = 0; i < frame_count; ++i) {
-                        float clamped = std::clamp(pcm_input[i], -1.0F, 1.0F);
-                        auto sample = static_cast<int16_t>(std::lrint(clamped * 32767.0F));
-                        std::memcpy(pcm_payload.data() + i * sizeof(sample), &sample, sizeof(sample));
-                    }
-                    client->enqueue_pcm_send_frame(
-                        pcm_payload.data(), static_cast<uint16_t>(payload_bytes),
-                        static_cast<uint16_t>(frame_count),
-                        static_cast<uint32_t>(runtime_sample_rate), callback_start);
-                }
-                return 0;
-            }
-
             if (!client->audio_encoder_.is_initialized()) {
                 return 0;
             }
@@ -4858,7 +4559,6 @@ private:
     std::atomic<int>         audio_complexity_{AudioStream::AudioConfig::DEFAULT_COMPLEXITY};
     std::atomic<int>         audio_frames_per_buffer_{
         AudioStream::AudioConfig::DEFAULT_FRAMES_PER_BUFFER};
-    std::atomic<AudioCodec>  audio_codec_{AudioCodec::PcmInt16};
     std::atomic<uint16_t>    opus_network_frame_count_{opus_network_clock::DEFAULT_FRAME_COUNT};
     std::atomic<int>         opus_jitter_buffer_ms_{DEFAULT_OPUS_JITTER_MS};
     std::atomic<size_t>      opus_queue_limit_packets_{DEFAULT_OPUS_QUEUE_LIMIT_PACKETS};
@@ -4869,7 +4569,6 @@ private:
     std::atomic<uint32_t>    audio_tx_sequence_{0};
     // Pre-sized so the audio callback's try_enqueue never allocates
     // (max_send_queue_frames caps useful depth at 8; 64 gives block-pool slack).
-    moodycamel::ConcurrentQueue<PcmSendFrame> pcm_send_queue_{64};
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_{64};
     std::array<float, 960>                     opus_tx_accumulator_{};
     size_t                                     opus_tx_accumulated_frames_ = 0;
@@ -4878,21 +4577,16 @@ private:
     size_t                                     recent_opus_audio_packet_count_ = 0;
     std::atomic<bool>                         recent_opus_audio_packets_reset_requested_{false};
     std::atomic<bool>                         opus_tx_accumulator_reset_requested_{false};
-    std::atomic<bool>                         pcm_sender_running_{false};
-    std::thread                               pcm_sender_thread_;
-    std::condition_variable                   pcm_sender_cv_;
-    std::mutex                                pcm_sender_wait_mutex_;
-    std::atomic<bool>                         pcm_sender_wake_{false};
-    std::atomic<uint64_t>                     pcm_send_drops_{0};
+    std::atomic<bool>                         audio_sender_running_{false};
+    std::thread                               audio_sender_thread_;
+    std::condition_variable                   audio_sender_cv_;
+    std::mutex                                audio_sender_wait_mutex_;
+    std::atomic<bool>                         audio_sender_wake_{false};
     std::atomic<uint64_t>                     opus_send_drops_{0};
     // Written by the audio callback (relaxed atomics), drained and logged by
     // the io-thread cleanup timer. The callback itself must never log.
-    std::atomic<uint64_t> rt_diag_pcm_shape_mismatches_{0};
-    std::atomic<uint64_t> rt_diag_pcm_size_mismatches_{0};
     std::atomic<uint64_t> rt_diag_mix_size_mismatches_{0};
     std::atomic<uint64_t> rt_diag_decode_failures_{0};
-    uint64_t              rt_diag_logged_pcm_shape_mismatches_ = 0;  // io thread only
-    uint64_t              rt_diag_logged_pcm_size_mismatches_  = 0;  // io thread only
     uint64_t              rt_diag_logged_mix_size_mismatches_  = 0;  // io thread only
     uint64_t              rt_diag_logged_decode_failures_      = 0;  // io thread only
     std::atomic<uint64_t>                     outbound_malformed_audio_drops_{0};
@@ -4902,9 +4596,6 @@ private:
     std::atomic<uint64_t>                     receive_generation_{0};
     std::atomic<bool>                         outbound_enabled_{false};
     std::atomic<uint64_t>                     outbound_generation_{0};
-    std::atomic<int64_t>                      pcm_send_queue_age_last_ns_{0};
-    std::atomic<int64_t>                      pcm_send_queue_age_avg_ns_{0};
-    std::atomic<int64_t>                      pcm_send_queue_age_max_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_last_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_avg_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_max_ns_{0};
@@ -5001,8 +4692,6 @@ private:
     struct ParticipantDropSnapshot {
         uint64_t jitter_depth_drops = 0;
         uint64_t jitter_age_drops   = 0;
-        uint64_t pcm_concealment_frames = 0;
-        uint64_t pcm_drift_drops = 0;
         uint64_t opus_packets_decoded_in_callback = 0;
         uint64_t opus_queue_limit_drops = 0;
         uint64_t opus_age_limit_drops = 0;
@@ -5010,7 +4699,6 @@ private:
         uint64_t opus_target_trim_drops = 0;
     };
     std::chrono::steady_clock::time_point                  last_audio_health_log_time_{};
-    uint64_t                                               last_pcm_send_drops_  = 0;
     uint64_t                                               last_opus_send_drops_ = 0;
     uint64_t                                               last_outbound_malformed_audio_drops_ = 0;
     std::unordered_map<uint32_t, ParticipantDropSnapshot>  participant_drop_snapshots_;
@@ -5041,9 +4729,6 @@ static bool apply_startup_latency_profile(Client& client,
         return true;
     }
 
-    if (!startup_options.startup_codec.has_value()) {
-        client.set_audio_codec(AudioCodec::Opus);
-    }
     if (!startup_options.startup_opus_packet_frames.has_value()) {
         client.set_opus_network_frame_count(profile.opus_packet_frames);
     }
@@ -5070,7 +4755,7 @@ int main(int argc, char** argv) {
     try {
         auto startup_options = parse_startup_options(argc, argv);
         logging::init(true, true, !startup_options.log_file_path.empty(),
-                      startup_options.log_file_path, spdlog::level::info);
+                      startup_options.log_file_path, logging::default_level());
         if (!startup_options.log_file_path.empty()) {
             spdlog::info("Logging to {}", startup_options.log_file_path);
         }
@@ -5137,11 +4822,6 @@ int main(int argc, char** argv) {
             client_instance.stop_connection();
             logging::flush();
             return 2;
-        }
-        if (startup_options.startup_codec.has_value()) {
-            client_instance.set_audio_codec(*startup_options.startup_codec);
-            spdlog::info("Startup codec override: {}",
-                      *startup_options.startup_codec == AudioCodec::Opus ? "Opus" : "PCM");
         }
         if (startup_options.startup_opus_packet_frames.has_value()) {
             client_instance.set_opus_network_frame_count(

@@ -118,8 +118,7 @@ struct MetronomeSyncHdr : CtrlHdr {
 };
 
 enum class AudioCodec : uint8_t {
-    Opus     = 1,
-    PcmInt16 = 2,
+    Opus = 1,
 };
 
 struct AudioHdrV3 : MsgHdr {

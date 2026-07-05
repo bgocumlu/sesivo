@@ -79,38 +79,25 @@ inline bool validate_audio_packet_shape(const ParsedAudioHeader& hdr,
         return false;
     }
 
-    if (hdr.codec == AudioCodec::Opus) {
-        if (!opus_network_clock::is_supported_frame_count(hdr.sample_rate, hdr.frame_count)) {
-            if (reason != nullptr) {
-                *reason = "unsupported opus frame count";
-            }
-            return false;
+    if (hdr.codec != AudioCodec::Opus) {
+        if (reason != nullptr) {
+            *reason = "unsupported audio codec";
         }
-        if (hdr.payload_bytes == 0) {
-            if (reason != nullptr) {
-                *reason = "empty opus payload";
-            }
-            return false;
+        return false;
+    }
+    if (!opus_network_clock::is_supported_frame_count(hdr.sample_rate, hdr.frame_count)) {
+        if (reason != nullptr) {
+            *reason = "unsupported opus frame count";
         }
-        return true;
+        return false;
     }
-
-    if (hdr.codec == AudioCodec::PcmInt16) {
-        const size_t expected_payload =
-            static_cast<size_t>(hdr.frame_count) * hdr.channels * sizeof(int16_t);
-        if (expected_payload > AUDIO_BUF_SIZE || hdr.payload_bytes != expected_payload) {
-            if (reason != nullptr) {
-                *reason = "pcm payload shape mismatch";
-            }
-            return false;
+    if (hdr.payload_bytes == 0) {
+        if (reason != nullptr) {
+            *reason = "empty opus payload";
         }
-        return true;
+        return false;
     }
-
-    if (reason != nullptr) {
-        *reason = "invalid codec";
-    }
-    return false;
+    return true;
 }
 
 inline bool validate_audio_packet_bytes(const unsigned char* data, size_t len,
@@ -318,7 +305,7 @@ struct AudioPacketView {
     size_t size = 0;
 };
 
-inline bool write_audio_packet_v3(AudioCodec codec, uint32_t sequence, uint32_t sample_rate,
+inline bool write_audio_packet_v3(uint32_t sequence, uint32_t sample_rate,
                                   uint16_t frame_count, uint8_t channels,
                                   const unsigned char* payload, uint16_t payload_bytes,
                                   int64_t capture_server_time_ns,
@@ -339,7 +326,7 @@ inline bool write_audio_packet_v3(AudioCodec codec, uint32_t sequence, uint32_t 
     hdr.frame_count = frame_count;
     hdr.payload_bytes = payload_bytes;
     hdr.channels = channels;
-    hdr.codec = codec;
+    hdr.codec = AudioCodec::Opus;
     hdr.capture_server_time_ns = capture_server_time_ns;
 
     std::memcpy(out, &hdr, header_size());
@@ -436,13 +423,13 @@ inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet
 }
 
 inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v3(
-    AudioCodec codec, uint32_t sequence, uint32_t sample_rate, uint16_t frame_count,
+    uint32_t sequence, uint32_t sample_rate, uint16_t frame_count,
     uint8_t channels, const unsigned char* payload, uint16_t payload_bytes,
     int64_t capture_server_time_ns) {
     auto packet = std::make_shared<std::vector<unsigned char>>();
     packet->resize(header_size() + payload_bytes);
     size_t bytes_written = 0;
-    if (!write_audio_packet_v3(codec, sequence, sample_rate, frame_count, channels,
+    if (!write_audio_packet_v3(sequence, sample_rate, frame_count, channels,
                                payload, payload_bytes, capture_server_time_ns,
                                packet->data(), packet->size(), bytes_written)) {
         return nullptr;

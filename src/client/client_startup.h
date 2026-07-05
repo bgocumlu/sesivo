@@ -45,7 +45,6 @@ struct ClientStartupOptions {
     bool startup_disable_auto_jitter = false;
     bool list_audio_devices = false;
     bool low_latency_check = false;
-    std::optional<AudioCodec> startup_codec;
     std::string required_audio_api;
     std::string log_file_path;
     PerformerJoinOptions performer_join;

@@ -450,12 +450,6 @@ struct ParticipantData {
     std::atomic<uint64_t>                   opus_target_trim_drops{0};
     std::atomic<size_t>                     last_packet_frame_count{0};
     std::atomic<size_t>                     last_callback_frame_count{0};
-    std::array<float, 960>                  last_pcm_buffer{};
-    size_t                                  last_pcm_samples = 0;
-    bool                                    last_pcm_valid = false;
-    bool                                    pcm_concealment_used = false;
-    std::atomic<uint64_t>                   pcm_drift_drops{0};
-
     // Participant state
     std::string                           profile_id;
     std::string                           display_name;
@@ -501,7 +495,6 @@ struct ParticipantData {
     std::atomic<uint64_t>   sequence_late_or_reordered{0};
     std::atomic<uint64_t>   jitter_depth_drops{0};
     std::atomic<uint64_t>   jitter_age_drops{0};
-    std::atomic<uint64_t>   pcm_concealment_frames{0};
     bool                    drift_reference_initialized = false;
     uint32_t                drift_reference_sequence = 0;
     uint32_t                drift_reference_sample_rate = 48000;
@@ -561,8 +554,6 @@ struct ParticipantInfo {
     uint64_t sequence_late_or_reordered;
     uint64_t jitter_depth_drops;
     uint64_t jitter_age_drops;
-    uint64_t pcm_concealment_frames;
-    uint64_t pcm_drift_drops;
     double   receiver_drift_ppm_last;
     double   receiver_drift_ppm_avg;
     double   receiver_drift_ppm_abs_max;

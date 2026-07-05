@@ -1472,7 +1472,7 @@ int main(int argc, char** argv) {
         auto             options = parse_server_options(argc, argv);
 
         logging::init(true, false, !options.log_file_path.empty(), options.log_file_path,
-                      spdlog::level::info, options.log_max_bytes, options.log_max_files);
+                      logging::default_level(), options.log_max_bytes, options.log_max_files);
 
         if (options.crash_reports_enabled) {
             crash_reporter::Options crash_options;

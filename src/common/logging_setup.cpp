@@ -26,6 +26,14 @@ size_t effective_or_default(size_t value, size_t fallback) {
 
 }  // namespace
 
+spdlog::level::level_enum default_level() {
+#ifdef NDEBUG
+    return spdlog::level::warn;
+#else
+    return spdlog::level::info;
+#endif
+}
+
 void init(bool use_stdout, bool use_stderr, bool use_file, const std::string& file_path,
           spdlog::level::level_enum level, size_t max_file_bytes, size_t max_files) {
     std::vector<spdlog::sink_ptr> sinks;

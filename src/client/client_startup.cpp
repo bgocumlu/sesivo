@@ -208,13 +208,6 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.list_audio_devices = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
-        } else if (arg == "--codec" && i + 1 < argc) {
-            const std::string codec = lowercase_copy(argv[++i]);
-            if (codec == "opus") {
-                options.startup_codec = AudioCodec::Opus;
-            } else if (codec == "pcm" || codec == "raw" || codec == "pcm_int16") {
-                options.startup_codec = AudioCodec::PcmInt16;
-            }
         } else if ((arg == "--require-api" || arg == "--api") && i + 1 < argc) {
             options.required_audio_api = argv[++i];
         } else if (arg == "--log-file" && i + 1 < argc) {

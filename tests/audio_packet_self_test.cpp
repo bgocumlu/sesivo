@@ -20,59 +20,64 @@ std::shared_ptr<std::vector<unsigned char>> make_packet(
     uint32_t sequence, uint16_t frame_count = 240, uint16_t payload_bytes = 8) {
     std::vector<unsigned char> payload(std::max<size_t>(payload_bytes, 1), 0xA5);
     return audio_packet::create_audio_packet_v3(
-        AudioCodec::Opus, sequence, opus_network_clock::SAMPLE_RATE, frame_count, 1,
+        sequence, opus_network_clock::SAMPLE_RATE, frame_count, 1,
         payload.data(), payload_bytes, 1000000LL + sequence);
 }
 
-bool validates(AudioCodec codec, uint32_t sample_rate, uint16_t frame_count,
-               uint8_t channels, uint16_t payload_bytes, std::string* reason = nullptr) {
+bool validates(uint32_t sample_rate, uint16_t frame_count, uint8_t channels,
+               uint16_t payload_bytes, std::string* reason = nullptr) {
     std::vector<unsigned char> payload(std::max<size_t>(payload_bytes, 1), 0xB6);
     auto packet = audio_packet::create_audio_packet_v3(
-        codec, 7, sample_rate, frame_count, channels, payload.data(), payload_bytes,
-        123456789LL);
+        7, sample_rate, frame_count, channels, payload.data(), payload_bytes, 123456789LL);
     return audio_packet::validate_audio_packet_bytes(packet->data(), packet->size(), reason);
 }
 
 void test_accepts_supported_opus_shapes() {
-    require(validates(AudioCodec::Opus, 48000, 120, 1, 8),
+    require(validates(48000, 120, 1, 8),
             "120-frame opus packet should validate");
-    require(validates(AudioCodec::Opus, 48000, 240, 1, 8),
+    require(validates(48000, 240, 1, 8),
             "240-frame opus packet should validate");
-    require(validates(AudioCodec::Opus, 48000, 480, 1, 8),
+    require(validates(48000, 480, 1, 8),
             "480-frame opus packet should validate");
-    require(validates(AudioCodec::Opus, 48000, 960, 1, 8),
+    require(validates(48000, 960, 1, 8),
             "960-frame opus packet should validate");
 }
 
 void test_rejects_unsupported_opus_shapes() {
     std::string reason;
-    require(!validates(AudioCodec::Opus, 48000, 2880, 1, 8, &reason),
+    require(!validates(48000, 2880, 1, 8, &reason),
             "oversized opus frame count should be rejected");
     require(reason == "unsupported opus frame count",
             "oversized opus rejection reason should be precise");
-    require(!validates(AudioCodec::Opus, 44100, 240, 1, 8),
+    require(!validates(44100, 240, 1, 8),
             "unsupported opus sample rate should be rejected");
-    require(!validates(AudioCodec::Opus, 48000, 240, 2, 8),
+    require(!validates(48000, 240, 2, 8),
             "unsupported opus channel count should be rejected");
-    require(!validates(AudioCodec::Opus, 48000, 240, 1, 0),
+    require(!validates(48000, 240, 1, 0),
             "empty opus payload should be rejected");
 }
 
-void test_pcm_payload_must_match_shape() {
-    require(validates(AudioCodec::PcmInt16, 48000, 128, 1, 256),
-            "matching mono PCM payload should validate");
-    require(!validates(AudioCodec::PcmInt16, 48000, 128, 1, 254),
-            "short PCM payload should be rejected");
-    require(!validates(AudioCodec::PcmInt16, 48000, 128, 2, 512),
-            "unsupported PCM channel count should be rejected");
-    require(!validates(AudioCodec::PcmInt16, 48000, 300, 1, 600),
-            "oversized PCM payload should be rejected");
+void test_rejects_non_opus_codec() {
+    std::vector<unsigned char> payload(8, 0xB6);
+    auto packet = audio_packet::create_audio_packet_v3(
+        7, 48000, 120, 1, payload.data(), static_cast<uint16_t>(payload.size()),
+        123456789LL);
+    AudioHdrV3 hdr{};
+    std::memcpy(&hdr, packet->data(), audio_packet::v3_header_size());
+    hdr.codec = static_cast<AudioCodec>(2);
+    std::memcpy(packet->data(), &hdr, audio_packet::v3_header_size());
+
+    std::string reason;
+    require(!audio_packet::validate_audio_packet_bytes(packet->data(), packet->size(), &reason),
+            "non-Opus codec should be rejected");
+    require(reason == "unsupported audio codec",
+            "non-Opus rejection reason should be precise");
 }
 
 void test_packet_round_trip() {
     std::vector<unsigned char> payload{0x10, 0x20, 0x30, 0x40};
     auto packet = audio_packet::create_audio_packet_v3(
-        AudioCodec::Opus, 42, 48000, 120, 1, payload.data(),
+        42, 48000, 120, 1, payload.data(),
         static_cast<uint16_t>(payload.size()), 123456789LL);
 
     require(packet != nullptr, "packet should build");
@@ -216,7 +221,7 @@ void test_write_audio_packet_into_caller_buffer() {
     size_t bytes_written = 0;
 
     require(audio_packet::write_audio_packet_v3(
-                AudioCodec::Opus, 42, 48000, 120, 1, payload.data(),
+                42, 48000, 120, 1, payload.data(),
                 static_cast<uint16_t>(payload.size()), 123456789LL,
                 out.data(), out.size(), bytes_written),
             "writer should fit in caller buffer");
@@ -232,7 +237,7 @@ void test_write_audio_packet_capacity_failure() {
     size_t bytes_written = 99;
 
     require(!audio_packet::write_audio_packet_v3(
-                AudioCodec::Opus, 7, 48000, 120, 1, payload.data(),
+                7, 48000, 120, 1, payload.data(),
                 static_cast<uint16_t>(payload.size()), 99,
                 out.data(), out.size(), bytes_written),
             "writer should fail when output buffer is too small");
@@ -249,12 +254,12 @@ void test_write_redundant_audio_packet_into_caller_buffer() {
     size_t redundant_bytes = 0;
 
     require(audio_packet::write_audio_packet_v3(
-                AudioCodec::Opus, 11, 48000, 120, 1, payload.data(),
+                11, 48000, 120, 1, payload.data(),
                 static_cast<uint16_t>(payload.size()), 1111,
                 current.data(), current.size(), current_bytes),
             "current packet should write");
     require(audio_packet::write_audio_packet_v3(
-                AudioCodec::Opus, 10, 48000, 120, 1, payload.data(),
+                10, 48000, 120, 1, payload.data(),
                 static_cast<uint16_t>(payload.size()), 1010,
                 previous.data(), previous.size(), previous_bytes),
             "previous packet should write");
@@ -277,7 +282,7 @@ void test_write_redundant_audio_packet_into_caller_buffer() {
 int main() {
     test_accepts_supported_opus_shapes();
     test_rejects_unsupported_opus_shapes();
-    test_pcm_payload_must_match_shape();
+    test_rejects_non_opus_codec();
     test_packet_round_trip();
     test_length_mismatch_still_rejected();
     test_redundant_audio_packet_validates_children();

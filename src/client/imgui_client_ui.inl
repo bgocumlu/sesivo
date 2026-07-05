@@ -94,22 +94,14 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Codec:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        const AudioCodec current_codec = client.get_audio_codec();
-        ImGui::Text("%s", current_codec == AudioCodec::Opus ? "Opus" : "PCM (startup flag)");
-        JamGui::ShowTooltipOnHover(
-            current_codec == AudioCodec::Opus
-                ? "Compressed internet mode"
-                : "PCM is only available through startup flags");
+        ImGui::Text("Opus");
+        JamGui::ShowTooltipOnHover("Compressed internet mode");
 
         ImGui::Spacing();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Jitter floor:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         int jitter_ms = client.get_opus_jitter_buffer_ms();
-        const bool jitter_enabled = client.get_audio_codec() == AudioCodec::Opus;
-        if (!jitter_enabled) {
-            ImGui::BeginDisabled();
-        }
         ImGui::PushItemWidth(width - PADDING);
         if (ImGui::InputInt("##OpusJitterMs", &jitter_ms, 5, 10)) {
             client.set_opus_jitter_buffer_ms(std::max(jitter_ms, 0));
@@ -119,9 +111,6 @@ static void draw_master_strip(Client& client, float available_height) {
             }
         }
         ImGui::PopItemWidth();
-        if (!jitter_enabled) {
-            ImGui::EndDisabled();
-        }
         const double packet_ms = client.get_opus_network_packet_ms();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         if (client.get_opus_auto_jitter_default()) {
@@ -136,14 +125,8 @@ static void draw_master_strip(Client& client, float available_height) {
         }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         bool auto_jitter_default = client.get_opus_auto_jitter_default();
-        if (!jitter_enabled) {
-            ImGui::BeginDisabled();
-        }
         if (ImGui::Checkbox("Auto jitter##GlobalAutoJitter", &auto_jitter_default)) {
             client.set_opus_auto_jitter_default(auto_jitter_default);
-        }
-        if (!jitter_enabled) {
-            ImGui::EndDisabled();
         }
         JamGui::ShowTooltipOnHover("Use adaptive jitter as the default for participants without custom settings");
 
@@ -152,18 +135,12 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Text("Queue limit:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         int queue_limit_packets = static_cast<int>(client.get_opus_queue_limit_packets());
-        if (!jitter_enabled) {
-            ImGui::BeginDisabled();
-        }
         ImGui::PushItemWidth(width - PADDING);
         if (ImGui::InputInt("##OpusQueueLimitPackets", &queue_limit_packets, 1, 4)) {
             client.set_opus_queue_limit_packets(
                 static_cast<size_t>(std::max(queue_limit_packets, 0)));
         }
         ImGui::PopItemWidth();
-        if (!jitter_enabled) {
-            ImGui::EndDisabled();
-        }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%zu pkt max", client.get_opus_queue_limit_packets());
 
@@ -172,17 +149,11 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Text("Age limit:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         int age_limit_ms = client.get_jitter_packet_age_limit_ms();
-        if (!jitter_enabled) {
-            ImGui::BeginDisabled();
-        }
         ImGui::PushItemWidth(width - PADDING);
         if (ImGui::InputInt("##JitterPacketAgeLimitMs", &age_limit_ms, 5, 20)) {
             client.set_jitter_packet_age_limit_ms(age_limit_ms);
         }
         ImGui::PopItemWidth();
-        if (!jitter_enabled) {
-            ImGui::EndDisabled();
-        }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%d ms max", client.get_jitter_packet_age_limit_ms());
 
@@ -200,9 +171,6 @@ static void draw_master_strip(Client& client, float available_height) {
         } else {
             std::snprintf(redundancy_preview, sizeof(redundancy_preview), "%d prev",
                           redundancy_depth);
-        }
-        if (!jitter_enabled) {
-            ImGui::BeginDisabled();
         }
         ImGui::PushItemWidth(width - PADDING);
         if (ImGui::BeginCombo("##OpusRedundancyDepth", redundancy_preview)) {
@@ -222,9 +190,6 @@ static void draw_master_strip(Client& client, float available_height) {
             ImGui::EndCombo();
         }
         ImGui::PopItemWidth();
-        if (!jitter_enabled) {
-            ImGui::EndDisabled();
-        }
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("%d prev effective", client.get_effective_opus_redundancy_depth());
         JamGui::ShowTooltipOnHover("Previous Opus packets carried in each UDP datagram");
@@ -790,16 +755,6 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::Text("PLC: %zu", p.plc_count);
             }
-            if (p.pcm_concealment_frames > 0) {
-                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-                ImGui::Text("PCM hold: %llu",
-                            static_cast<unsigned long long>(p.pcm_concealment_frames));
-            }
-            if (p.pcm_drift_drops > 0) {
-                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-                ImGui::Text("PCM drift drop: %llu",
-                            static_cast<unsigned long long>(p.pcm_drift_drops));
-            }
             if (!p.buffer_ready) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
                 ImGui::TextColored(ImVec4(1.0F, 0.8F, 0.2F, 1.0F), "Buffering...");
@@ -881,8 +836,6 @@ static void draw_bottom_bar(Client& client) {
         selected_api = api_index_for_name(client.get_audio_api_filter());
         devices_initialized   = true;
     }
-    pending_buffer_frames =
-        normalize_buffer_frames_for_codec(client.get_audio_codec(), pending_buffer_frames);
     pending_input_channel =
         std::clamp(pending_input_channel, 0, max_input_channels_for(pending_input) - 1);
 
@@ -1060,9 +1013,6 @@ static void draw_bottom_bar(Client& client) {
     std::snprintf(buffer_preview, sizeof(buffer_preview), "%d", pending_buffer_frames);
     if (ImGui::BeginCombo("##BufferFrames", buffer_preview)) {
         for (int frames: buffer_options) {
-            if (normalized_buffer_frames_for_codec(client.get_audio_codec(), frames) != frames) {
-                continue;
-            }
             char label[48];
             if (frames == 96) {
                 std::snprintf(label, sizeof(label), "%d Ultra##buffer_%d", frames, frames);

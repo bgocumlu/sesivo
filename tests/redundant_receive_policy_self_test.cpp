@@ -24,7 +24,7 @@ std::shared_ptr<std::vector<unsigned char>> make_audio_packet(uint32_t sequence,
     const std::array<unsigned char, 3> payload{marker, static_cast<unsigned char>(marker + 1),
                                               static_cast<unsigned char>(marker + 2)};
     return audio_packet::create_audio_packet_v3(
-        AudioCodec::Opus, sequence, opus_network_clock::SAMPLE_RATE,
+        sequence, opus_network_clock::SAMPLE_RATE,
         opus_network_clock::DEFAULT_FRAME_COUNT, 1, payload.data(),
         static_cast<uint16_t>(payload.size()), 1000000LL + sequence);
 }

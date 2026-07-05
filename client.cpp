@@ -50,7 +50,6 @@
 #include "audio_packet.h"
 #include "audio_stream.h"
 #include "gui.h"
-#include "jam_broadcast_ipc.h"
 #include "join_reliability.h"
 #include "jitter_policy.h"
 #include "logger.h"
@@ -531,36 +530,7 @@ public:
     void stop_audio_stream() {
         audio_.stop_audio_stream();
         stop_pcm_sender_thread();
-        disable_broadcast_ipc();
         stop_recording();
-    }
-
-    bool enable_broadcast_ipc(uint16_t port) {
-        if (port == 0) {
-            return false;
-        }
-        if (broadcast_ipc_running_.load(std::memory_order_acquire)) {
-            return true;
-        }
-        broadcast_ipc_port_.store(port, std::memory_order_release);
-        broadcast_ipc_running_.store(true, std::memory_order_release);
-        broadcast_ipc_thread_ = std::thread([this]() { broadcast_ipc_sender_loop(); });
-        Log::info("Broadcast IPC enabled on localhost UDP port {}", port);
-        return true;
-    }
-
-    void disable_broadcast_ipc() {
-        if (!broadcast_ipc_running_.exchange(false, std::memory_order_acq_rel)) {
-            return;
-        }
-        if (broadcast_ipc_thread_.joinable()) {
-            broadcast_ipc_thread_.join();
-        }
-        Log::info("Broadcast IPC stopped: produced={} sent={} drops enqueue/send={}/{}",
-                  broadcast_frames_produced_.load(std::memory_order_relaxed),
-                  broadcast_frames_sent_.load(std::memory_order_relaxed),
-                  broadcast_enqueue_drops_.load(std::memory_order_relaxed),
-                  broadcast_send_drops_.load(std::memory_order_relaxed));
     }
 
     // Getters for UI access
@@ -5485,96 +5455,6 @@ private:
         record_mono_block(RecordingWriter::TrackKind::Master, 0, mono.data(), frame_count);
     }
 
-    struct BroadcastIpcFrame {
-        uint32_t sample_rate = 48000;
-        uint16_t frame_count = 0;
-        std::array<float, 960> samples{};
-    };
-
-    void enqueue_broadcast_mix(const float* output_buffer, const float* input_buffer,
-                               unsigned long frame_count, size_t out_channels) {
-        if (!broadcast_ipc_running_.load(std::memory_order_acquire) || output_buffer == nullptr ||
-            out_channels == 0 || frame_count == 0 || frame_count > 960) {
-            return;
-        }
-
-        BroadcastIpcFrame frame;
-        frame.sample_rate = static_cast<uint32_t>(current_audio_sample_rate());
-        frame.frame_count = static_cast<uint16_t>(frame_count);
-        const bool include_mic =
-            input_buffer != nullptr && !mic_muted_.load(std::memory_order_acquire);
-        const float input_gain = input_gain_.load(std::memory_order_acquire);
-
-        for (unsigned long i = 0; i < frame_count; ++i) {
-            float sample = 0.0F;
-            if (out_channels == 1) {
-                sample = output_buffer[i];
-            } else {
-                for (size_t channel = 0; channel < out_channels; ++channel) {
-                    sample += output_buffer[(i * out_channels) + channel];
-                }
-                sample /= static_cast<float>(out_channels);
-            }
-            if (include_mic) {
-                sample += input_buffer[i] * input_gain;
-            }
-            frame.samples[i] = std::clamp(sample, -1.0F, 1.0F);
-        }
-
-        if (broadcast_queue_.try_enqueue(frame)) {
-            broadcast_frames_produced_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            broadcast_enqueue_drops_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    void broadcast_ipc_sender_loop() {
-        try {
-            asio::io_context io;
-            udp::socket socket(io);
-            socket.open(udp::v4());
-            udp::endpoint endpoint(asio::ip::make_address("127.0.0.1"),
-                                   broadcast_ipc_port_.load(std::memory_order_acquire));
-
-            std::array<unsigned char, sizeof(JamBroadcastIpcHeader) + (960 * sizeof(float))>
-                packet{};
-            uint32_t sequence = 0;
-            BroadcastIpcFrame frame;
-            while (broadcast_ipc_running_.load(std::memory_order_acquire)) {
-                bool sent_any = false;
-                while (broadcast_queue_.try_dequeue(frame)) {
-                    JamBroadcastIpcHeader header;
-                    header.sequence = sequence++;
-                    header.sample_rate = frame.sample_rate;
-                    header.channels = 1;
-                    header.frame_count = frame.frame_count;
-                    header.format = static_cast<uint16_t>(JamBroadcastPcmFormat::Float32LE);
-                    header.payload_bytes =
-                        static_cast<uint16_t>(frame.frame_count * sizeof(float));
-                    std::memcpy(packet.data(), &header, sizeof(header));
-                    std::memcpy(packet.data() + sizeof(header), frame.samples.data(),
-                                header.payload_bytes);
-
-                    std::error_code ec;
-                    socket.send_to(
-                        asio::buffer(packet.data(), sizeof(header) + header.payload_bytes),
-                        endpoint, 0, ec);
-                    if (ec) {
-                        broadcast_send_drops_.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        broadcast_frames_sent_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    sent_any = true;
-                }
-                if (!sent_any) {
-                    std::this_thread::sleep_for(2ms);
-                }
-            }
-        } catch (const std::exception& e) {
-            Log::error("Broadcast IPC sender stopped: {}", e.what());
-        }
-    }
-
     static int audio_callback(const void* input, void* output, unsigned long frame_count,
                               void* user_data) {
         const auto* input_buffer  = static_cast<const float*>(input);
@@ -6155,7 +6035,7 @@ private:
 
         // Apply normalization if multiple sources to prevent clipping
         if (active_count > 1) {
-            constexpr float HEADROOM = 0.5F;  // VoIP can use more headroom than broadcast
+            constexpr float HEADROOM = 0.5F;
             float           gain     = HEADROOM / static_cast<float>(active_count);
 
             for (unsigned long i = 0; i < frame_count * out_channels; ++i) {
@@ -6167,7 +6047,6 @@ private:
             }
         }
 
-        client->enqueue_broadcast_mix(output_buffer, input_buffer, frame_count, out_channels);
         if (client->self_monitor_enabled_.load(std::memory_order_acquire) &&
             input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
             const float input_gain = client->input_gain_.load(std::memory_order_acquire);
@@ -6350,14 +6229,6 @@ private:
     std::atomic<int64_t>                      rx_playout_avg_ns_{0};
     std::atomic<int64_t>                      rx_playout_max_ns_{0};
     std::chrono::steady_clock::time_point     last_audio_packet_send_time_{};
-    moodycamel::ConcurrentQueue<BroadcastIpcFrame> broadcast_queue_{256};
-    std::atomic<bool>                         broadcast_ipc_running_{false};
-    std::atomic<unsigned short>               broadcast_ipc_port_{0};
-    std::thread                               broadcast_ipc_thread_;
-    std::atomic<uint64_t>                     broadcast_frames_produced_{0};
-    std::atomic<uint64_t>                     broadcast_frames_sent_{0};
-    std::atomic<uint64_t>                     broadcast_enqueue_drops_{0};
-    std::atomic<uint64_t>                     broadcast_send_drops_{0};
 
     ParticipantManager participant_manager_;
     WavFilePlayback    wav_playback_;
@@ -7866,7 +7737,6 @@ struct ClientStartupOptions {
     std::optional<AudioCodec> startup_codec;
     std::string required_audio_api;
     std::string log_file_path;
-    std::optional<uint16_t> broadcast_ipc_port;
     PerformerJoinOptions performer_join;
 };
 
@@ -7993,8 +7863,6 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.required_audio_api = argv[++i];
         } else if (arg == "--log-file" && i + 1 < argc) {
             options.log_file_path = argv[++i];
-        } else if (arg == "--broadcast-ipc-port" && i + 1 < argc) {
-            options.broadcast_ipc_port = parse_udp_port(argv[++i], "--broadcast-ipc-port");
         }
     }
     return options;
@@ -8658,7 +8526,7 @@ int main(int argc, char** argv) {
                 "Startup config smoke: codec={} frames={} opus_packet={} jitter_floor={} "
                 "jitter_ms={} input_channel={} auto_start_jitter={} queue_limit={} "
                 "age_limit_ms={} auto_jitter={} redundancy_depth={} effective_redundancy_depth={} "
-                "broadcast_ipc_port={} app_version={}",
+                "app_version={}",
                 client_instance.get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
                 client_instance.get_audio_config().frames_per_buffer,
                 client_instance.get_opus_network_frame_count(),
@@ -8676,22 +8544,10 @@ int main(int argc, char** argv) {
                     ? "auto"
                     : std::to_string(client_instance.get_opus_redundancy_depth_setting()),
                 client_instance.get_effective_opus_redundancy_depth(),
-                startup_options.broadcast_ipc_port.has_value()
-                    ? std::to_string(*startup_options.broadcast_ipc_port)
-                    : "disabled",
                 startup_options.app_version.empty() ? "none" : startup_options.app_version);
             client_instance.stop_connection();
             log.flush();
             return 0;
-        }
-        if (startup_options.broadcast_ipc_port.has_value()) {
-            const uint16_t port = *startup_options.broadcast_ipc_port;
-            if (port == 0) {
-                Log::error("Invalid broadcast IPC port: {}", port);
-                log.flush();
-                return 2;
-            }
-            client_instance.enable_broadcast_ipc(port);
         }
 
         // Auto-start audio stream with default devices
@@ -8751,7 +8607,6 @@ int main(int argc, char** argv) {
         }
 
         // Clean up Client resources before exit
-        client_instance.disable_broadcast_ipc();
         client_instance.stop_audio_stream();
         client_instance.stop_connection();
 

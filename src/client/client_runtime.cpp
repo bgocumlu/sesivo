@@ -52,6 +52,7 @@
 #include "client_join_session.h"
 #include "client_media_state.h"
 #include "client_metronome.h"
+#include "client_network_path.h"
 #include "client_runtime.h"
 #include "jitter_policy.h"
 #include "message_validator.h"
@@ -71,17 +72,6 @@
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
-constexpr uint32_t AUDIO_PATH_FEEDBACK_MIN_PACKETS = 20;
-constexpr double AUDIO_PATH_FEEDBACK_UNSTABLE_GAP_RATE = 0.05;
-constexpr double AUDIO_PATH_FEEDBACK_SEVERE_GAP_RATE = 0.25;
-constexpr uint32_t PING_PATH_FEEDBACK_MIN_PACKETS = 8;
-constexpr uint32_t PING_PATH_TIMEOUT_PROMOTE_REPLIES = 10;
-constexpr double PING_PATH_FEEDBACK_UNSTABLE_GAP_RATE = 0.10;
-constexpr double PING_PATH_FEEDBACK_SEVERE_GAP_RATE = 0.25;
-constexpr double PING_PATH_HIGH_RTT_MS = 250.0;
-constexpr uint32_t UDP_PATH_REBIND_MIN_OBSERVED_PACKETS = 8;
-constexpr double UDP_PATH_REBIND_SEVERE_GAP_RATE = 0.25;
-constexpr auto UDP_PATH_REBIND_COOLDOWN = 15s;
 constexpr int OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS = 200;
 constexpr int OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE = 3;
 constexpr bool AUDIO_CALLBACK_NOTIFY_ENABLED = true;
@@ -484,7 +474,7 @@ public:
         diagnostics.audio_ingress_gaps =
             audio_path_interval_gaps_.load(std::memory_order_relaxed);
         diagnostics.audio_ingress_gap_percent =
-            audio_path_feedback_net_gap_rate(
+            client_network_path::net_gap_rate(
                 diagnostics.audio_ingress_received,
                 audio_path_interval_sequence_gaps_.load(std::memory_order_relaxed),
                 diagnostics.audio_ingress_gaps) *
@@ -1528,7 +1518,7 @@ private:
 
         const int64_t cooldown_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                UDP_PATH_REBIND_COOLDOWN)
+                client_network_path::UDP_REBIND_COOLDOWN)
                 .count();
         while (!next_udp_path_rebind_allowed_ns_.compare_exchange_weak(
             next_allowed, now_ns + cooldown_ns, std::memory_order_acq_rel,
@@ -2945,122 +2935,6 @@ private:
         }
     }
 
-public:
-    static double audio_path_feedback_gap_rate(uint32_t received_packets,
-                                               uint32_t sequence_gaps) {
-        const uint64_t denominator =
-            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
-        if (denominator == 0) {
-            return 0.0;
-        }
-        return static_cast<double>(sequence_gaps) / static_cast<double>(denominator);
-    }
-
-    static double audio_path_feedback_net_gap_rate(uint32_t received_packets,
-                                                   uint32_t sequence_gaps,
-                                                   uint32_t unrecovered_sequence_gaps) {
-        const uint64_t denominator =
-            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
-        if (denominator == 0) {
-            return 0.0;
-        }
-        return static_cast<double>(unrecovered_sequence_gaps) /
-               static_cast<double>(denominator);
-    }
-
-    static bool should_rebind_udp_path_after_feedback(uint16_t current_frame_count,
-                                                      uint32_t received_packets,
-                                                      uint32_t sequence_gaps) {
-        return current_frame_count >= opus_network_clock::STABLE_FRAME_COUNT &&
-               should_rebind_udp_path_after_severe_loss(received_packets, sequence_gaps);
-    }
-
-    static bool should_rebind_udp_path_after_severe_loss(uint32_t received_packets,
-                                                         uint32_t sequence_gaps) {
-        const uint64_t observed_packets =
-            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
-        return observed_packets >= UDP_PATH_REBIND_MIN_OBSERVED_PACKETS &&
-               audio_path_feedback_gap_rate(received_packets, sequence_gaps) >=
-                   UDP_PATH_REBIND_SEVERE_GAP_RATE;
-    }
-
-    static bool should_rebind_udp_path_after_ping_feedback(uint32_t received_replies,
-                                                           uint32_t missing_replies,
-                                                           double rtt_ms) {
-        return rtt_ms >= PING_PATH_HIGH_RTT_MS &&
-               should_rebind_udp_path_after_severe_loss(received_replies, missing_replies);
-    }
-
-    static bool ping_reply_is_within_watch_window(uint32_t reply_sequence,
-                                                  uint32_t watch_start_sequence) {
-        return reply_sequence >= watch_start_sequence;
-    }
-
-    static uint32_t ping_path_missing_replies_for_timeout(
-        uint32_t sent_sequence, uint32_t watch_start_sequence, bool have_reply_sequence,
-        uint32_t last_reply_sequence) {
-        if (sent_sequence < watch_start_sequence) {
-            return 0;
-        }
-
-        uint32_t first_missing_sequence = watch_start_sequence;
-        if (have_reply_sequence && last_reply_sequence >= watch_start_sequence) {
-            first_missing_sequence = last_reply_sequence + 1U;
-        }
-        if (sent_sequence < first_missing_sequence) {
-            return 0;
-        }
-        return sent_sequence - first_missing_sequence + 1U;
-    }
-
-    static uint16_t opus_packet_frames_after_audio_path_feedback(
-        uint16_t current_frame_count, uint32_t received_packets, uint32_t sequence_gaps) {
-        const uint64_t observed_packets =
-            static_cast<uint64_t>(received_packets) + static_cast<uint64_t>(sequence_gaps);
-        if (observed_packets < AUDIO_PATH_FEEDBACK_MIN_PACKETS || sequence_gaps == 0) {
-            return current_frame_count;
-        }
-
-        const double gap_rate =
-            audio_path_feedback_gap_rate(received_packets, sequence_gaps);
-        if (gap_rate >= AUDIO_PATH_FEEDBACK_SEVERE_GAP_RATE &&
-            current_frame_count < opus_network_clock::STABLE_FRAME_COUNT) {
-            return opus_network_clock::STABLE_FRAME_COUNT;
-        }
-        if (gap_rate >= AUDIO_PATH_FEEDBACK_UNSTABLE_GAP_RATE &&
-            current_frame_count < opus_network_clock::BALANCED_FRAME_COUNT) {
-            return opus_network_clock::BALANCED_FRAME_COUNT;
-        }
-        return current_frame_count;
-    }
-
-    static uint16_t opus_packet_frames_after_ping_path_feedback(
-        uint16_t current_frame_count, uint32_t received_replies, uint32_t missing_replies,
-        double rtt_ms) {
-        const uint64_t observed_replies =
-            static_cast<uint64_t>(received_replies) + static_cast<uint64_t>(missing_replies);
-        if (observed_replies >= PING_PATH_FEEDBACK_MIN_PACKETS && missing_replies > 0) {
-            const double gap_rate =
-                audio_path_feedback_gap_rate(received_replies, missing_replies);
-            if (gap_rate >= PING_PATH_FEEDBACK_SEVERE_GAP_RATE &&
-                current_frame_count < opus_network_clock::STABLE_FRAME_COUNT) {
-                return opus_network_clock::STABLE_FRAME_COUNT;
-            }
-            if (gap_rate >= PING_PATH_FEEDBACK_UNSTABLE_GAP_RATE &&
-                current_frame_count < opus_network_clock::BALANCED_FRAME_COUNT) {
-                return opus_network_clock::BALANCED_FRAME_COUNT;
-            }
-        }
-
-        if (rtt_ms >= PING_PATH_HIGH_RTT_MS &&
-            current_frame_count < opus_network_clock::BALANCED_FRAME_COUNT) {
-            return opus_network_clock::BALANCED_FRAME_COUNT;
-        }
-
-        return current_frame_count;
-    }
-
-
 private:
     void handle_ctrl_message(std::size_t bytes, const char* recv_data) {
         // Add to total bytes received
@@ -3207,9 +3081,9 @@ private:
         audio_path_interval_gaps_.store(interval_unrecovered_gaps,
                                         std::memory_order_relaxed);
         const double gap_rate_percent =
-            audio_path_feedback_net_gap_rate(stats.interval_received,
-                                             stats.interval_sequence_gaps,
-                                             interval_unrecovered_gaps) *
+            client_network_path::net_gap_rate(stats.interval_received,
+                                              stats.interval_sequence_gaps,
+                                              interval_unrecovered_gaps) *
             100.0;
         if (stats.interval_sequence_gaps == 0 && interval_unrecovered_gaps == 0) {
             return;
@@ -3225,8 +3099,8 @@ private:
             stats.total_received, stats.total_sequence_gaps,
             stats.total_unrecovered_sequence_gaps,
             get_opus_network_frame_count());
-        if (should_rebind_udp_path_after_severe_loss(stats.interval_received,
-                                                     interval_unrecovered_gaps)) {
+        if (client_network_path::should_rebind_after_severe_loss(
+                stats.interval_received, interval_unrecovered_gaps)) {
             request_udp_path_rebind("severe sender audio ingress loss");
         }
     }
@@ -3236,7 +3110,7 @@ private:
             return;
         }
 
-        const uint32_t missing_replies = ping_path_missing_replies_for_timeout(
+        const uint32_t missing_replies = client_network_path::missing_replies_for_timeout(
             sent_sequence,
             ping_path_watch_start_sequence_.load(std::memory_order_acquire),
             have_ping_reply_sequence_.load(std::memory_order_acquire),
@@ -3244,7 +3118,7 @@ private:
 
         ping_path_consecutive_missing_.store(missing_replies,
                                              std::memory_order_relaxed);
-        if (missing_replies < PING_PATH_TIMEOUT_PROMOTE_REPLIES) {
+        if (missing_replies < client_network_path::PING_TIMEOUT_PROMOTE_REPLIES) {
             return;
         }
 
@@ -3256,7 +3130,7 @@ private:
     }
 
     void observe_ping_path_feedback(uint32_t reply_sequence, double rtt_ms) {
-        if (!ping_reply_is_within_watch_window(
+        if (!client_network_path::ping_reply_is_within_watch_window(
                 reply_sequence,
                 ping_path_watch_start_sequence_.load(std::memory_order_acquire))) {
             return;
@@ -3286,15 +3160,15 @@ private:
             ping_path_interval_received_.load(std::memory_order_relaxed);
         const uint32_t missing =
             ping_path_interval_missing_.load(std::memory_order_relaxed);
-        if (received + missing < PING_PATH_FEEDBACK_MIN_PACKETS) {
+        if (received + missing < client_network_path::PING_FEEDBACK_MIN_REPLIES) {
             return;
         }
 
         ping_path_interval_received_.store(0, std::memory_order_relaxed);
         ping_path_interval_missing_.store(0, std::memory_order_relaxed);
         const double gap_rate_percent =
-            audio_path_feedback_gap_rate(received, missing) * 100.0;
-        if (missing == 0 && rtt_ms < PING_PATH_HIGH_RTT_MS) {
+            client_network_path::gap_rate(received, missing) * 100.0;
+        if (missing == 0 && rtt_ms < client_network_path::HIGH_RTT_MS) {
             return;
         }
 
@@ -3302,7 +3176,8 @@ private:
             "Server ping path is unstable: replies={} missing={} gap_rate={:.1f}% "
             "rtt_ms={:.1f}; manual mode keeps current Opus packet at {} frames",
             received, missing, gap_rate_percent, rtt_ms, get_opus_network_frame_count());
-        if (should_rebind_udp_path_after_ping_feedback(received, missing, rtt_ms)) {
+        if (client_network_path::should_rebind_after_ping_feedback(
+                received, missing, rtt_ms)) {
             request_udp_path_rebind("severe server ping path loss");
         }
     }

@@ -50,6 +50,7 @@
 #include "audio_stream.h"
 #include "client_audio_devices.h"
 #include "client_audio_state.h"
+#include "client_app_facade.h"
 #include "client_join_session.h"
 #include "client_media_state.h"
 #include "client_metronome.h"
@@ -393,15 +394,7 @@ public:
     // Device and encoder info structure
     using DeviceInfo = ClientDeviceInfo;
     using EncoderInfo = ClientEncoderInfo;
-
-    struct CallbackTimingInfo {
-        double last_ms;
-        double max_ms;
-        double avg_ms;
-        double deadline_ms;
-        uint64_t callback_count;
-        uint64_t over_deadline_count;
-    };
+    using CallbackTimingInfo = ClientCallbackTimingInfo;
 
     struct LatencyPercentileWindow {
         static constexpr size_t CAPACITY = 256;
@@ -445,39 +438,7 @@ public:
         }
     };
 
-    struct PathDiagnostics {
-        double rtt_last_ms = 0.0;
-        double rtt_min_ms = 0.0;
-        double rtt_avg_ms = 0.0;
-        double rtt_max_ms = 0.0;
-        uint32_t ping_received = 0;
-        uint32_t ping_missing = 0;
-        uint32_t ping_consecutive_missing = 0;
-        double ping_gap_percent = 0.0;
-        uint32_t audio_ingress_received = 0;
-        uint32_t audio_ingress_gaps = 0;
-        double audio_ingress_gap_percent = 0.0;
-        double opus_send_queue_avg_ms = 0.0;
-        double opus_send_queue_max_ms = 0.0;
-        double opus_send_queue_p99_ms = 0.0;
-        double total_estimate_ms = 0.0;
-        double total_input_ms = 0.0;
-        double total_opus_ms = 0.0;
-        double total_network_ms = 0.0;
-        double total_jitter_ms = 0.0;
-        double total_output_ms = 0.0;
-        double e2e_latency_avg_max_ms = 0.0;
-        double e2e_latency_peak_ms = 0.0;
-        uint64_t e2e_latency_samples = 0;
-        double tx_pace_avg_ms = 0.0;
-        double tx_pace_max_ms = 0.0;
-        size_t rx_queue_current = 0;
-        size_t rx_queue_avg_max = 0;
-        size_t rx_queue_peak = 0;
-        int underruns = 0;
-        size_t plc_frames = 0;
-        uint32_t udp_rebind_count = 0;
-    };
+    using PathDiagnostics = ClientPathDiagnostics;
 
     DeviceInfo get_device_info() const {
         return audio_state_.device_info();
@@ -4317,6 +4278,307 @@ private:
     PeriodicTimer cleanup_timer_;
 };
 
+class ClientAppAdapter final : public ClientAppFacade {
+public:
+    explicit ClientAppAdapter(Client& client)
+        : client_(client) {
+    }
+
+    bool start_audio_stream(AudioStream::DeviceIndex input_device,
+                            AudioStream::DeviceIndex output_device,
+                            const AudioStream::AudioConfig& config) override {
+        return client_.start_audio_stream(input_device, output_device, config);
+    }
+
+    void stop_audio_stream() override {
+        client_.stop_audio_stream();
+    }
+
+    bool is_audio_stream_active() const override {
+        return client_.is_audio_stream_active();
+    }
+
+    bool swap_audio_devices(AudioStream::DeviceIndex input_device,
+                            AudioStream::DeviceIndex output_device) override {
+        return client_.swap_audio_devices(input_device, output_device);
+    }
+
+    void reset_audio_path() override {
+        client_.reset_audio_path();
+    }
+
+    std::string get_server_address() const override {
+        return client_.get_server_address();
+    }
+
+    unsigned short get_server_port() const override {
+        return client_.get_server_port();
+    }
+
+    std::string get_room_id() const override {
+        return client_.get_room_id();
+    }
+
+    std::vector<ParticipantInfo> get_participant_info() const override {
+        return client_.get_participant_info();
+    }
+
+    float get_own_audio_level() const override {
+        return client_.get_own_audio_level();
+    }
+
+    double get_rtt_ms() const override {
+        return client_.get_rtt_ms();
+    }
+
+    uint64_t get_total_bytes_rx() const override {
+        return client_.get_total_bytes_rx();
+    }
+
+    uint64_t get_total_bytes_tx() const override {
+        return client_.get_total_bytes_tx();
+    }
+
+    void set_mic_muted(bool muted) override {
+        client_.set_mic_muted(muted);
+    }
+
+    bool get_mic_muted() const override {
+        return client_.get_mic_muted();
+    }
+
+    void set_self_monitor_enabled(bool enabled) override {
+        client_.set_self_monitor_enabled(enabled);
+    }
+
+    bool get_self_monitor_enabled() const override {
+        return client_.get_self_monitor_enabled();
+    }
+
+    void set_input_gain(float gain) override {
+        client_.set_input_gain(gain);
+    }
+
+    float get_input_gain() const override {
+        return client_.get_input_gain();
+    }
+
+    DeviceInfo get_device_info() const override {
+        return client_.get_device_info();
+    }
+
+    AudioStream::LatencyInfo get_latency_info() const override {
+        return client_.get_latency_info();
+    }
+
+    AudioStream::AudioConfig get_audio_config() const override {
+        return client_.get_audio_config();
+    }
+
+    CallbackTimingInfo get_callback_timing_info() const override {
+        return client_.get_callback_timing_info();
+    }
+
+    PathDiagnostics get_path_diagnostics() const override {
+        return client_.get_path_diagnostics();
+    }
+
+    int get_input_channel_index() const override {
+        return client_.get_input_channel_index();
+    }
+
+    void set_input_channel_index(int channel_index) override {
+        client_.set_input_channel_index(channel_index);
+    }
+
+    void set_requested_frames_per_buffer(int frames_per_buffer) override {
+        client_.set_requested_frames_per_buffer(frames_per_buffer);
+    }
+
+    AudioStream::DeviceIndex get_selected_input_device() const override {
+        return client_.get_selected_input_device();
+    }
+
+    AudioStream::DeviceIndex get_selected_output_device() const override {
+        return client_.get_selected_output_device();
+    }
+
+    std::string get_audio_api_filter() const override {
+        return client_.get_audio_api_filter();
+    }
+
+    void set_audio_api_filter(std::string api_filter) override {
+        client_.set_audio_api_filter(std::move(api_filter));
+    }
+
+    bool save_audio_device_preferences() const override {
+        return client_.save_audio_device_preferences();
+    }
+
+    bool set_input_device(AudioStream::DeviceIndex device_index) override {
+        return client_.set_input_device(device_index);
+    }
+
+    bool set_output_device(AudioStream::DeviceIndex device_index) override {
+        return client_.set_output_device(device_index);
+    }
+
+    uint16_t get_opus_network_frame_count() const override {
+        return client_.get_opus_network_frame_count();
+    }
+
+    void set_opus_network_frame_count(int frame_count) override {
+        client_.set_opus_network_frame_count(frame_count);
+    }
+
+    double get_opus_network_packet_ms() const override {
+        return client_.get_opus_network_packet_ms();
+    }
+
+    int get_opus_jitter_buffer_ms() const override {
+        return client_.get_opus_jitter_buffer_ms();
+    }
+
+    size_t get_opus_jitter_buffer_packets() const override {
+        return client_.get_opus_jitter_buffer_packets();
+    }
+
+    void set_opus_jitter_buffer_ms(int target_ms) override {
+        client_.set_opus_jitter_buffer_ms(target_ms);
+    }
+
+    size_t get_opus_auto_start_jitter_packets() const override {
+        return client_.get_opus_auto_start_jitter_packets();
+    }
+
+    int get_opus_auto_start_jitter_ms() const override {
+        return client_.get_opus_auto_start_jitter_ms();
+    }
+
+    size_t get_opus_queue_limit_packets() const override {
+        return client_.get_opus_queue_limit_packets();
+    }
+
+    void set_opus_queue_limit_packets(size_t packets) override {
+        client_.set_opus_queue_limit_packets(packets);
+    }
+
+    int get_jitter_packet_age_limit_ms() const override {
+        return client_.get_jitter_packet_age_limit_ms();
+    }
+
+    void set_jitter_packet_age_limit_ms(int age_ms) override {
+        client_.set_jitter_packet_age_limit_ms(age_ms);
+    }
+
+    bool get_opus_auto_jitter_default() const override {
+        return client_.get_opus_auto_jitter_default();
+    }
+
+    void set_opus_auto_jitter_default(bool enabled) override {
+        client_.set_opus_auto_jitter_default(enabled);
+    }
+
+    int get_opus_redundancy_depth_setting() const override {
+        return client_.get_opus_redundancy_depth_setting();
+    }
+
+    int get_effective_opus_redundancy_depth() const override {
+        return client_.get_effective_opus_redundancy_depth();
+    }
+
+    void set_opus_redundancy_depth(int depth) override {
+        client_.set_opus_redundancy_depth(depth);
+    }
+
+    void set_participant_muted(uint32_t id, bool muted) override {
+        client_.set_participant_muted(id, muted);
+    }
+
+    void set_participant_gain(uint32_t id, float gain) override {
+        client_.set_participant_gain(id, gain);
+    }
+
+    void set_participant_pan(uint32_t id, float pan) override {
+        client_.set_participant_pan(id, pan);
+    }
+
+    void set_participant_opus_jitter_buffer_ms(uint32_t id, int target_ms) override {
+        client_.set_participant_opus_jitter_buffer_ms(id, target_ms);
+    }
+
+    void reset_participant_opus_jitter_buffer_packets(uint32_t id) override {
+        client_.reset_participant_opus_jitter_buffer_packets(id);
+    }
+
+    void set_participant_opus_auto_jitter(uint32_t id, bool enabled) override {
+        client_.set_participant_opus_auto_jitter(id, enabled);
+    }
+
+    MetronomeState get_metronome_state() const override {
+        return client_.get_metronome_state();
+    }
+
+    void commit_metronome_bpm(float bpm) override {
+        client_.commit_metronome_bpm(bpm);
+    }
+
+    void start_metronome() override {
+        client_.start_metronome();
+    }
+
+    void stop_metronome() override {
+        client_.stop_metronome();
+    }
+
+    void tap_metronome_tempo() override {
+        client_.tap_metronome_tempo();
+    }
+
+    RecordingState get_recording_state() const override {
+        return client_.get_recording_state();
+    }
+
+    bool start_recording() override {
+        return client_.start_recording();
+    }
+
+    void stop_recording() override {
+        client_.stop_recording();
+    }
+
+    bool load_wav_file(const std::string& path) override {
+        return client_.load_wav_file(path);
+    }
+
+    void wav_play() override {
+        client_.wav_play();
+    }
+
+    void wav_pause() override {
+        client_.wav_pause();
+    }
+
+    void wav_seek(int64_t frame_position) override {
+        client_.wav_seek(frame_position);
+    }
+
+    void set_wav_gain(float gain) override {
+        client_.set_wav_gain(gain);
+    }
+
+    void set_wav_muted_local(bool muted) override {
+        client_.set_wav_muted_local(muted);
+    }
+
+    WavState get_wav_state() const override {
+        return client_.get_wav_state();
+    }
+
+private:
+    Client& client_;
+};
+
 #include "imgui_client_ui.inl"
 
 static bool apply_startup_latency_profile(Client& client,
@@ -4489,9 +4751,10 @@ int main(int argc, char** argv) {
             startup_options.app_version.empty()
                 ? "Jam"
                 : "Jam " + startup_options.app_version;
+        ClientAppAdapter client_app(client_instance);
         Gui app(810, 555, window_title.c_str(), false, 60);
 
-        app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });
+        app.set_draw_callback([&client_app]() { draw_client_ui(client_app); });
 
         app.set_close_callback([&io_context]() {
             io_context.stop();

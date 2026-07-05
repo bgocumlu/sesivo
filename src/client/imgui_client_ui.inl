@@ -10,7 +10,7 @@ static constexpr float KNOB_SIZE    = 50.0F;
 static constexpr float MASTER_WIDTH = 160.0F;  // Wider master
 
 // Draw the master (your own audio) channel strip with WAV controls
-static void draw_master_strip(Client& client, float available_height) {
+static void draw_master_strip(ClientAppFacade& client, float available_height) {
     ImGuiStyle& style       = ImGui::GetStyle();
     float       strip_width = MASTER_WIDTH;
     float       line_height = ImGui::GetTextLineHeightWithSpacing();
@@ -199,7 +199,7 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Spacing();
 
         // ========== METRONOME SECTION ==========
-        Client::MetronomeState metronome = client.get_metronome_state();
+        ClientAppFacade::MetronomeState metronome = client.get_metronome_state();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Metronome:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
@@ -258,7 +258,7 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Spacing();
 
         // ========== RECORDING SECTION ==========
-        Client::RecordingState recording = client.get_recording_state();
+        ClientAppFacade::RecordingState recording = client.get_recording_state();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Recording:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (PADDING / 2.0F));
@@ -286,7 +286,7 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Spacing();
 
         // ========== PATH DIAGNOSTICS ==========
-        Client::PathDiagnostics path = client.get_path_diagnostics();
+        ClientAppFacade::PathDiagnostics path = client.get_path_diagnostics();
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("Path:");
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
@@ -354,10 +354,11 @@ static void draw_master_strip(Client& client, float available_height) {
 
         // ========== LATENCY INFO (with padding) ==========
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
-        Client::DeviceInfo       device_info  = client.get_device_info();
+        ClientAppFacade::DeviceInfo device_info = client.get_device_info();
         AudioStream::LatencyInfo latency      = client.get_latency_info();
         AudioStream::AudioConfig audio_config = client.get_audio_config();
-        Client::CallbackTimingInfo callback_timing = client.get_callback_timing_info();
+        ClientAppFacade::CallbackTimingInfo callback_timing =
+            client.get_callback_timing_info();
         ImGui::Text("%s", device_info.output_api.c_str());
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("In: %.1f ms", latency.input_latency_ms);
@@ -390,7 +391,7 @@ static void draw_master_strip(Client& client, float available_height) {
         ImGui::Spacing();
 
         // ========== WAV SECTION (with padding) ==========
-        Client::WavState wav_state = client.get_wav_state();
+        ClientAppFacade::WavState wav_state = client.get_wav_state();
 
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + PADDING);
         ImGui::Text("WAV File:");
@@ -515,7 +516,7 @@ static ParticipantQualityStatus participant_quality_status(const ParticipantInfo
             ImVec4(0.35F, 0.85F, 0.45F, 1.0F)};
 }
 
-static void draw_participant_strip(Client& client, const ParticipantInfo& p, int index,
+static void draw_participant_strip(ClientAppFacade& client, const ParticipantInfo& p, int index,
                                    float available_height) {
     ImGuiStyle& style       = ImGui::GetStyle();
     float       strip_width = TRACK_WIDTH;
@@ -768,7 +769,7 @@ static void draw_participant_strip(Client& client, const ParticipantInfo& p, int
 }
 
 // Draw bottom device selector bar (horizontal)
-static void draw_bottom_bar(Client& client) {
+static void draw_bottom_bar(ClientAppFacade& client) {
     static std::vector<AudioStream::DeviceInfo> input_devices;
     static std::vector<AudioStream::DeviceInfo> output_devices;
     static std::vector<AudioStream::ApiInfo>    available_apis;
@@ -1175,7 +1176,7 @@ static void draw_bottom_bar(Client& client) {
     }
 }
 
-void draw_client_ui(Client& client) {
+void draw_client_ui(ClientAppFacade& client) {
     // Apply zynlab theme on first frame
     static bool theme_applied = false;
     if (!theme_applied) {

@@ -49,6 +49,7 @@
 #include "audio_packet.h"
 #include "audio_stream.h"
 #include "client_audio_devices.h"
+#include "client_audio_state.h"
 #include "client_join_session.h"
 #include "client_startup.h"
 #include "gui.h"
@@ -97,12 +98,8 @@ public:
         : io_context_(io_context),
           socket_(io_context),
           join_session_(std::move(performer_join_options), 1s),
+          audio_state_(audio_preferences.audio_api),
           audio_preferences_path_(std::move(audio_preferences_path)),
-          selected_audio_api_filter_(audio_preferences.audio_api.empty()
-                                         ? "All"
-                                         : audio_preferences.audio_api),
-          selected_input_device_(AudioStream::NO_DEVICE),
-          selected_output_device_(AudioStream::NO_DEVICE),
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
           join_retry_timer_(io_context, 1s, [this]() { join_retry_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
@@ -123,31 +120,20 @@ public:
             configure_udp_socket_locked();
         }
 
-        // Initialize audio config with defaults (but don't start stream yet)
-        AudioStream::AudioConfig default_config{};
-        default_config.sample_rate       = 48000;
-        default_config.bitrate           = AudioStream::AudioConfig::DEFAULT_BITRATE;
-        default_config.complexity        = AudioStream::AudioConfig::DEFAULT_COMPLEXITY;
-        default_config.frames_per_buffer = 120;  // 2.5ms validated low-latency default
-        default_config.input_channel_index = 0;
-        default_config.input_gain        = 1.0F;
-        default_config.output_gain       = 1.0F;
-        publish_audio_config(default_config);
-
         // Set default devices
-        selected_input_device_  = AudioStream::get_default_input_device();
-        selected_output_device_ = AudioStream::get_default_output_device();
+        audio_state_.set_selected_input_device(AudioStream::get_default_input_device());
+        audio_state_.set_selected_output_device(AudioStream::get_default_output_device());
 
         if (audio_preferences.loaded) {
             apply_audio_device_preferences(audio_preferences);
         }
 
         // Initialize device info with default devices
-        if (selected_input_device_ != AudioStream::NO_DEVICE) {
-            set_input_device(selected_input_device_);
+        if (get_selected_input_device() != AudioStream::NO_DEVICE) {
+            set_input_device(get_selected_input_device());
         }
-        if (selected_output_device_ != AudioStream::NO_DEVICE) {
-            set_output_device(selected_output_device_);
+        if (get_selected_output_device() != AudioStream::NO_DEVICE) {
+            set_output_device(get_selected_output_device());
         }
 
         // Connect to server (audio stream will be started manually via UI)
@@ -305,16 +291,8 @@ public:
         }
         auto output_info = *output_info_ptr;
 
-        // Store device info
-        device_info_.input_device_name  = input_info.name;
-        device_info_.input_api          = input_info.api_name;
-        device_info_.input_channels     = input_info.max_input_channels;
-        device_info_.input_channel_index = runtime_config.input_channel_index;
-        device_info_.input_sample_rate  = input_info.default_sample_rate;
-        device_info_.output_device_name = output_info.name;
-        device_info_.output_api         = output_info.api_name;
-        device_info_.output_channels    = output_info.max_output_channels >= 2 ? 2 : 1;
-        device_info_.output_sample_rate = output_info.default_sample_rate;
+        audio_state_.set_input_device_info(input_info, runtime_config.input_channel_index);
+        audio_state_.set_output_device_info(output_info);
 
         // Initialize Opus encoder for sending own audio BEFORE starting stream
         // This prevents data race where callback might access encoder during initialization
@@ -326,11 +304,10 @@ public:
         publish_audio_config(runtime_config);
 
         // Store encoder info (get actual bitrate from encoder)
-        encoder_info_.channels       = input_channels;
-        encoder_info_.sample_rate    = runtime_config.sample_rate;
-        encoder_info_.bitrate        = runtime_config.bitrate;
-        encoder_info_.complexity     = runtime_config.complexity;
-        encoder_info_.actual_bitrate = audio_encoder_.get_actual_bitrate();
+        audio_state_.set_encoder_info(
+            ClientEncoderInfo{input_channels, runtime_config.sample_rate,
+                              runtime_config.bitrate, audio_encoder_.get_actual_bitrate(),
+                              runtime_config.complexity});
 
         spdlog::info("Starting audio stream...");
         bool success =
@@ -406,33 +383,16 @@ public:
 
     // Master input gain control (0.0 - 2.0, 1.0 = unity)
     void set_input_gain(float gain) {
-        input_gain_.store(std::clamp(gain, 0.0F, 2.0F), std::memory_order_release);
+        audio_state_.set_input_gain(gain);
     }
 
     float get_input_gain() const {
-        return input_gain_.load(std::memory_order_acquire);
+        return audio_state_.input_gain();
     }
 
     // Device and encoder info structure
-    struct DeviceInfo {
-        std::string input_device_name;
-        std::string input_api;
-        int         input_channels;
-        int         input_channel_index;
-        double      input_sample_rate;
-        std::string output_device_name;
-        std::string output_api;
-        int         output_channels;
-        double      output_sample_rate;
-    };
-
-    struct EncoderInfo {
-        int channels;
-        int sample_rate;
-        int bitrate;
-        int actual_bitrate;
-        int complexity;
-    };
+    using DeviceInfo = ClientDeviceInfo;
+    using EncoderInfo = ClientEncoderInfo;
 
     struct CallbackTimingInfo {
         double last_ms;
@@ -520,11 +480,11 @@ public:
     };
 
     DeviceInfo get_device_info() const {
-        return device_info_;
+        return audio_state_.device_info();
     }
 
     EncoderInfo get_encoder_info() const {
-        return encoder_info_;
+        return audio_state_.encoder_info();
     }
 
     AudioStream::LatencyInfo get_latency_info() const {
@@ -639,37 +599,27 @@ public:
     }
 
     AudioStream::AudioConfig get_audio_config() const {
-        std::lock_guard<std::mutex> lock(audio_config_mutex_);
-        return audio_config_;
+        return audio_state_.config();
     }
 
     int current_audio_sample_rate() const {
-        return audio_sample_rate_.load(std::memory_order_acquire);
+        return audio_state_.sample_rate();
     }
 
     int current_audio_frames_per_buffer() const {
-        return audio_frames_per_buffer_.load(std::memory_order_acquire);
+        return audio_state_.frames_per_buffer();
     }
 
     void publish_audio_config(const AudioStream::AudioConfig& config) {
-        {
-            std::lock_guard<std::mutex> lock(audio_config_mutex_);
-            audio_config_ = config;
-        }
-        audio_sample_rate_.store(config.sample_rate, std::memory_order_release);
-        audio_bitrate_.store(config.bitrate, std::memory_order_release);
-        audio_complexity_.store(config.complexity, std::memory_order_release);
-        audio_frames_per_buffer_.store(config.frames_per_buffer, std::memory_order_release);
+        audio_state_.publish_config(config);
     }
 
     void set_requested_frames_per_buffer(int frames_per_buffer) {
-        auto config = get_audio_config();
-        config.frames_per_buffer = frames_per_buffer;
-        publish_audio_config(config);
+        audio_state_.set_requested_frames_per_buffer(frames_per_buffer);
     }
 
     int get_input_channel_index() const {
-        return get_audio_config().input_channel_index;
+        return audio_state_.input_channel_index();
     }
 
     int max_input_channel_count_for_device(AudioStream::DeviceIndex device_index) const {
@@ -681,10 +631,8 @@ public:
     }
 
     void set_input_channel_index(int channel_index) {
-        auto config = get_audio_config();
-        const int channel_count = max_input_channel_count_for_device(selected_input_device_);
-        config.input_channel_index = std::clamp(channel_index, 0, channel_count - 1);
-        publish_audio_config(config);
+        audio_state_.set_input_channel_index(
+            channel_index, max_input_channel_count_for_device(get_selected_input_device()));
     }
 
     uint16_t get_opus_network_frame_count() const {
@@ -1213,25 +1161,25 @@ public:
     // Device selection methods (removed - use AudioStream static methods directly)
 
     AudioStream::DeviceIndex get_selected_input_device() const {
-        return selected_input_device_;
+        return audio_state_.selected_input_device();
     }
 
     AudioStream::DeviceIndex get_selected_output_device() const {
-        return selected_output_device_;
+        return audio_state_.selected_output_device();
     }
 
     std::string get_audio_api_filter() const {
-        return selected_audio_api_filter_;
+        return audio_state_.audio_api_filter();
     }
 
     void set_audio_api_filter(std::string api_filter) {
-        selected_audio_api_filter_ = api_filter.empty() ? "All" : std::move(api_filter);
+        audio_state_.set_audio_api_filter(std::move(api_filter));
     }
 
     bool save_audio_device_preferences() const {
         return ::save_audio_device_preferences(
-            audio_preferences_path_, selected_audio_api_filter_, selected_input_device_,
-            selected_output_device_, get_audio_config().input_channel_index);
+            audio_preferences_path_, get_audio_api_filter(), get_selected_input_device(),
+            get_selected_output_device(), get_audio_config().input_channel_index);
     }
 
     bool set_input_device(AudioStream::DeviceIndex device_index) {
@@ -1239,21 +1187,17 @@ public:
             spdlog::error("Invalid input device index: {}", device_index);
             return false;
         }
-        selected_input_device_ = device_index;
+        audio_state_.set_selected_input_device(device_index);
 
         // Update device info for UI display
         const auto* input_info = AudioStream::get_device_info(device_index);
         if (input_info != nullptr) {
-            device_info_.input_device_name = input_info->name;
-            device_info_.input_api         = input_info->api_name;
-            device_info_.input_channels    = input_info->max_input_channels;
             auto config = get_audio_config();
             const int input_channel_count = std::max(input_info->max_input_channels, 1);
             config.input_channel_index =
                 std::clamp(config.input_channel_index, 0, input_channel_count - 1);
             publish_audio_config(config);
-            device_info_.input_channel_index = config.input_channel_index;
-            device_info_.input_sample_rate = input_info->default_sample_rate;
+            audio_state_.set_input_device_info(*input_info, config.input_channel_index);
         }
         return true;
     }
@@ -1263,15 +1207,12 @@ public:
             spdlog::error("Invalid output device index: {}", device_index);
             return false;
         }
-        selected_output_device_ = device_index;
+        audio_state_.set_selected_output_device(device_index);
 
         // Update device info for UI display
         const auto* output_info = AudioStream::get_device_info(device_index);
         if (output_info != nullptr) {
-            device_info_.output_device_name = output_info->name;
-            device_info_.output_api         = output_info->api_name;
-            device_info_.output_channels    = output_info->max_output_channels >= 2 ? 2 : 1;
-            device_info_.output_sample_rate = output_info->default_sample_rate;
+            audio_state_.set_output_device_info(*output_info);
         }
         return true;
     }
@@ -1287,8 +1228,8 @@ public:
         }
 
         // Update selected devices
-        selected_input_device_  = input_device;
-        selected_output_device_ = output_device;
+        audio_state_.set_selected_input_device(input_device);
+        audio_state_.set_selected_output_device(output_device);
 
         // Start new stream if it was active before
         if (was_active) {
@@ -1300,8 +1241,8 @@ public:
 
     void reset_audio_path() {
         const bool was_active = audio_.is_stream_active();
-        const auto input_device = selected_input_device_;
-        const auto output_device = selected_output_device_;
+        const auto input_device = get_selected_input_device();
+        const auto output_device = get_selected_output_device();
         const auto config = get_audio_config();
 
         if (was_active) {
@@ -1799,14 +1740,14 @@ private:
                                         preferences.output_api, preferences.audio_api);
 
         if (preferred_input != AudioStream::NO_DEVICE) {
-            selected_input_device_ = preferred_input;
+            audio_state_.set_selected_input_device(preferred_input);
         } else if (!preferences.input_device.empty()) {
             spdlog::warn("Saved input device is unavailable; using default: {}",
                       preferences.input_device);
         }
 
         if (preferred_output != AudioStream::NO_DEVICE) {
-            selected_output_device_ = preferred_output;
+            audio_state_.set_selected_output_device(preferred_output);
         } else if (!preferences.output_device.empty()) {
             spdlog::warn("Saved output device is unavailable; using default: {}",
                       preferences.output_device);
@@ -3620,7 +3561,7 @@ private:
 
         // Register participant if not known
         if (!participant_manager_.exists(sender_id)) {
-            // Validate audio_config_ before using it
+            // Validate runtime audio shape before creating participant decoder state.
             const int decoder_sample_rate = static_cast<int>(parsed_audio.sample_rate);
             const int decoder_channels = static_cast<int>(parsed_audio.channels);
             if (decoder_sample_rate == 0 || current_audio_frames_per_buffer() == 0 ||
@@ -4398,7 +4339,7 @@ private:
 
         if (client->self_monitor_enabled_.load(std::memory_order_acquire) &&
             input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
-            const float input_gain = client->input_gain_.load(std::memory_order_acquire);
+            const float input_gain = client->audio_state_.input_gain();
             audio_analysis::mix_local_monitor(output_buffer, input_buffer, frame_count,
                                               out_channels, input_gain);
             for (unsigned long i = 0; i < frame_count * out_channels; ++i) {
@@ -4424,7 +4365,7 @@ private:
             }
 
             if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
-                float input_gain = client->input_gain_.load(std::memory_order_acquire);
+                float input_gain = client->audio_state_.input_gain();
                 for (unsigned long i = 0; i < frame_count; ++i) {
                     float mic_sample = input_buffer[i] * input_gain;
                     opus_input[i] = wav_active ? (opus_input[i] + mic_sample) * 0.5F : mic_sample;
@@ -4454,21 +4395,14 @@ private:
     mutable std::mutex server_endpoint_mutex_;
     udp::endpoint      server_endpoint_;
     ClientJoinSession join_session_;
+    ClientAudioState audio_state_;
     std::filesystem::path audio_preferences_path_;
-    std::string           selected_audio_api_filter_ = "All";
     std::optional<session_crypto::SessionKey> session_key_;
     session_crypto::ReplayWindow              server_audio_replay_window_;
     std::atomic<uint64_t>                     secure_audio_send_nonce_{1};
 
     AudioStream              audio_;
     OpusEncoderWrapper       audio_encoder_;
-    mutable std::mutex       audio_config_mutex_;
-    AudioStream::AudioConfig audio_config_;  // Store config for decoder initialization
-    std::atomic<int>         audio_sample_rate_{AudioStream::AudioConfig::DEFAULT_SAMPLE_RATE};
-    std::atomic<int>         audio_bitrate_{AudioStream::AudioConfig::DEFAULT_BITRATE};
-    std::atomic<int>         audio_complexity_{AudioStream::AudioConfig::DEFAULT_COMPLEXITY};
-    std::atomic<int>         audio_frames_per_buffer_{
-        AudioStream::AudioConfig::DEFAULT_FRAMES_PER_BUFFER};
     std::atomic<uint16_t>    opus_network_frame_count_{opus_network_clock::DEFAULT_FRAME_COUNT};
     std::atomic<int>         opus_jitter_buffer_ms_{DEFAULT_OPUS_JITTER_MS};
     std::atomic<size_t>      opus_queue_limit_packets_{DEFAULT_OPUS_QUEUE_LIMIT_PACKETS};
@@ -4557,9 +4491,6 @@ private:
     std::atomic<bool> mic_muted_{false};  // Mute mic (doesn't send to server)
     std::atomic<bool> self_monitor_enabled_{false};
 
-    // Master input gain (thread-safe with atomic) - 1.0 = unity
-    std::atomic<float> input_gain_{1.0F};
-
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
 
@@ -4612,14 +4543,6 @@ private:
     uint64_t                                               last_opus_send_drops_ = 0;
     uint64_t                                               last_outbound_malformed_audio_drops_ = 0;
     std::unordered_map<uint32_t, ParticipantDropSnapshot>  participant_drop_snapshots_;
-
-    // Device and encoder info storage
-    DeviceInfo  device_info_;
-    EncoderInfo encoder_info_;
-
-    // Selected devices (for UI)
-    AudioStream::DeviceIndex selected_input_device_;
-    AudioStream::DeviceIndex selected_output_device_;
 
     PeriodicTimer ping_timer_;
     PeriodicTimer join_retry_timer_;

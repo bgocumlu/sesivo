@@ -92,6 +92,7 @@ add_executable(client
     ${JAM_CLIENT_DIR}/gui.cpp
     ${JAM_CLIENT_DIR}/audio_stream.cpp
     ${JAM_CLIENT_DIR}/juce_audio_backend.cpp
+    ${JAM_COMMON_DIR}/logging_setup.cpp
 )
 jam_add_project_includes(client)
 

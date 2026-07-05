@@ -44,7 +44,7 @@
 #include <concurrentqueue.h>
 #include <imgui.h>
 #include <opus.h>
-#include <spdlog/common.h>
+#include <spdlog/spdlog.h>
 
 #include "audio_analysis.h"
 #include "audio_packet.h"
@@ -53,7 +53,7 @@
 #include "gui.h"
 #include "join_reliability.h"
 #include "jitter_policy.h"
-#include "logger.h"
+#include "logging_setup.h"
 #include "message_validator.h"
 #include "opus_decoder.h"
 #include "opus_defines.h"
@@ -81,7 +81,7 @@ static int normalized_buffer_frames_for_codec(AudioCodec codec, int frames_per_b
 static int normalize_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
     const int normalized = normalized_buffer_frames_for_codec(codec, frames_per_buffer);
     if (normalized != frames_per_buffer) {
-        Log::info("Normalizing buffer from {} to {} frames for Opus network pacing",
+        spdlog::info("Normalizing buffer from {} to {} frames for Opus network pacing",
                   frames_per_buffer, normalized);
     }
     return normalized;
@@ -164,7 +164,7 @@ public:
             throw std::runtime_error("Failed to bind UDP socket: " +
                                      socket_error.message());
         }
-        Log::info("Client local port: {} ({})", socket_.local_endpoint().port(),
+        spdlog::info("Client local port: {} ({})", socket_.local_endpoint().port(),
                   protocol == udp::v6() ? "IPv6 dual-stack" : "IPv4 fallback");
 
         // Optimize UDP socket buffers for low-latency audio streaming
@@ -206,7 +206,7 @@ public:
 
     // Start connection to server (or switch to new server)
     void start_connection(const std::string& server_address, uint16_t server_port) {
-        Log::info("Connecting to {}:{}...", server_address, server_port);
+        spdlog::info("Connecting to {}:{}...", server_address, server_port);
         receiving_enabled_.store(false, std::memory_order_release);
         outbound_enabled_.store(false, std::memory_order_release);
         outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
@@ -228,7 +228,7 @@ public:
         }
         const udp::endpoint resolved_endpoint = *selected_endpoint;
 
-        Log::info("Resolved to: {}:{}", 
+        spdlog::info("Resolved to: {}:{}",
                   udp_network::format_address_for_display(resolved_endpoint.address()),
                   resolved_endpoint.port());
         {
@@ -251,7 +251,7 @@ public:
 
         do_receive();
 
-        Log::info("Connected and receiving!");
+        spdlog::info("Connected and receiving!");
 
         send_join();
     }
@@ -271,7 +271,7 @@ public:
         update_session_key_from_join_token();
         join_state_.mark_join_sent(std::chrono::steady_clock::now());
         send(buf->data(), buf->size(), buf);
-        Log::info("Sent JOIN for room '{}' user '{}' token {}", performer_join_options_.room_id,
+        spdlog::info("Sent JOIN for room '{}' user '{}' token {}", performer_join_options_.room_id,
                   performer_join_options_.user_id,
                   performer_join_options_.join_token.empty() ? "missing" : "present");
     }
@@ -293,7 +293,7 @@ public:
                 performer_join_options_.join_token);
         if (!derived.has_value()) {
             reset_session_security();
-            Log::warn("Join token is not usable for secure audio key derivation");
+            spdlog::warn("Join token is not usable for secure audio key derivation");
             return;
         }
 
@@ -306,7 +306,7 @@ public:
 
     // Stop connection (stops sending/receiving UDP packets)
     void stop_connection() {
-        Log::info("Disconnecting from server...");
+        spdlog::info("Disconnecting from server...");
 
         // Stop receive scheduling before touching the socket from the caller thread.
         receiving_enabled_.store(false, std::memory_order_release);
@@ -327,13 +327,13 @@ public:
             socket_.cancel(cancel_error);
         }
         if (leave_error) {
-            Log::warn("LEAVE send failed: {}", leave_error.message());
+            spdlog::warn("LEAVE send failed: {}", leave_error.message());
         }
         if (cancel_error) {
-            Log::warn("socket cancel failed: {}", cancel_error.message());
+            spdlog::warn("socket cancel failed: {}", cancel_error.message());
         }
 
-        Log::info("Disconnected (no longer sending/receiving)");
+        spdlog::info("Disconnected (no longer sending/receiving)");
     }
 
     bool start_audio_stream(AudioStream::DeviceIndex input_device,
@@ -348,7 +348,7 @@ public:
         // (audio_.get_input_channel_count() returns 0 before stream starts)
         const auto* input_info_ptr = AudioStream::get_device_info(input_device);
         if (input_info_ptr == nullptr) {
-            Log::error("Invalid input device");
+            spdlog::error("Invalid input device");
             return false;
         }
         auto input_info = *input_info_ptr;
@@ -360,7 +360,7 @@ public:
         // Get output device info
         const auto* output_info_ptr = AudioStream::get_device_info(output_device);
         if (output_info_ptr == nullptr) {
-            Log::error("Invalid output device");
+            spdlog::error("Invalid output device");
             return false;
         }
         auto output_info = *output_info_ptr;
@@ -380,7 +380,7 @@ public:
         // This prevents data race where callback might access encoder during initialization
         if (!audio_encoder_.create(runtime_config.sample_rate, input_channels, OPUS_APPLICATION_VOIP,
                                    runtime_config.bitrate, runtime_config.complexity)) {
-            Log::error("Failed to create Opus encoder");
+            spdlog::error("Failed to create Opus encoder");
             return false;
         }
         publish_audio_config(runtime_config);
@@ -392,7 +392,7 @@ public:
         encoder_info_.complexity     = runtime_config.complexity;
         encoder_info_.actual_bitrate = audio_encoder_.get_actual_bitrate();
 
-        Log::info("Starting audio stream...");
+        spdlog::info("Starting audio stream...");
         bool success =
             audio_.start_audio_stream(input_device, output_device, runtime_config, audio_callback,
                                       this);
@@ -792,7 +792,7 @@ public:
             opus_network_frame_count_.exchange(normalized, std::memory_order_acq_rel);
         if (previous != normalized) {
             opus_tx_accumulator_reset_requested_.store(true, std::memory_order_release);
-            Log::info("Opus network packet changed from {} to {} frames ({:.1f} ms)",
+            spdlog::info("Opus network packet changed from {} to {} frames ({:.1f} ms)",
                       previous, normalized,
                       opus_network_clock::frame_duration_ms(sample_rate, normalized));
             apply_opus_jitter_buffer_ms(
@@ -982,7 +982,7 @@ public:
         const int previous_jitter_ms = get_opus_jitter_buffer_ms();
         if (previous_jitter_ms > clamped) {
             apply_opus_jitter_buffer_ms(clamped);
-            Log::info("Clamped global Opus jitter from {} ms to packet age limit {} ms",
+            spdlog::info("Clamped global Opus jitter from {} ms to packet age limit {} ms",
                       previous_jitter_ms, clamped);
         }
 
@@ -1210,9 +1210,9 @@ public:
         const bool started =
             recording_writer_.start(static_cast<uint32_t>(current_audio_sample_rate()));
         if (started) {
-            Log::info("Recording started: {}", recording_writer_.folder());
+            spdlog::info("Recording started: {}", recording_writer_.folder());
         } else {
-            Log::error("Recording failed to start");
+            spdlog::error("Recording failed to start");
         }
         return started;
     }
@@ -1222,7 +1222,7 @@ public:
         const std::string folder = recording_writer_.folder();
         recording_writer_.stop();
         if (was_active && !folder.empty()) {
-            Log::info("Recording stopped: {}", folder);
+            spdlog::info("Recording stopped: {}", folder);
         }
     }
 
@@ -1329,7 +1329,7 @@ public:
 
         std::ofstream output(audio_preferences_path_, std::ios::trunc);
         if (!output) {
-            Log::warn("Could not write audio device preferences: {}",
+            spdlog::warn("Could not write audio device preferences: {}",
                       audio_preferences_path_.string());
             return false;
         }
@@ -1340,14 +1340,14 @@ public:
                << "input_channel=" << get_audio_config().input_channel_index << '\n'
                << "output_device=" << output_name << '\n'
                << "output_api=" << output_api << '\n';
-        Log::info("Saved audio device preferences: {}",
+        spdlog::info("Saved audio device preferences: {}",
                   audio_preferences_path_.string());
         return true;
     }
 
     bool set_input_device(AudioStream::DeviceIndex device_index) {
         if (!AudioStream::is_device_valid(device_index)) {
-            Log::error("Invalid input device index: {}", device_index);
+            spdlog::error("Invalid input device index: {}", device_index);
             return false;
         }
         selected_input_device_ = device_index;
@@ -1371,7 +1371,7 @@ public:
 
     bool set_output_device(AudioStream::DeviceIndex device_index) {
         if (!AudioStream::is_device_valid(device_index)) {
-            Log::error("Invalid output device index: {}", device_index);
+            spdlog::error("Invalid output device index: {}", device_index);
             return false;
         }
         selected_output_device_ = device_index;
@@ -1426,7 +1426,7 @@ public:
             start_audio_stream(input_device, output_device, config);
         }
 
-        Log::warn("Manual audio path reset: cleared local queues and restarted audio stream");
+        spdlog::warn("Manual audio path reset: cleared local queues and restarted audio stream");
     }
 
     // =========================================================================
@@ -1542,7 +1542,7 @@ public:
             const uint64_t count =
                 stray_udp_packets_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
-                Log::warn(
+                spdlog::warn(
                     "Ignoring UDP packet from unexpected endpoint {}:{} (server is {}:{}, "
                     "ignored={})",
                     state->endpoint.address().to_string(), state->endpoint.port(),
@@ -1583,7 +1583,7 @@ public:
                               static_cast<unsigned char>(state->buffer[i]));
                 hex_dump += hex;
             }
-            Log::warn("Unknown message (magic=0x{:08x}, bytes={}, hex={}...)", hdr.magic, bytes,
+            spdlog::warn("Unknown message (magic=0x{:08x}, bytes={}, hex={}...)", hdr.magic, bytes,
                       hex_dump);
         }
 
@@ -1659,7 +1659,7 @@ public:
                                       outbound.endpoint,
                                       [send_buffer](std::error_code error_code, std::size_t) {
                                           if (error_code) {
-                                              Log::error("send error: {}", error_code.message());
+                                              spdlog::error("send error: {}", error_code.message());
                                           }
                                       });
             }
@@ -1730,7 +1730,7 @@ private:
             error_code != asio::error::try_again &&
             error_code != asio::error::operation_aborted &&
             outbound_enabled_.load(std::memory_order_acquire)) {
-            Log::error("audio send error: {}", error_code.message());
+            spdlog::error("audio send error: {}", error_code.message());
         }
     }
 
@@ -1738,10 +1738,10 @@ private:
         std::error_code buffer_error;
         udp_network::configure_low_latency_buffers(socket, buffer_error);
         if (!buffer_error) {
-            Log::info("UDP socket buffers optimized for low latency ({} bytes)",
+            spdlog::info("UDP socket buffers optimized for low latency ({} bytes)",
                       UDP_SOCKET_BUFFER_BYTES);
         } else {
-            Log::warn("Failed to set socket buffer sizes: {}", buffer_error.message());
+            spdlog::warn("Failed to set socket buffer sizes: {}", buffer_error.message());
         }
     }
 
@@ -1752,10 +1752,10 @@ private:
         }
         const auto address = udp_network::format_address_for_display(endpoint.address());
         if (!result.ok() || result.detail.find("failed") != std::string::npos) {
-            Log::warn("UDP QoS not fully active for {}:{}: {}", address, endpoint.port(),
+            spdlog::warn("UDP QoS not fully active for {}:{}: {}", address, endpoint.port(),
                       result.detail);
         } else {
-            Log::info("UDP QoS active for {}:{}: {}", address, endpoint.port(),
+            spdlog::info("UDP QoS active for {}:{}: {}", address, endpoint.port(),
                       result.detail);
         }
     }
@@ -1850,7 +1850,7 @@ private:
         udp::socket     replacement(io_context_);
         udp_network::open_compatible_socket(replacement, target, 0, ec);
         if (ec) {
-            Log::error("UDP path rebind failed after '{}': {}", reason, ec.message());
+            spdlog::error("UDP path rebind failed after '{}': {}", reason, ec.message());
             return;
         }
         configure_udp_socket(replacement);
@@ -1895,7 +1895,7 @@ private:
 
         const uint32_t rebind_count =
             udp_path_rebind_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        Log::warn(
+        spdlog::warn(
             "UDP path rebind #{} after '{}': local port {} -> {}; rejoining room '{}'",
             rebind_count, reason, old_port, new_port, performer_join_options_.room_id);
 
@@ -1917,14 +1917,14 @@ private:
         if (preferred_input != AudioStream::NO_DEVICE) {
             selected_input_device_ = preferred_input;
         } else if (!preferences.input_device.empty()) {
-            Log::warn("Saved input device is unavailable; using default: {}",
+            spdlog::warn("Saved input device is unavailable; using default: {}",
                       preferences.input_device);
         }
 
         if (preferred_output != AudioStream::NO_DEVICE) {
             selected_output_device_ = preferred_output;
         } else if (!preferences.output_device.empty()) {
-            Log::warn("Saved output device is unavailable; using default: {}",
+            spdlog::warn("Saved output device is unavailable; using default: {}",
                       preferences.output_device);
         }
 
@@ -1967,7 +1967,7 @@ private:
             codec = parsed.codec;
         }
 
-        Log::error(
+        spdlog::error(
             "BUG: refusing malformed outbound versioned audio: reason={} len={} magic=0x{:08x} "
             "header_size={} payload_bytes={} codec={} seq={}",
             reason, len, hdr.magic, parsed.header_size, payload_bytes, static_cast<int>(codec),
@@ -3228,7 +3228,7 @@ private:
             return static_cast<double>(ns) / 1'000'000.0;
         };
 
-        Log::info(
+        spdlog::info(
             "Audio diag: frames={} tx_packets={} tx_drops pcm/opus={}/{} "
             "tx_malformed={} ({:.1f}/s) "
             "sendq_age_ms last/avg/max/opus_p99={:.2f}/{:.2f}/{:.2f}/{:.2f} rx_bytes={} tx_bytes={}",
@@ -3245,7 +3245,7 @@ private:
                   total_bytes_rx_.load(std::memory_order_relaxed),
                   total_bytes_tx_.load(std::memory_order_relaxed));
 
-        Log::info(
+        spdlog::info(
             "Latency diag: callback_ms last/avg/max/deadline={:.3f}/{:.3f}/{:.3f}/{:.3f} "
             "over={} txq_ms pcm={:.3f}/{:.3f}/{:.3f} opus={:.3f}/{:.3f}/{:.3f} opus_p99={:.3f} "
             "encode_ms={:.3f}/{:.3f}/{:.3f} send_pace_ms={:.3f}/{:.3f}/{:.3f} "
@@ -3309,7 +3309,7 @@ private:
                 p.opus_decode_buffer_overflow_drops;
             previous.opus_target_trim_drops = p.opus_target_trim_drops;
 
-            Log::info(
+            spdlog::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
                 "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} e2e_avg_ms={:.1f} e2e_max_ms={:.1f} drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} pcm_hold/drop={}/{} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/recovered/unresolved/late={}/{}/{}/{} "
                 "target_trim={} drop_rate pcm/q/hold/drift={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
@@ -3329,7 +3329,7 @@ private:
                 p.sequence_late_or_reordered, p.opus_target_trim_drops,
                 drop_rate.pcm_send_per_sec, drop_rate.jitter_depth_per_sec,
                 drop_rate.pcm_hold_per_sec, drop_rate.pcm_drift_drop_per_sec);
-            Log::info(
+            spdlog::info(
                 "Participant playout rates {}: decoded_packets={:.1f}/s ratio={:.4f} correction_callbacks={} drops limit/age/overflow/target={:.1f}/{:.1f}/{:.1f}/{:.1f}/s",
                 p.id, decoded_packet_rate, p.opus_playout_rate_ratio,
                 p.opus_rate_correction_callbacks, queue_limit_drop_rate, age_limit_drop_rate,
@@ -3341,7 +3341,7 @@ private:
                  drop_rate.jitter_age_per_sec > 5.0 ||
                  drop_rate.pcm_hold_per_sec > 5.0 ||
                  drop_rate.pcm_drift_drop_per_sec > 5.0)) {
-                Log::warn(
+                spdlog::warn(
                     "Audio health warning for participant {}: likely corrupt/robotic risk "
                     "(pcm_drop_rate={:.1f}/s opus_drop_rate={:.1f}/s "
                     "queue_drop_rate={:.1f}/s age_drop_rate={:.1f}/s "
@@ -3485,7 +3485,7 @@ private:
             case CtrlHdr::Cmd::PARTICIPANT_LEAVE: {
                 uint32_t participant_id = chdr.participant_id;
                 remove_participant(participant_id);
-                Log::info("Participant {} left (server notification)", participant_id);
+                spdlog::info("Participant {} left (server notification)", participant_id);
                 break;
             }
             case CtrlHdr::Cmd::PARTICIPANT_INFO: {
@@ -3507,7 +3507,7 @@ private:
                                                               display_name);
                 recording_writer_.set_participant_metadata(info.participant_id, profile_id,
                                                            display_name);
-                Log::info("Participant {} metadata: user='{}' display='{}' capabilities=0x{:08x}",
+                spdlog::info("Participant {} metadata: user='{}' display='{}' capabilities=0x{:08x}",
                           info.participant_id, profile_id, display_name,
                           participant_capabilities);
                 break;
@@ -3525,7 +3525,7 @@ private:
                     reset_ping_path_feedback_to_current_sequence();
                     server_audio_replay_window_.reset();
                 }
-                Log::info("JOIN acknowledged by server (participant ID: {}, capabilities=0x{:08x})",
+                spdlog::info("JOIN acknowledged by server (participant ID: {}, capabilities=0x{:08x})",
                           chdr.participant_id, server_capabilities);
                 break;
             }
@@ -3538,7 +3538,7 @@ private:
                 while (opus_send_queue_.try_dequeue(discarded_opus)) {
                 }
                 request_recent_opus_audio_packets_reset();
-                Log::warn("Server requested JOIN refresh; resending JOIN");
+                spdlog::warn("Server requested JOIN refresh; resending JOIN");
                 send_join();
                 break;
             }
@@ -3554,7 +3554,7 @@ private:
                 std::memcpy(&sync, recv_data, sizeof(MetronomeSyncHdr));
                 schedule_metronome_sync(sync);
                 metronome_sync_received_.fetch_add(1, std::memory_order_relaxed);
-                Log::info("Metronome sync: bpm={:.1f} running={} beat={} seq={} effective_ns={}",
+                spdlog::info("Metronome sync: bpm={:.1f} running={} beat={} seq={} effective_ns={}",
                           static_cast<double>(sync.bpm_milli) / 1000.0,
                           (sync.flags & METRONOME_FLAG_RUNNING) != 0, sync.beat_number,
                           sync.sequence, sync.effective_server_time_ns);
@@ -3581,7 +3581,7 @@ private:
             decode == rt_diag_logged_decode_failures_) {
             return;
         }
-        Log::warn(
+        spdlog::warn(
             "Audio callback diagnostics: pcm_shape_mismatches={} pcm_size_mismatches={} "
             "mix_size_mismatches={} decode_failures={}",
             shape, size, mix, decode);
@@ -3600,7 +3600,7 @@ private:
             participant_manager_.remove_timed_out_participants(now, PARTICIPANT_TIMEOUT);
 
         for (uint32_t id: removed_ids) {
-            Log::info(
+            spdlog::info(
                 "Removed stale participant {} (no packets for {}s)", id,
                 std::chrono::duration_cast<std::chrono::seconds>(PARTICIPANT_TIMEOUT).count());
         }
@@ -3633,7 +3633,7 @@ private:
             return;
         }
 
-        Log::warn(
+        spdlog::warn(
             "Server reports sender audio ingress loss: received={} seq_gap={} "
             "net_gap={} net_gap_rate={:.1f}% observed_packet={} total_received={} "
             "total_gap={} total_net_gap={}; "
@@ -3666,7 +3666,7 @@ private:
             return;
         }
 
-        Log::warn(
+        spdlog::warn(
             "Server ping replies are missing for {} consecutive sends; manual mode keeps "
             "current Opus packet at {} frames",
             missing_replies, get_opus_network_frame_count());
@@ -3716,7 +3716,7 @@ private:
             return;
         }
 
-        Log::warn(
+        spdlog::warn(
             "Server ping path is unstable: replies={} missing={} gap_rate={:.1f}% "
             "rtt_ms={:.1f}; manual mode keeps current Opus packet at {} frames",
             received, missing, gap_rate_percent, rtt_ms, get_opus_network_frame_count());
@@ -3762,7 +3762,7 @@ private:
         }
 
         // print live stats
-        // Log::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
+        // spdlog::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
     }
 
     void handle_secure_audio_message(std::size_t bytes, const char* recv_data) {
@@ -3780,7 +3780,7 @@ private:
             const uint64_t count =
                 inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
-                Log::warn("Dropping secure audio with invalid auth tag (drops={})", count);
+                spdlog::warn("Dropping secure audio with invalid auth tag (drops={})", count);
             }
             return;
         }
@@ -3789,7 +3789,7 @@ private:
             const uint64_t count =
                 inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
-                Log::warn("Dropping replayed secure audio nonce={} drops={}", nonce, count);
+                spdlog::warn("Dropping replayed secure audio nonce={} drops={}", nonce, count);
             }
             return;
         }
@@ -3826,14 +3826,14 @@ private:
 
         size_t expected_size = min_packet_size + payload_bytes;
         if (!message_validator::has_complete_payload(bytes, expected_size, 0)) {
-            Log::error("Incomplete audio packet: got {}, expected {} (payload_bytes={})", bytes,
+            spdlog::error("Incomplete audio packet: got {}, expected {} (payload_bytes={})", bytes,
                        expected_size, payload_bytes);
             return;
         }
 
         // Additional safety check: ensure encoded_bytes is reasonable
         if (!message_validator::is_encoded_bytes_valid(payload_bytes, AUDIO_BUF_SIZE)) {
-            Log::error("Invalid audio packet: payload_bytes {} exceeds max {}", payload_bytes,
+            spdlog::error("Invalid audio packet: payload_bytes {} exceeds max {}", payload_bytes,
                        AUDIO_BUF_SIZE);
             return;
         }
@@ -3843,7 +3843,7 @@ private:
             const uint64_t count =
                 inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
-                Log::warn(
+                spdlog::warn(
                     "Dropping invalid audio: reason={} sender={} seq={} "
                     "sample_rate={} frame_count={} channels={} payload_bytes={} drops={}",
                     reason, sender_id, parsed_audio.sequence, parsed_audio.sample_rate,
@@ -3860,7 +3860,7 @@ private:
             const int decoder_channels = static_cast<int>(parsed_audio.channels);
             if (decoder_sample_rate == 0 || current_audio_frames_per_buffer() == 0 ||
                 decoder_channels == 0) {
-                Log::error(
+                spdlog::error(
                     "Cannot create decoder for participant {}: audio config not initialized "
                     "(sample_rate={}, frames_per_buffer={}, channels={})",
                     sender_id, decoder_sample_rate, current_audio_frames_per_buffer(),
@@ -3929,7 +3929,7 @@ private:
                     return;
                 }
             } else {
-                Log::error("Packet too large: {} bytes (max {})", payload_bytes, AUDIO_BUF_SIZE);
+                spdlog::error("Packet too large: {} bytes (max {})", payload_bytes, AUDIO_BUF_SIZE);
                 return;
             }
 
@@ -3965,7 +3965,7 @@ private:
                 participant.buffer_ready.store(true, std::memory_order_relaxed);
                 participant.opus_consecutive_empty_callbacks.store(0,
                                                                    std::memory_order_relaxed);
-                Log::info("Jitter buffer ready for participant {} ({} packets)", sender_id,
+                spdlog::info("Jitter buffer ready for participant {} ({} packets)", sender_id,
                           queue_after_enqueue);
             }
         });
@@ -3978,7 +3978,7 @@ private:
             const uint64_t count =
                 inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
-                Log::warn("Dropping invalid inbound redundant audio: reason={} bytes={} drops={}",
+                spdlog::warn("Dropping invalid inbound redundant audio: reason={} bytes={} drops={}",
                           reason, bytes, count);
             }
             return;
@@ -5062,46 +5062,45 @@ static bool apply_startup_latency_profile(Client& client,
         client.set_opus_auto_jitter_default(profile.auto_jitter);
     }
 
-    Log::info("Startup latency profile: {}", profile.name);
+    spdlog::info("Startup latency profile: {}", profile.name);
     return true;
 }
 
 int main(int argc, char** argv) {
     try {
         auto startup_options = parse_startup_options(argc, argv);
-        auto& log = Logger::instance();
-        log.init(true, true, !startup_options.log_file_path.empty(),
-                 startup_options.log_file_path, spdlog::level::info);
+        logging::init(true, true, !startup_options.log_file_path.empty(),
+                      startup_options.log_file_path, spdlog::level::info);
         if (!startup_options.log_file_path.empty()) {
-            Log::info("Logging to {}", startup_options.log_file_path);
+            spdlog::info("Logging to {}", startup_options.log_file_path);
         }
-        Log::info("Runtime: process=client platform={} arch={}", runtime_platform_name(),
+        spdlog::info("Runtime: process=client platform={} arch={}", runtime_platform_name(),
                   runtime_arch_name());
         if (startup_options.startup_jitter_packets.has_value() &&
             startup_options.startup_jitter_ms.has_value()) {
-            Log::error(
+            spdlog::error(
                 "Cannot combine packet jitter override (--jitter/--opus-jitter) with "
                 "millisecond jitter override (--jitter-ms/--opus-jitter-ms)");
-            log.flush();
+            logging::flush();
             return 2;
         }
 
         if (startup_options.list_audio_devices) {
             print_audio_backend_inventory();
-            log.flush();
+            logging::flush();
             return 0;
         }
         if (startup_options.low_latency_check) {
             const int result = run_low_latency_backend_check(startup_options);
-            log.flush();
+            logging::flush();
             return result;
         }
         if (!startup_options.required_audio_api.empty() &&
             !required_api_has_duplex_devices(startup_options.required_audio_api)) {
-            Log::error("Required audio API '{}' does not have both input and output devices",
+            spdlog::error("Required audio API '{}' does not have both input and output devices",
                        startup_options.required_audio_api);
             print_audio_backend_inventory();
-            log.flush();
+            logging::flush();
             return 2;
         }
         asio::io_context io_context;
@@ -5121,72 +5120,72 @@ int main(int argc, char** argv) {
             client_instance.set_input_device(input_dev);
             client_instance.set_output_device(output_dev);
             client_instance.set_audio_api_filter(startup_options.required_audio_api);
-            Log::info("Startup required audio API: {}", startup_options.required_audio_api);
+            spdlog::info("Startup required audio API: {}", startup_options.required_audio_api);
         }
         if (startup_options.requested_frames > 0) {
             client_instance.set_requested_frames_per_buffer(startup_options.requested_frames);
-            Log::info("Startup requested buffer override: {} frames",
+            spdlog::info("Startup requested buffer override: {} frames",
                       startup_options.requested_frames);
         }
         if (startup_options.startup_input_channel_index.has_value()) {
             client_instance.set_input_channel_index(*startup_options.startup_input_channel_index);
-            Log::info("Startup input channel override: channel {} (index {})",
+            spdlog::info("Startup input channel override: channel {} (index {})",
                       *startup_options.startup_input_channel_index + 1,
                       *startup_options.startup_input_channel_index);
         }
         if (!apply_startup_latency_profile(client_instance, startup_options)) {
             client_instance.stop_connection();
-            log.flush();
+            logging::flush();
             return 2;
         }
         if (startup_options.startup_codec.has_value()) {
             client_instance.set_audio_codec(*startup_options.startup_codec);
-            Log::info("Startup codec override: {}",
+            spdlog::info("Startup codec override: {}",
                       *startup_options.startup_codec == AudioCodec::Opus ? "Opus" : "PCM");
         }
         if (startup_options.startup_opus_packet_frames.has_value()) {
             client_instance.set_opus_network_frame_count(
                 *startup_options.startup_opus_packet_frames);
-            Log::info("Startup Opus packet override: {} frames",
+            spdlog::info("Startup Opus packet override: {} frames",
                       *startup_options.startup_opus_packet_frames);
         }
         if (startup_options.startup_jitter_ms.has_value()) {
             client_instance.set_opus_jitter_buffer_ms(
                 std::max(*startup_options.startup_jitter_ms, 0));
-            Log::info("Startup Opus jitter override: {} ms",
+            spdlog::info("Startup Opus jitter override: {} ms",
                       *startup_options.startup_jitter_ms);
         }
         if (startup_options.startup_jitter_packets.has_value()) {
             client_instance.set_opus_jitter_buffer_packets(
                 static_cast<size_t>(std::max(*startup_options.startup_jitter_packets, 0)));
-            Log::info("Startup Opus jitter override: {} packets",
+            spdlog::info("Startup Opus jitter override: {} packets",
                       *startup_options.startup_jitter_packets);
         }
         if (startup_options.startup_queue_limit_packets.has_value()) {
             client_instance.set_opus_queue_limit_packets(
                 static_cast<size_t>(std::max(*startup_options.startup_queue_limit_packets, 0)));
-            Log::info("Startup Opus queue limit override: {} packets",
+            spdlog::info("Startup Opus queue limit override: {} packets",
                       *startup_options.startup_queue_limit_packets);
         }
         if (startup_options.startup_redundancy_depth_packets.has_value()) {
             client_instance.set_opus_redundancy_depth(
                 *startup_options.startup_redundancy_depth_packets);
             const int depth = client_instance.get_opus_redundancy_depth_setting();
-            Log::info("Startup Opus redundancy depth override: {}",
+            spdlog::info("Startup Opus redundancy depth override: {}",
                       depth == OPUS_REDUNDANCY_DEPTH_AUTO ? "auto"
                                                           : std::to_string(depth));
         }
         if (startup_options.startup_age_limit_ms.has_value()) {
             client_instance.set_jitter_packet_age_limit_ms(*startup_options.startup_age_limit_ms);
-            Log::info("Startup packet age limit override: {} ms",
+            spdlog::info("Startup packet age limit override: {} ms",
                       *startup_options.startup_age_limit_ms);
         }
         if (startup_options.startup_disable_auto_jitter) {
             client_instance.set_opus_auto_jitter_default(false);
-            Log::info("Startup Opus auto jitter default disabled");
+            spdlog::info("Startup Opus auto jitter default disabled");
         } else if (startup_options.startup_auto_jitter) {
             client_instance.set_opus_auto_jitter_default(true);
-            Log::info("Startup Opus auto jitter default enabled");
+            spdlog::info("Startup Opus auto jitter default enabled");
         }
         // Auto-start audio stream with default devices
         {
@@ -5195,9 +5194,9 @@ int main(int argc, char** argv) {
             if (input_dev != AudioStream::NO_DEVICE && output_dev != AudioStream::NO_DEVICE) {
                 AudioStream::AudioConfig config = client_instance.get_audio_config();
                 if (client_instance.start_audio_stream(input_dev, output_dev, config)) {
-                    Log::info("Auto-started audio stream with default devices");
+                    spdlog::info("Auto-started audio stream with default devices");
                 } else {
-                    Log::warn("Failed to auto-start audio stream");
+                    spdlog::warn("Failed to auto-start audio stream");
                 }
             }
         }
@@ -5227,9 +5226,9 @@ int main(int argc, char** argv) {
         if (io_thread.joinable()) {
             io_thread.join();
         }
-        log.flush();
+        logging::flush();
     } catch (std::exception& e) {
-        Log::error("ERR: {}", e.what());
-        Logger::instance().flush();
+        spdlog::error("ERR: {}", e.what());
+        logging::flush();
     }
 }

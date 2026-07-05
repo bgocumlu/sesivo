@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "logger.h"
+#include <spdlog/spdlog.h>
 
 // Format parsing (can extract to class later)
 namespace wav_format {
@@ -255,18 +255,18 @@ public:
 
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) {
-            Log::error("Failed to open WAV file: {}", path);
+            spdlog::error("Failed to open WAV file: {}", path);
             return false;
         }
 
         wav_format::WavHeader header;
         if (!wav_format::parse_header(file, header)) {
-            Log::error("Failed to parse WAV header: {}", path);
+            spdlog::error("Failed to parse WAV header: {}", path);
             return false;
         }
 
         if (!wav_format::validate_format(header)) {
-            Log::error(
+            spdlog::error(
                 "Unsupported WAV format: format={}, channels={}, bits={} (only 16-bit PCM "
                 "mono/stereo "
                 "supported)",
@@ -287,7 +287,7 @@ public:
         file.read(reinterpret_cast<char*>(pcm16_data.data()), header.data_size);
 
         if (file.gcount() != static_cast<std::streamsize>(header.data_size)) {
-            Log::error("Failed to read all PCM data: read {} bytes, expected {}", file.gcount(),
+            spdlog::error("Failed to read all PCM data: read {} bytes, expected {}", file.gcount(),
                        header.data_size);
             return false;
         }
@@ -312,7 +312,7 @@ public:
         resample_ratio_.store(1.0F);
         resample_position_frac_.store(0.0);
 
-        Log::info("Loaded WAV file: {} ({}Hz, {}ch, {}bits, {} frames)", path, file_sample_rate_,
+        spdlog::info("Loaded WAV file: {} ({}Hz, {}ch, {}bits, {} frames)", path, file_sample_rate_,
                   file_channels_, file_bits_per_sample_, total_frames);
 
         return true;

@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include "logger.h"
+#include <spdlog/spdlog.h>
 #include "participant_info.h"
 
 // Thread-safe participant lifecycle manager for client-side
@@ -71,7 +71,7 @@ public:
         new_participant->decoder = std::make_unique<OpusDecoderWrapper>();
 
         if (!new_participant->decoder->create(sample_rate, channels)) {
-            Log::error("Failed to create decoder for participant {} ({}Hz, {}ch)", id, sample_rate,
+            spdlog::error("Failed to create decoder for participant {} ({}Hz, {}ch)", id, sample_rate,
                        channels);
             return false;
         }
@@ -95,7 +95,7 @@ public:
             publish_all_snapshots_locked();
         }
 
-        Log::info("New participant {} joined (decoder: {}Hz, {}ch)", id, sample_rate, channels);
+        spdlog::info("New participant {} joined (decoder: {}Hz, {}ch)", id, sample_rate, channels);
         return true;
     }
 
@@ -128,7 +128,7 @@ public:
             }
         }
         if (removed) {
-            Log::info("Participant {} left", id);
+            spdlog::info("Participant {} left", id);
         }
     }
 
@@ -204,7 +204,7 @@ public:
         }
 
         for (const auto& [id, elapsed_seconds]: timed_out_logs) {
-            Log::info("Participant {} timed out ({}s since last packet)", id, elapsed_seconds);
+            spdlog::info("Participant {} timed out ({}s since last packet)", id, elapsed_seconds);
         }
 
         return removed_ids;

@@ -5,7 +5,7 @@
 #include <opus.h>
 #include <opus_defines.h>
 
-#include "logger.h"
+#include <spdlog/spdlog.h>
 
 class OpusDecoderWrapper {
 public:
@@ -42,14 +42,14 @@ public:
         int err;
         decoder_ = opus_decoder_create(sample_rate, channels, &err);
         if (err != OPUS_OK) {
-            Log::error("Failed to create Opus decoder: {}", opus_strerror(err));
+            spdlog::error("Failed to create Opus decoder: {}", opus_strerror(err));
             return false;
         }
 
         channels_    = channels;
         sample_rate_ = sample_rate;
 
-        Log::info("Opus decoder created: {}ch, {}Hz", channels, sample_rate);
+        spdlog::info("Opus decoder created: {}ch, {}Hz", channels, sample_rate);
         return true;
     }
 
@@ -73,7 +73,7 @@ public:
     bool decode(const unsigned char* input, int input_size, int frame_size,
                 std::vector<float>& output) {
         if (decoder_ == nullptr) {
-            Log::error("Opus decoder not initialized.");
+            spdlog::error("Opus decoder not initialized.");
             output.clear();
             return false;
         }
@@ -83,7 +83,7 @@ public:
             opus_decode_float(decoder_, input, input_size, output.data(), frame_size, 0);
 
         if (decoded_samples_per_channel < 0) {
-            Log::error("Opus decoding failed: {}", opus_strerror(decoded_samples_per_channel));
+            spdlog::error("Opus decoding failed: {}", opus_strerror(decoded_samples_per_channel));
             output.clear();
             return false;
         }
@@ -129,7 +129,7 @@ public:
     // Decode with Packet Loss Concealment (when packet is lost)
     bool decode_plc(int frame_size, std::vector<float>& output) {
         if (decoder_ == nullptr) {
-            Log::error("Opus decoder not initialized.");
+            spdlog::error("Opus decoder not initialized.");
             output.clear();
             return false;
         }
@@ -140,7 +140,7 @@ public:
             opus_decode_float(decoder_, nullptr, 0, output.data(), frame_size, 0);
 
         if (decoded_samples_per_channel < 0) {
-            Log::error("Opus PLC decoding failed: {}", opus_strerror(decoded_samples_per_channel));
+            spdlog::error("Opus PLC decoding failed: {}", opus_strerror(decoded_samples_per_channel));
             output.clear();
             return false;
         }

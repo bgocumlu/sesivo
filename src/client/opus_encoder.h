@@ -9,7 +9,7 @@
 #include <opus_defines.h>
 #include <opus_types.h>
 
-#include "logger.h"
+#include <spdlog/spdlog.h>
 
 class OpusEncoderWrapper {
 public:
@@ -55,7 +55,7 @@ public:
         int err;
         encoder_ = opus_encoder_create(sample_rate, channels, application, &err);
         if (err != OPUS_OK) {
-            Log::error("Failed to create Opus encoder: {}", opus_strerror(err));
+            spdlog::error("Failed to create Opus encoder: {}", opus_strerror(err));
             return false;
         }
 
@@ -77,7 +77,7 @@ public:
         // Verify settings
         int32_t actual_bitrate;
         opus_encoder_ctl(encoder_, OPUS_GET_BITRATE(&actual_bitrate));
-        Log::info("Opus encoder created: {}ch, {}Hz, target={}bps, actual={}bps, complexity={}",
+        spdlog::info("Opus encoder created: {}ch, {}Hz, target={}bps, actual={}bps, complexity={}",
                   channels, sample_rate, bitrate, actual_bitrate, complexity);
 
         return true;
@@ -96,16 +96,16 @@ public:
                 size_t output_capacity, uint16_t& encoded_bytes) {
         encoded_bytes = 0;
         if (encoder_ == nullptr) {
-            Log::error("Opus encoder not initialized.");
+            spdlog::error("Opus encoder not initialized.");
             return false;
         }
         if (output == nullptr || output_capacity == 0 ||
             output_capacity > static_cast<size_t>(std::numeric_limits<opus_int32>::max())) {
-            Log::error("Invalid Opus output buffer.");
+            spdlog::error("Invalid Opus output buffer.");
             return false;
         }
         if (!is_legal_frame_size(sample_rate_, frame_size)) {
-            Log::error("Illegal Opus frame size: {} samples at {} Hz", frame_size, sample_rate_);
+            spdlog::error("Illegal Opus frame size: {} samples at {} Hz", frame_size, sample_rate_);
             return false;
         }
 
@@ -113,7 +113,7 @@ public:
             encoder_, input, frame_size, output,
             static_cast<opus_int32>(output_capacity));
         if (result < 0) {
-            Log::error("Opus encoding failed: {}", opus_strerror(result));
+            spdlog::error("Opus encoding failed: {}", opus_strerror(result));
             return false;
         }
         encoded_bytes = static_cast<uint16_t>(result);

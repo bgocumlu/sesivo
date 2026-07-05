@@ -23,13 +23,13 @@
 #include <asio/buffer.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
-#include <spdlog/common.h>
+#include <spdlog/spdlog.h>
 
 #include "audio_packet.h"
 #include "client_manager.h"
 #include "crash_reporter.h"
 #include "endpoint_hash.h"
-#include "logger.h"
+#include "logging_setup.h"
 #include "message_validator.h"
 #include "performer_join_token.h"
 #include "packet_builder.h"
@@ -79,8 +79,8 @@ struct ServerOptions {
     std::string server_id = "local-dev";
     std::string join_secret;
     std::string log_file_path;
-    size_t      log_max_bytes = Logger::DEFAULT_ROTATING_LOG_MAX_BYTES;
-    size_t      log_max_files = Logger::DEFAULT_ROTATING_LOG_MAX_FILES;
+    size_t      log_max_bytes = logging::DEFAULT_ROTATING_LOG_MAX_BYTES;
+    size_t      log_max_files = logging::DEFAULT_ROTATING_LOG_MAX_FILES;
     std::string metrics_jsonl_path;
     bool        crash_reports_enabled = true;
     std::string crash_report_dir = "crash_reports/server";
@@ -109,7 +109,7 @@ public:
                                      socket_error.message());
         }
         const auto local = socket_.local_endpoint();
-        Log::info("UDP socket bound on {}:{} ({})",
+        spdlog::info("UDP socket bound on {}:{} ({})",
                   udp_network::format_address_for_display(local.address()), local.port(),
                   protocol == udp::v6() ? "IPv6 dual-stack" : "IPv4 fallback");
 
@@ -117,13 +117,13 @@ public:
         std::error_code buffer_error;
         udp_network::configure_low_latency_buffers(socket_, buffer_error);
         if (!buffer_error) {
-            Log::info("UDP socket buffers optimized for packet forwarding ({} bytes)",
+            spdlog::info("UDP socket buffers optimized for packet forwarding ({} bytes)",
                       UDP_SOCKET_BUFFER_BYTES);
         } else {
-            Log::warn("Failed to set socket buffer sizes: {}", buffer_error.message());
+            spdlog::warn("Failed to set socket buffer sizes: {}", buffer_error.message());
         }
 
-        Log::info("SFU server ready: forwarding audio between clients");
+        spdlog::info("SFU server ready: forwarding audio between clients");
         do_receive();
     }
 
@@ -151,7 +151,7 @@ public:
             return true;
         }
 
-        Log::warn("Failed to write server metrics JSONL '{}': {}",
+        spdlog::warn("Failed to write server metrics JSONL '{}': {}",
                   metrics_exporter_.path().string(), error);
         return false;
     }
@@ -196,7 +196,7 @@ public:
         const auto qos = socket_qos_.ensure_flow(socket_, target);
         if (qos.newly_configured &&
             (!qos.ok() || qos.detail.find("failed") != std::string::npos)) {
-            Log::warn("UDP QoS not fully active for {}:{}: {}",
+            spdlog::warn("UDP QoS not fully active for {}:{}: {}",
                       udp_network::format_address_for_display(target.address()), target.port(),
                       qos.detail);
         }
@@ -210,7 +210,7 @@ public:
         socket_.async_send_to(asio::buffer(send_buffer->data(), send_buffer->size()), target,
                               [send_buffer](std::error_code error_code, std::size_t) {
                                   if (error_code) {
-                                      Log::error("send error: {}", error_code.message());
+                                      spdlog::error("send error: {}", error_code.message());
                                   }
                               });
     }
@@ -280,7 +280,7 @@ private:
             return;
         }
 
-        Log::warn("UDP receive error: {}; keeping participants registered",
+        spdlog::warn("UDP receive error: {}; keeping participants registered",
                   error_code.message());
         do_receive();  // keep listening
     }
@@ -328,7 +328,7 @@ private:
                 handle_join(bytes, now);
                 break;
             case CtrlHdr::Cmd::LEAVE: {
-                Log::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
+                spdlog::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
                           remote_endpoint_.port());
                 auto leaving_client = client_manager_.remove_client_with_info(remote_endpoint_);
                 if (leaving_client.has_value()) {
@@ -347,13 +347,13 @@ private:
             }
             case CtrlHdr::Cmd::PARTICIPANT_LEAVE:
                 // Clients shouldn't send this, only server broadcasts it
-                Log::warn("Client sent PARTICIPANT_LEAVE (should only come from server)");
+                spdlog::warn("Client sent PARTICIPANT_LEAVE (should only come from server)");
                 break;
             case CtrlHdr::Cmd::METRONOME_SYNC:
                 handle_metronome_sync(bytes, now);
                 break;
             default:
-                Log::warn("Unknown CTRL cmd: {} from {}:{}", static_cast<int>(chdr.type),
+                spdlog::warn("Unknown CTRL cmd: {} from {}:{}", static_cast<int>(chdr.type),
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
                 break;
         }
@@ -398,7 +398,7 @@ private:
 
     void handle_join(std::size_t bytes, std::chrono::steady_clock::time_point now) {
         if (bytes < sizeof(JoinHdr)) {
-            Log::warn("Rejecting JOIN from {}:{}: packet too small",
+            spdlog::warn("Rejecting JOIN from {}:{}: packet too small",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
             return;
         }
@@ -413,12 +413,12 @@ private:
         const uint32_t client_capabilities = join.capabilities & AUDIO_SUPPORTED_CAPABILITIES;
 
         if (room_id.empty() || profile_id.empty()) {
-            Log::warn("Rejecting JOIN from {}:{}: missing room or profile id",
+            spdlog::warn("Rejecting JOIN from {}:{}: missing room or profile id",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
             return;
         }
         if (token.empty() && !options_.allow_insecure_dev_joins) {
-            Log::warn("Rejecting JOIN from {}:{} room '{}': missing token",
+            spdlog::warn("Rejecting JOIN from {}:{} room '{}': missing token",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id);
             return;
         }
@@ -427,13 +427,13 @@ private:
             const auto result = performer_join_token::validate_with_claims(
                 token, options_.join_secret, options_.server_id, room_id, profile_id);
             if (!result.ok) {
-                Log::warn("Rejecting JOIN from {}:{} room '{}': {}",
+                spdlog::warn("Rejecting JOIN from {}:{} room '{}': {}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
                           result.reason);
                 return;
             }
             if (!reserve_token_nonce(result, remote_endpoint_)) {
-                Log::warn("Rejecting JOIN from {}:{} room '{}': token nonce replay",
+                spdlog::warn("Rejecting JOIN from {}:{} room '{}': token nonce replay",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id);
                 return;
             }
@@ -454,13 +454,13 @@ private:
             remote_endpoint_, now, room_id, profile_id, display_name, registered_capabilities,
             security);
         for (uint32_t removed_client_id: registration.removed_client_ids) {
-            Log::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
+            spdlog::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
                       removed_client_id, room_id, profile_id);
             broadcast_participant_leave(removed_client_id);
         }
 
         uint32_t client_id = registration.client_id;
-        Log::info(
+        spdlog::info(
                   "JOIN: {}:{} room='{}' user='{}' display='{}' "
                   "(ID: {}, {}, capabilities=0x{:08x})",
                   remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
@@ -533,7 +533,7 @@ private:
         const uint64_t drop_count = ++rate_limited_audio_drops_total_;
         ++rate_limited_audio_drops_interval_;
         if (drop_count == 1 || drop_count % 100 == 0) {
-            Log::warn("Rate-limited audio from {}:{} sample_rate={} frame_count={} drops={}",
+            spdlog::warn("Rate-limited audio from {}:{} sample_rate={} frame_count={} drops={}",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port(),
                       sample_rate, frame_count, drop_count);
         }
@@ -562,7 +562,7 @@ private:
         const auto security = client_manager_.get_security(remote_endpoint_);
         if (!security.has_value()) {
             if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
-                Log::warn("Dropping secure audio from endpoint without session key {}:{}",
+                spdlog::warn("Dropping secure audio from endpoint without session key {}:{}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
             }
             return;
@@ -576,7 +576,7 @@ private:
                 secure_plaintext_buf_.data(), secure_plaintext_buf_.size(),
                 plaintext_bytes)) {
             if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
-                Log::warn("Dropping audio with invalid auth tag from {}:{} bytes={}",
+                spdlog::warn("Dropping audio with invalid auth tag from {}:{} bytes={}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(),
                           bytes);
             }
@@ -585,7 +585,7 @@ private:
 
         if (!client_manager_.accept_audio_nonce(remote_endpoint_, nonce)) {
             if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
-                Log::warn("Dropping replayed secure audio from {}:{} nonce={}",
+                spdlog::warn("Dropping replayed secure audio from {}:{} nonce={}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(),
                           nonce);
             }
@@ -618,7 +618,7 @@ private:
         if (!message_validator::is_valid_audio_packet(bytes, min_audio_packet_size)) {
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
-                Log::debug("Audio packet too small: {} bytes", bytes);
+                spdlog::debug("Audio packet too small: {} bytes", bytes);
             }
             return;
         }
@@ -634,7 +634,7 @@ private:
         if (!authenticated && client_manager_.has_session_key(remote_endpoint_)) {
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
-                Log::warn("Dropping plaintext audio from signed session {}:{}",
+                spdlog::warn("Dropping plaintext audio from signed session {}:{}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
             }
             return;
@@ -668,7 +668,7 @@ private:
         if (bytes < audio_packet::redundant_header_size()) {
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
-                Log::debug("Redundant audio packet too small: {} bytes", bytes);
+                spdlog::debug("Redundant audio packet too small: {} bytes", bytes);
             }
             return;
         }
@@ -684,7 +684,7 @@ private:
         if (!authenticated && client_manager_.has_session_key(remote_endpoint_)) {
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
-                Log::warn("Dropping plaintext redundant audio from signed session {}:{}",
+                spdlog::warn("Dropping plaintext redundant audio from signed session {}:{}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
             }
             return;
@@ -695,7 +695,7 @@ private:
             record_invalid_audio_drop();
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
-                Log::warn("Dropping invalid redundant audio from {}:{}: reason={} bytes={}",
+                spdlog::warn("Dropping invalid redundant audio from {}:{}: reason={} bytes={}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(),
                           reason, bytes);
             }
@@ -712,7 +712,7 @@ private:
         if (!audio_packet::embed_sender_id_in_redundant_audio_packet(
                 packet_copy->data(), packet_copy->size(), sender_id, &reason)) {
             record_invalid_audio_drop();
-            Log::warn("Dropping redundant audio that could not be stamped: reason={}", reason);
+            spdlog::warn("Dropping redundant audio that could not be stamped: reason={}", reason);
             return;
         }
 
@@ -739,7 +739,7 @@ private:
             record_invalid_audio_drop();
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
-                Log::warn(
+                spdlog::warn(
                     "Dropping invalid audio from {}:{}: reason={} magic=0x{:08x} got {} "
                     "payload_bytes={} seq={}",
                     remote_endpoint_.address().to_string(), remote_endpoint_.port(), reason,
@@ -753,12 +753,12 @@ private:
 
     void handle_metronome_sync(std::size_t bytes, std::chrono::steady_clock::time_point now) {
         if (bytes < sizeof(MetronomeSyncHdr)) {
-            Log::debug("Metronome sync packet too small: {} bytes", bytes);
+            spdlog::debug("Metronome sync packet too small: {} bytes", bytes);
             return;
         }
 
         if (!client_manager_.exists(remote_endpoint_)) {
-            Log::warn("Dropping metronome sync from unjoined endpoint {}:{}",
+            spdlog::warn("Dropping metronome sync from unjoined endpoint {}:{}",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
             send_join_required(remote_endpoint_);
             return;
@@ -814,7 +814,7 @@ private:
                 it->second.last_join_required_sent = now;
             }
             if (!it->second.first_log_emitted) {
-                Log::warn("Dropping audio from unjoined endpoint {}:{}",
+                spdlog::warn("Dropping audio from unjoined endpoint {}:{}",
                           endpoint.address().to_string(), endpoint.port());
                 it->second.first_log_emitted = true;
             }
@@ -822,7 +822,7 @@ private:
 
         if (now - last_unknown_audio_summary_ >= server_config::UNKNOWN_ENDPOINT_LOG_INTERVAL) {
             if (unknown_audio_drops_since_log_ > 0) {
-                Log::warn("Dropped {} audio packets from unjoined endpoints in the last {} ms (tracking {} endpoints)",
+                spdlog::warn("Dropped {} audio packets from unjoined endpoints in the last {} ms (tracking {} endpoints)",
                           unknown_audio_drops_since_log_,
                           std::chrono::duration_cast<std::chrono::milliseconds>(
                               server_config::UNKNOWN_ENDPOINT_LOG_INTERVAL)
@@ -856,7 +856,7 @@ private:
             client_manager_.remove_timed_out_clients(now, server_config::CLIENT_TIMEOUT);
 
         for (uint32_t timed_out_id: timed_out_ids) {
-            Log::info("Client timed out (ID: {})", timed_out_id);
+            spdlog::info("Client timed out (ID: {})", timed_out_id);
             broadcast_participant_leave(timed_out_id);
         }
 
@@ -1273,7 +1273,7 @@ private:
 
     void log_audio_forward_summary() {
         if (invalid_audio_drops_since_log_ > 0) {
-            Log::warn("Dropped {} invalid/incomplete audio packets in the last interval",
+            spdlog::warn("Dropped {} invalid/incomplete audio packets in the last interval",
                       invalid_audio_drops_since_log_);
             invalid_audio_drops_since_log_ = 0;
         }
@@ -1284,7 +1284,7 @@ private:
                 continue;
             }
 
-            Log::info(
+            spdlog::info(
                 "Ingress diag interval sender={} endpoint={}:{} received={} seq_gap={} "
                 "net_gap={} gap_rate={:.1f}% seq_recovered={} seq_unresolved={} "
                 "seq_late={} late={:.1f}% total received={} seq_gap={} net_gap={} "
@@ -1321,7 +1321,7 @@ private:
 
             const uint32_t sender_id = static_cast<uint32_t>(key >> 32);
             const uint32_t target_id = static_cast<uint32_t>(key & 0xFFFFFFFFU);
-            Log::info(
+            spdlog::info(
                 "Forward diag interval sender={} target={} forwarded={} seq_gap={} gap_rate={:.1f}% "
                 "seq_recovered={} seq_unresolved={} seq_late={} late={:.1f}% "
                 "total forwarded={} seq_gap={} seq_recovered={} seq_unresolved={} seq_late={}",
@@ -1347,7 +1347,7 @@ private:
                 continue;
             }
 
-            Log::info(
+            spdlog::info(
                 "Ping diag interval client={} endpoint={}:{} received={} reply_queued={} "
                 "seq_gap={} gap_rate={:.1f}% seq_recovered={} seq_unresolved={} seq_late={} "
                 "late={:.1f}% total received={} reply_queued={} seq_gap={} seq_recovered={} "
@@ -1471,9 +1471,8 @@ int main(int argc, char** argv) {
         asio::io_context io_context;
         auto             options = parse_server_options(argc, argv);
 
-        auto& log = Logger::instance();
-        log.init(true, false, !options.log_file_path.empty(), options.log_file_path,
-                 spdlog::level::info, options.log_max_bytes, options.log_max_files);
+        logging::init(true, false, !options.log_file_path.empty(), options.log_file_path,
+                      spdlog::level::info, options.log_max_bytes, options.log_max_files);
 
         if (options.crash_reports_enabled) {
             crash_reporter::Options crash_options;
@@ -1482,32 +1481,34 @@ int main(int argc, char** argv) {
             crash_options.platform = runtime_platform_name();
             crash_options.arch = runtime_arch_name();
             crash_reporter::install(crash_options);
-            Log::info("Crash reports enabled: {}", options.crash_report_dir);
+            spdlog::info("Crash reports enabled: {}", options.crash_report_dir);
         }
 
-        Log::info("Starting SFU server on [::]:{} (dual-stack preferred)", options.port);
-        Log::info("Runtime: process=server platform={} arch={}", runtime_platform_name(),
+        spdlog::info("Starting SFU server on [::]:{} (dual-stack preferred)", options.port);
+        spdlog::info("Runtime: process=server platform={} arch={}", runtime_platform_name(),
                   runtime_arch_name());
         if (!options.log_file_path.empty()) {
-            Log::info("Logging to {}", options.log_file_path);
-            Log::info("Log rotation: max_bytes={} max_files={}", options.log_max_bytes,
+            spdlog::info("Logging to {}", options.log_file_path);
+            spdlog::info("Log rotation: max_bytes={} max_files={}", options.log_max_bytes,
                       options.log_max_files);
         }
         if (!options.metrics_jsonl_path.empty()) {
-            Log::info("Server metrics JSONL export: {}", options.metrics_jsonl_path);
+            spdlog::info("Server metrics JSONL export: {}", options.metrics_jsonl_path);
         }
-        Log::info("Forwarding audio packets between clients");
+        spdlog::info("Forwarding audio packets between clients");
         if (options.allow_insecure_dev_joins) {
-            Log::warn("Insecure performer dev joins enabled");
+            spdlog::warn("Insecure performer dev joins enabled");
         } else if (options.join_secret.empty()) {
-            Log::warn("Join secret is not configured; JOIN packets will be rejected unless insecure dev joins are enabled");
+            spdlog::warn("Join secret is not configured; JOIN packets will be rejected unless insecure dev joins are enabled");
         }
 
         Server server(io_context, options);
 
         io_context.run();
+        logging::flush();
     } catch (std::exception& e) {
-        Log::error("ERR: {}", e.what());
+        spdlog::error("ERR: {}", e.what());
+        logging::flush();
         return 1;
     }
 }

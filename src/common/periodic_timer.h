@@ -9,7 +9,7 @@
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
 
-#include "logger.h"
+#include <spdlog/spdlog.h>
 
 class PeriodicTimer {
 public:
@@ -40,7 +40,7 @@ private:
 
     void on_timeout(std::error_code error_code) {
         if (error_code) {
-            Log::error("Timer error: {}", error_code.message());
+            spdlog::error("Timer error: {}", error_code.message());
             return;
         }
         callback_();

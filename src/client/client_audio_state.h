@@ -66,6 +66,7 @@ private:
     std::atomic<int> frames_per_buffer_{AudioStream::AudioConfig::DEFAULT_FRAMES_PER_BUFFER};
     std::atomic<float> input_gain_{1.0F};
 
+    mutable std::mutex metadata_mutex_;
     AudioStream::DeviceIndex selected_input_device_{AudioStream::NO_DEVICE};
     AudioStream::DeviceIndex selected_output_device_{AudioStream::NO_DEVICE};
     std::string audio_api_filter_ = "All";

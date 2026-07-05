@@ -14,30 +14,10 @@ FetchContent_Declare(
     GIT_PROGRESS   TRUE
 )
 
-FetchContent_Declare(
-    imgui
-    GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        v1.92.5-docking
-    GIT_SHALLOW    TRUE
-    GIT_PROGRESS   TRUE
-)
-
-FetchContent_Declare(
-    glfw
-    GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG        3.4
-    GIT_SHALLOW    TRUE
-    GIT_PROGRESS   TRUE
-)
-
-set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(JUCE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(JUCE_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
-find_package(OpenGL REQUIRED)
 
-FetchContent_MakeAvailable(juce imgui glfw)
+FetchContent_MakeAvailable(juce)
 
 find_path(ASIO_SDK_INCLUDE_DIR
     NAMES iasiodrv.h
@@ -63,29 +43,6 @@ endif()
 message(STATUS "JUCE ASIO support: ${JUCE_CLIENT_ENABLE_ASIO}")
 message(STATUS "JUCE JACK support: ${JUCE_CLIENT_ENABLE_JACK}")
 
-# ============================================================
-# Client Wrappers
-# ============================================================
-
-add_library(imgui_lib STATIC
-    ${imgui_SOURCE_DIR}/imgui.cpp
-    ${imgui_SOURCE_DIR}/imgui_demo.cpp
-    ${imgui_SOURCE_DIR}/imgui_draw.cpp
-    ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
-)
-target_include_directories(imgui_lib PUBLIC 
-    ${imgui_SOURCE_DIR}
-    ${imgui_SOURCE_DIR}/backends
-)
-target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
-
-# ============================================================
-# Client Target
-# ============================================================
-
 add_executable(client
     ${JAM_CLIENT_DIR}/client.cpp
     ${JAM_CLIENT_DIR}/client_audio_devices.cpp
@@ -96,10 +53,11 @@ add_executable(client
     ${JAM_CLIENT_DIR}/client_network_path.cpp
     ${JAM_CLIENT_DIR}/client_runtime.cpp
     ${JAM_CLIENT_DIR}/client_startup.cpp
-    ${JAM_CLIENT_DIR}/gui.cpp
-    ${JAM_CLIENT_DIR}/imgui_client_ui.cpp
+    ${JAM_CLIENT_DIR}/juce_app.cpp
     ${JAM_CLIENT_DIR}/audio_stream.cpp
     ${JAM_CLIENT_DIR}/juce_audio_backend.cpp
+    ${JAM_CLIENT_DIR}/juce_main_window.cpp
+    ${JAM_CLIENT_DIR}/juce_mixer_component.cpp
     ${JAM_COMMON_DIR}/logging_setup.cpp
 )
 jam_add_project_includes(client)
@@ -129,11 +87,11 @@ target_link_libraries(client PRIVATE
     spdlog::spdlog
     opus
     token_crypto
-    imgui_lib
     juce::juce_audio_devices
     juce::juce_audio_basics
     juce::juce_core
     juce::juce_events
+    juce::juce_gui_basics
 )
 
 if(WIN32)

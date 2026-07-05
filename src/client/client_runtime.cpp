@@ -107,23 +107,8 @@ public:
             configure_udp_socket_locked();
         }
 
-        // Set default devices
-        audio_state_.set_selected_input_device(AudioStream::get_default_input_device());
-        audio_state_.set_selected_output_device(AudioStream::get_default_output_device());
-
-        if (audio_preferences.loaded) {
-            apply_audio_device_preferences(audio_preferences);
-        }
-
-        // Initialize device info with default devices
-        if (get_selected_input_device() != AudioStream::NO_DEVICE) {
-            set_input_device(get_selected_input_device());
-        }
-        if (get_selected_output_device() != AudioStream::NO_DEVICE) {
-            set_output_device(get_selected_output_device());
-        }
-
-        // Connect to server (audio stream will be started manually via UI)
+        // Audio devices are resolved by the GUI startup job so the window can
+        // paint before device enumeration or stream opening blocks anything.
         start_connection(server_address, server_port);
     }
 
@@ -1600,36 +1585,6 @@ private:
 
         do_receive();
         send_join();
-    }
-
-    void apply_audio_device_preferences(const AudioDevicePreferences& preferences) {
-        const auto input_devices = AudioStream::get_input_device_stubs();
-        const auto output_devices = AudioStream::get_output_device_stubs();
-
-        const auto preferred_input =
-            find_preferred_audio_device(input_devices, preferences.input_device,
-                                        preferences.input_api, preferences.audio_api);
-        const auto preferred_output =
-            find_preferred_audio_device(output_devices, preferences.output_device,
-                                        preferences.output_api, preferences.audio_api);
-
-        if (preferred_input != AudioStream::NO_DEVICE) {
-            audio_state_.set_selected_input_device(preferred_input);
-        } else if (!preferences.input_device.empty()) {
-            spdlog::warn("Saved input device is unavailable; using default: {}",
-                      preferences.input_device);
-        }
-
-        if (preferred_output != AudioStream::NO_DEVICE) {
-            audio_state_.set_selected_output_device(preferred_output);
-        } else if (!preferences.output_device.empty()) {
-            spdlog::warn("Saved output device is unavailable; using default: {}",
-                      preferences.output_device);
-        }
-
-        if (preferences.input_channel_index.has_value()) {
-            set_input_channel_index(*preferences.input_channel_index);
-        }
     }
 
     udp::endpoint current_server_endpoint() const {

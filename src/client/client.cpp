@@ -3,17 +3,16 @@
 #include <exception>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <asio/io_context.hpp>
 #include <spdlog/spdlog.h>
 
-#include "audio_stream.h"
 #include "client_app_facade.h"
 #include "client_audio_devices.h"
 #include "client_runtime.h"
 #include "client_startup.h"
-#include "gui.h"
-#include "imgui_client_ui.h"
+#include "juce_app.h"
 #include "logging_setup.h"
 #include "opus_defines.h"
 
@@ -78,15 +77,6 @@ int main(int argc, char** argv) {
             logging::flush();
             return result;
         }
-        if (!startup_options.required_audio_api.empty() &&
-            !required_api_has_duplex_devices(startup_options.required_audio_api)) {
-            spdlog::error("Required audio API '{}' does not have both input and output devices",
-                          startup_options.required_audio_api);
-            print_audio_backend_inventory();
-            logging::flush();
-            return 2;
-        }
-
         asio::io_context io_context;
         const auto audio_preferences_path =
             client_config_path(argv[0], startup_options.config_dir);
@@ -99,26 +89,10 @@ int main(int argc, char** argv) {
                                      audio_preferences_path, audio_preferences);
         ClientAppFacade& client_app = client_runtime.app_facade();
 
-        if (!startup_options.required_audio_api.empty()) {
-            const auto input_dev =
-                find_device_for_api(startup_options.required_audio_api, true);
-            const auto output_dev =
-                find_device_for_api(startup_options.required_audio_api, false);
-            client_app.set_input_device(input_dev);
-            client_app.set_output_device(output_dev);
-            client_app.set_audio_api_filter(startup_options.required_audio_api);
-            spdlog::info("Startup required audio API: {}", startup_options.required_audio_api);
-        }
         if (startup_options.requested_frames > 0) {
             client_app.set_requested_frames_per_buffer(startup_options.requested_frames);
             spdlog::info("Startup requested buffer override: {} frames",
                          startup_options.requested_frames);
-        }
-        if (startup_options.startup_input_channel_index.has_value()) {
-            client_app.set_input_channel_index(*startup_options.startup_input_channel_index);
-            spdlog::info("Startup input channel override: channel {} (index {})",
-                         *startup_options.startup_input_channel_index + 1,
-                         *startup_options.startup_input_channel_index);
         }
         if (!apply_startup_latency_profile(client_app, startup_options)) {
             client_runtime.stop_connection();
@@ -170,33 +144,19 @@ int main(int argc, char** argv) {
             spdlog::info("Startup Opus auto jitter default enabled");
         }
 
-        {
-            AudioStream::DeviceIndex input_dev = client_app.get_selected_input_device();
-            AudioStream::DeviceIndex output_dev = client_app.get_selected_output_device();
-            if (input_dev != AudioStream::NO_DEVICE && output_dev != AudioStream::NO_DEVICE) {
-                AudioStream::AudioConfig config = client_app.get_audio_config();
-                if (client_app.start_audio_stream(input_dev, output_dev, config)) {
-                    spdlog::info("Auto-started audio stream with default devices");
-                } else {
-                    spdlog::warn("Failed to auto-start audio stream");
-                }
-            }
-        }
-
         std::thread io_thread([&io_context]() { io_context.run(); });
 
         const std::string window_title =
             startup_options.app_version.empty()
                 ? "Jam"
                 : "Jam " + startup_options.app_version;
-        Gui app(810, 555, window_title.c_str(), false, 60);
-
-        app.set_draw_callback([&client_app]() { draw_client_ui(client_app); });
-
-        app.set_close_callback([&io_context]() {
-            io_context.stop();
-        });
-        app.run();
+        JuceClientStartupAudioOptions startup_audio_options;
+        startup_audio_options.audio_preferences = audio_preferences;
+        startup_audio_options.required_audio_api = startup_options.required_audio_api;
+        startup_audio_options.startup_input_channel_index =
+            startup_options.startup_input_channel_index;
+        run_juce_client_app(client_app, window_title, std::move(startup_audio_options),
+                            [&io_context]() { io_context.stop(); });
 
         client_app.stop_audio_stream();
         client_runtime.stop_connection();

@@ -68,35 +68,43 @@ float ClientAudioState::input_gain() const {
 }
 
 AudioStream::DeviceIndex ClientAudioState::selected_input_device() const {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     return selected_input_device_;
 }
 
 AudioStream::DeviceIndex ClientAudioState::selected_output_device() const {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     return selected_output_device_;
 }
 
 void ClientAudioState::set_selected_input_device(AudioStream::DeviceIndex device) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     selected_input_device_ = device;
 }
 
 void ClientAudioState::set_selected_output_device(AudioStream::DeviceIndex device) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     selected_output_device_ = device;
 }
 
 std::string ClientAudioState::audio_api_filter() const {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     return audio_api_filter_;
 }
 
 void ClientAudioState::set_audio_api_filter(std::string api_filter) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     audio_api_filter_ = api_filter.empty() ? "All" : std::move(api_filter);
 }
 
 ClientDeviceInfo ClientAudioState::device_info() const {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     return device_info_;
 }
 
 void ClientAudioState::set_input_device_info(const AudioStream::DeviceInfo& info,
                                              int input_channel_index) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     device_info_.input_device_name = info.name;
     device_info_.input_api = info.api_name;
     device_info_.input_channels = info.max_input_channels;
@@ -105,6 +113,7 @@ void ClientAudioState::set_input_device_info(const AudioStream::DeviceInfo& info
 }
 
 void ClientAudioState::set_output_device_info(const AudioStream::DeviceInfo& info) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     device_info_.output_device_name = info.name;
     device_info_.output_api = info.api_name;
     device_info_.output_channels = info.max_output_channels >= 2 ? 2 : 1;
@@ -112,9 +121,11 @@ void ClientAudioState::set_output_device_info(const AudioStream::DeviceInfo& inf
 }
 
 ClientEncoderInfo ClientAudioState::encoder_info() const {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     return encoder_info_;
 }
 
 void ClientAudioState::set_encoder_info(const ClientEncoderInfo& info) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
     encoder_info_ = info;
 }

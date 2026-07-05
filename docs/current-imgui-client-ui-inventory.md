@@ -1,8 +1,8 @@
-# Current ImGui Client UI Inventory
+# Removed ImGui Client UI Inventory
 
-This records what the current ImGui client exposes so a future JUCE UI can keep
-the same control surface while replacing the visual design. This is not a design
-spec and not a compatibility contract.
+This records what the removed ImGui client exposed so the JUCE UI can keep the
+same control surface while replacing the visual design. This is not a design spec
+and not a compatibility contract.
 
 ## Main Window
 
@@ -111,6 +111,4 @@ spec and not a compatibility contract.
 
 - Preserve these user capabilities first; redesign layout and styling later.
 - Do not keep ImGui-only layout decisions as requirements.
-- The next useful split is to make the client session/audio/network state
-  available through a small UI-facing API, then build JUCE components against
-  that API.
+- The JUCE UI should continue targeting `ClientAppFacade`, not client internals.

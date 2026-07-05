@@ -87,11 +87,12 @@ target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 # ============================================================
 
 add_executable(client
-    client.cpp
-    gui.cpp
-    audio_stream.cpp
-    juce_audio_backend.cpp
+    ${JAM_CLIENT_DIR}/client.cpp
+    ${JAM_CLIENT_DIR}/gui.cpp
+    ${JAM_CLIENT_DIR}/audio_stream.cpp
+    ${JAM_CLIENT_DIR}/juce_audio_backend.cpp
 )
+jam_add_project_includes(client)
 
 target_compile_definitions(client PRIVATE
     JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1

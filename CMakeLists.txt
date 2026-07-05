@@ -8,8 +8,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
 
+# Keep dependency population noisy enough to diagnose slow downloads/clones.
+set(FETCHCONTENT_QUIET OFF CACHE BOOL "Show FetchContent population output")
+
 option(JAM_BUILD_CLIENT "Build the desktop GUI client" ON)
-option(JAM_BUILD_TESTS "Build and register jam self-tests" ON)
+option(JAM_BUILD_TESTS "Build and register jam self-tests" OFF)
+
+set(JAM_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+set(JAM_COMMON_DIR "${JAM_SRC_DIR}/common")
+set(JAM_CLIENT_DIR "${JAM_SRC_DIR}/client")
+set(JAM_SERVER_DIR "${JAM_SRC_DIR}/server")
+set(JAM_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+
+function(jam_add_project_includes target_name)
+    target_include_directories(${target_name} PRIVATE
+        ${JAM_COMMON_DIR}
+        ${JAM_CLIENT_DIR}
+        ${JAM_SERVER_DIR}
+    )
+endfunction()
 
 # Release binaries are bundled inside Electron and must not depend on
 # build-machine dylib paths.
@@ -24,69 +41,71 @@ if(JAM_BUILD_CLIENT)
     include(cmake/client.cmake)
 endif()
 
-add_executable(join_token_tool join_token_tool.cpp)
-target_link_libraries(join_token_tool PRIVATE token_crypto)
-
 if(JAM_BUILD_TESTS)
-    add_executable(client_manager_self_test client_manager_self_test.cpp)
+    function(jam_add_self_test target_name source_name)
+        add_executable(${target_name} ${JAM_TEST_DIR}/${source_name})
+        jam_add_project_includes(${target_name})
+    endfunction()
+
+    jam_add_self_test(client_manager_self_test client_manager_self_test.cpp)
     target_link_libraries(client_manager_self_test PRIVATE asio concurrentqueue token_crypto)
 
-    add_executable(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)
+    jam_add_self_test(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)
     target_link_libraries(server_rate_limiter_self_test PRIVATE asio)
 
-    add_executable(server_metrics_self_test server_metrics_self_test.cpp)
+    jam_add_self_test(server_metrics_self_test server_metrics_self_test.cpp)
 
-    add_executable(logger_self_test logger_self_test.cpp)
+    jam_add_self_test(logger_self_test logger_self_test.cpp)
     target_link_libraries(logger_self_test PRIVATE spdlog::spdlog)
 
-    add_executable(periodic_timer_self_test periodic_timer_self_test.cpp)
+    jam_add_self_test(periodic_timer_self_test periodic_timer_self_test.cpp)
     target_link_libraries(periodic_timer_self_test PRIVATE asio spdlog::spdlog)
 
-    add_executable(crash_reporter_self_test crash_reporter_self_test.cpp)
+    jam_add_self_test(crash_reporter_self_test crash_reporter_self_test.cpp)
     if(WIN32)
         target_link_libraries(crash_reporter_self_test PRIVATE Dbghelp)
     endif()
 
-    add_executable(join_reliability_self_test join_reliability_self_test.cpp)
+    jam_add_self_test(join_reliability_self_test join_reliability_self_test.cpp)
 
-    add_executable(opus_network_clock_self_test opus_network_clock_self_test.cpp)
+    jam_add_self_test(opus_network_clock_self_test opus_network_clock_self_test.cpp)
 
-    add_executable(audio_packet_self_test audio_packet_self_test.cpp)
+    jam_add_self_test(audio_packet_self_test audio_packet_self_test.cpp)
 
-    add_executable(session_crypto_self_test session_crypto_self_test.cpp)
+    jam_add_self_test(session_crypto_self_test session_crypto_self_test.cpp)
     target_link_libraries(session_crypto_self_test PRIVATE token_crypto)
 
-    add_executable(participant_packet_queue_self_test participant_packet_queue_self_test.cpp)
+    jam_add_self_test(participant_packet_queue_self_test participant_packet_queue_self_test.cpp)
     target_link_libraries(participant_packet_queue_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 
-    add_executable(participant_manager_self_test participant_manager_self_test.cpp)
+    jam_add_self_test(participant_manager_self_test participant_manager_self_test.cpp)
     target_link_libraries(participant_manager_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 
-    add_executable(sequence_tracker_self_test sequence_tracker_self_test.cpp)
+    jam_add_self_test(sequence_tracker_self_test sequence_tracker_self_test.cpp)
 
-    add_executable(udp_port_self_test udp_port_self_test.cpp)
+    jam_add_self_test(udp_port_self_test udp_port_self_test.cpp)
 
-    add_executable(udp_socket_config_self_test udp_socket_config_self_test.cpp)
+    jam_add_self_test(udp_socket_config_self_test udp_socket_config_self_test.cpp)
     target_link_libraries(udp_socket_config_self_test PRIVATE asio)
     if(WIN32)
         target_link_libraries(udp_socket_config_self_test PRIVATE Qwave)
     endif()
 
-    add_executable(jitter_policy_self_test jitter_policy_self_test.cpp)
+    jam_add_self_test(jitter_policy_self_test jitter_policy_self_test.cpp)
 
-    add_executable(redundant_receive_policy_self_test redundant_receive_policy_self_test.cpp)
+    jam_add_self_test(redundant_receive_policy_self_test redundant_receive_policy_self_test.cpp)
     target_link_libraries(redundant_receive_policy_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 endif()
 
 if(JAM_BUILD_TESTS)
-    add_executable(recording_writer_self_test recording_writer_self_test.cpp)
+    jam_add_self_test(recording_writer_self_test recording_writer_self_test.cpp)
     target_link_libraries(recording_writer_self_test PRIVATE concurrentqueue)
 
-    add_executable(audio_analysis_self_test audio_analysis_self_test.cpp)
+    jam_add_self_test(audio_analysis_self_test audio_analysis_self_test.cpp)
 
-    add_executable(audio_backend_policy_self_test audio_backend_policy_self_test.cpp)
+    jam_add_self_test(audio_backend_policy_self_test audio_backend_policy_self_test.cpp)
 
-    add_executable(juce_audio_adapter_self_test juce_audio_adapter_self_test.cpp)
+    jam_add_self_test(juce_audio_adapter_self_test juce_audio_adapter_self_test.cpp)
 endif()
 
 if(JAM_BUILD_TESTS)

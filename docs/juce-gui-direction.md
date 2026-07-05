@@ -3,38 +3,6 @@
 The JUCE client should preserve the current jam controls, but it should not
 copy the ImGui layout or startup behavior.
 
-## Migration Plan
-
-1. Split `src/client/client.cpp` first.
-   Extract the app/session/audio/network logic away from ImGui drawing. This is
-   done far enough for GUI replacement: startup is in `client.cpp`, runtime is
-   behind `ClientRuntime`, and UI code talks through `ClientAppFacade`.
-2. Move current ImGui app UI into its own file.
-   This is done: `src/client/imgui_client_ui.cpp` depends on
-   `ClientAppFacade`, not the concrete client implementation.
-3. Add JUCE GUI files.
-   Next step. Start with a JUCE app/window/component shell that reads the same
-   facade state and dispatches the same commands.
-4. Replace the `client` target UI entrypoint.
-   Once JUCE can start, connect, show devices, start/stop audio, and show
-   participants, switch the executable from the ImGui shell to the JUCE shell.
-5. Remove ImGui/GLFW completely.
-   No long-term dual UI.
-
-## Runtime Cleanup Backlog
-
-These are useful `client_runtime.cpp` extractions, but they are not blockers for
-starting the JUCE GUI:
-
-- UDP transport/socket helper: socket setup, QoS logging, send/receive
-  scheduling, and rebind support.
-- Session/control-message handler: join/leave, ping, control messages, and
-  participant add/remove handling.
-- Opus send pipeline: audio sender thread, packet batching, redundancy, secure
-  audio send.
-- Audio callback/mix pipeline: callback mixing, participant playout, WAV,
-  metronome, and recording mix handling.
-
 ## Startup Responsiveness
 
 - Show the main window as early as possible.

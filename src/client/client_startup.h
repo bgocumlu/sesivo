@@ -1,6 +1,5 @@
 #pragma once
 
-#include "audio_stream.h"
 #include "opus_network_clock.h"
 #include "protocol.h"
 
@@ -15,16 +14,6 @@ struct PerformerJoinOptions {
     std::string user_id;
     std::string display_name;
     std::string join_token;
-};
-
-struct AudioDevicePreferences {
-    bool loaded = false;
-    std::string audio_api = "All";
-    std::string input_device;
-    std::string input_api;
-    std::optional<int> input_channel_index;
-    std::string output_device;
-    std::string output_api;
 };
 
 struct ClientStartupOptions {
@@ -66,14 +55,10 @@ const char* runtime_arch_name();
 
 std::filesystem::path client_config_path(const char* executable_path,
                                          const std::string& config_dir);
-AudioDevicePreferences load_audio_device_preferences(const std::filesystem::path& path);
 
 ClientStartupOptions parse_startup_options(int argc, char** argv);
 StartupLatencyProfile resolve_startup_latency_profile(
     const ClientStartupOptions& startup_options);
 
-void print_audio_backend_inventory();
-AudioStream::DeviceIndex find_device_for_api(const std::string& api_name, bool input);
-bool required_api_has_duplex_devices(const std::string& api_name);
 int run_audio_backend_open_check(const ClientStartupOptions& startup_options);
 int run_low_latency_backend_check(const ClientStartupOptions& startup_options);

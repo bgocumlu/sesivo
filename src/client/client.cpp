@@ -12,7 +12,6 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -49,6 +48,7 @@
 #include "audio_analysis.h"
 #include "audio_packet.h"
 #include "audio_stream.h"
+#include "client_audio_devices.h"
 #include "client_startup.h"
 #include "gui.h"
 #include "join_reliability.h"
@@ -87,42 +87,6 @@ constexpr auto UDP_PATH_REBIND_COOLDOWN = 15s;
 constexpr int OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS = 200;
 constexpr int OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE = 3;
 constexpr bool AUDIO_CALLBACK_NOTIFY_ENABLED = true;
-
-static AudioStream::DeviceIndex find_preferred_audio_device(
-    const std::vector<AudioStream::DeviceInfo>& devices,
-    const std::string& preferred_device,
-    const std::string& preferred_device_api,
-    const std::string& preferred_filter_api) {
-    if (preferred_device.empty()) {
-        return AudioStream::NO_DEVICE;
-    }
-
-    auto matches_name = [&](const AudioStream::DeviceInfo& device) {
-        return device.name == preferred_device;
-    };
-    auto matches_api = [](const AudioStream::DeviceInfo& device, const std::string& api_name) {
-        return api_name.empty() || api_name == "All" || device.api_name == api_name;
-    };
-
-    if (!preferred_device_api.empty() && preferred_device_api != "All") {
-        auto it = std::find_if(devices.begin(), devices.end(), [&](const auto& device) {
-            return matches_name(device) && matches_api(device, preferred_device_api);
-        });
-        if (it != devices.end()) {
-            return it->index;
-        }
-    }
-
-    auto it = std::find_if(devices.begin(), devices.end(), [&](const auto& device) {
-        return matches_name(device) && matches_api(device, preferred_filter_api);
-    });
-    if (it != devices.end()) {
-        return it->index;
-    }
-
-    it = std::find_if(devices.begin(), devices.end(), matches_name);
-    return it != devices.end() ? it->index : AudioStream::NO_DEVICE;
-}
 
 class Client {
 public:
@@ -1273,47 +1237,9 @@ public:
     }
 
     bool save_audio_device_preferences() const {
-        if (audio_preferences_path_.empty()) {
-            return false;
-        }
-
-        const auto* input_info = AudioStream::get_device_info(selected_input_device_);
-        if (input_info == nullptr) {
-            return false;
-        }
-
-        const std::string input_name = input_info->name;
-        const std::string input_api = input_info->api_name;
-        const auto* output_info = AudioStream::get_device_info(selected_output_device_);
-        if (output_info == nullptr) {
-            return false;
-        }
-
-        const std::string output_name = output_info->name;
-        const std::string output_api = output_info->api_name;
-
-        std::error_code create_error;
-        if (audio_preferences_path_.has_parent_path()) {
-            std::filesystem::create_directories(audio_preferences_path_.parent_path(),
-                                                create_error);
-        }
-
-        std::ofstream output(audio_preferences_path_, std::ios::trunc);
-        if (!output) {
-            spdlog::warn("Could not write audio device preferences: {}",
-                      audio_preferences_path_.string());
-            return false;
-        }
-
-        output << "audio_api=" << selected_audio_api_filter_ << '\n'
-               << "input_device=" << input_name << '\n'
-               << "input_api=" << input_api << '\n'
-               << "input_channel=" << get_audio_config().input_channel_index << '\n'
-               << "output_device=" << output_name << '\n'
-               << "output_api=" << output_api << '\n';
-        spdlog::info("Saved audio device preferences: {}",
-                  audio_preferences_path_.string());
-        return true;
+        return ::save_audio_device_preferences(
+            audio_preferences_path_, selected_audio_api_filter_, selected_input_device_,
+            selected_output_device_, get_audio_config().input_channel_index);
     }
 
     bool set_input_device(AudioStream::DeviceIndex device_index) {

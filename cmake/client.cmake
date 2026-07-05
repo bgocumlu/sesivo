@@ -56,8 +56,10 @@ add_executable(client
     ${JAM_CLIENT_DIR}/juce_app.cpp
     ${JAM_CLIENT_DIR}/audio_stream.cpp
     ${JAM_CLIENT_DIR}/juce_audio_backend.cpp
+    ${JAM_CLIENT_DIR}/juce_participant_list_component.cpp
     ${JAM_CLIENT_DIR}/juce_main_window.cpp
     ${JAM_CLIENT_DIR}/juce_mixer_component.cpp
+    ${JAM_CLIENT_DIR}/juce_status_bar_component.cpp
     ${JAM_COMMON_DIR}/logging_setup.cpp
 )
 jam_add_project_includes(client)

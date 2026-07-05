@@ -75,6 +75,7 @@ public:
                                     AudioStream::DeviceIndex output_device) = 0;
     virtual void reset_audio_path() = 0;
 
+    virtual void start_connection(const std::string& server_address, uint16_t server_port) = 0;
     virtual std::string get_server_address() const = 0;
     virtual unsigned short get_server_port() const = 0;
     virtual std::string get_room_id() const = 0;

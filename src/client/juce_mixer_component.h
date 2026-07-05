@@ -2,6 +2,8 @@
 
 #include "audio_stream.h"
 #include "client_app_facade.h"
+#include "juce_participant_list_component.h"
+#include "juce_status_bar_component.h"
 #include "juce_startup_options.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
@@ -16,14 +18,13 @@
 class JuceMixerComponent final : public juce::Component, private juce::Timer {
 public:
     JuceMixerComponent(ClientAppFacade& client,
-                       JuceClientStartupAudioOptions startup_audio_options);
+                       JuceClientStartupOptions startup_options);
     ~JuceMixerComponent() override;
 
     void paint(juce::Graphics& g) override;
     void resized() override;
 
 private:
-    class ParticipantRowComponent;
     struct AudioDeviceRefreshResult {
         std::vector<AudioStream::DeviceInfo> input_devices;
         std::vector<AudioStream::DeviceInfo> output_devices;
@@ -38,17 +39,23 @@ private:
         bool auto_start_attempted = false;
         bool auto_start_succeeded = false;
     };
+    struct ConnectionResult {
+        juce::String status;
+        bool started = false;
+    };
 
     void timerCallback() override;
     void configure_controls();
     void configure_device_controls();
     void refresh_live_state();
-    void refresh_participants();
     void refresh_audio_device_controls();
     void request_audio_device_refresh(bool auto_start_audio);
     AudioDeviceRefreshResult load_audio_devices(bool auto_start_audio);
     void poll_audio_device_refresh();
     void apply_audio_device_refresh_result(AudioDeviceRefreshResult result);
+    void request_connection_start();
+    ConnectionResult start_connection();
+    void poll_connection_start();
     void set_device_controls_enabled(bool enabled);
     void populate_api_combo();
     void populate_device_combos();
@@ -73,18 +80,25 @@ private:
     void set_device_status(const juce::String& text);
 
     ClientAppFacade& client_;
-    JuceClientStartupAudioOptions startup_audio_options_;
+    JuceClientStartupOptions startup_options_;
     bool updating_from_client_ = false;
     bool device_controls_loaded_ = false;
     bool startup_device_refresh_started_ = false;
     bool device_job_running_ = false;
     bool device_job_finished_ = false;
+    bool startup_connection_started_ = false;
+    bool connection_job_running_ = false;
+    bool connection_job_finished_ = false;
     int device_load_delay_ticks_ = 2;
+    int connection_delay_ticks_ = 1;
     double last_participant_refresh_ms_ = 0.0;
-    size_t visible_participant_count_ = 0;
+    juce::String connection_status_ = "Connection will start after the window opens...";
     std::mutex device_job_mutex_;
     std::thread device_job_thread_;
     std::optional<AudioDeviceRefreshResult> device_job_result_;
+    std::mutex connection_job_mutex_;
+    std::thread connection_job_thread_;
+    std::optional<ConnectionResult> connection_job_result_;
 
     std::vector<AudioStream::DeviceInfo> input_devices_;
     std::vector<AudioStream::DeviceInfo> output_devices_;
@@ -97,12 +111,11 @@ private:
     int pending_buffer_frames_ = AudioStream::AudioConfig::DEFAULT_FRAMES_PER_BUFFER;
     int pending_opus_frames_per_packet_ = 0;
 
-    juce::Label status_label_;
-    juce::Label transport_label_;
     juce::Label diagnostics_label_;
     juce::Label device_status_label_;
-    juce::Label participant_header_label_;
-    juce::Label empty_participants_label_;
+
+    JuceStatusBarComponent status_bar_;
+    JuceParticipantListComponent participants_component_;
 
     juce::TextButton mic_mute_button_;
     juce::ToggleButton monitor_toggle_;
@@ -136,7 +149,4 @@ private:
     juce::TextButton reset_audio_button_;
     juce::TextButton refresh_devices_button_;
 
-    juce::Viewport participants_viewport_;
-    juce::Component participants_content_;
-    std::vector<std::unique_ptr<ParticipantRowComponent>> participant_rows_;
 };

@@ -2,12 +2,16 @@
 
 #include "client_audio_devices.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
-struct JuceClientStartupAudioOptions {
+struct JuceClientStartupOptions {
     AudioDevicePreferences audio_preferences;
     std::string required_audio_api;
     std::optional<int> startup_input_channel_index;
+    std::string server_address;
+    uint16_t server_port = 0;
+    bool auto_connect = true;
     bool auto_start_audio = true;
 };

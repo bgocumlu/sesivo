@@ -8,12 +8,12 @@
 #include <utility>
 
 int run_juce_client_app(ClientAppFacade& client, const std::string& window_title,
-                        JuceClientStartupAudioOptions startup_audio_options,
+                        JuceClientStartupOptions startup_options,
                         std::function<void()> close_callback) {
     juce::ScopedJuceInitialiser_GUI juce_runtime;
 
     JuceMainWindow window(
-        juce::String(window_title), client, std::move(startup_audio_options),
+        juce::String(window_title), client, std::move(startup_options),
         [close_callback = std::move(close_callback)]() mutable {
             if (close_callback) {
                 close_callback();

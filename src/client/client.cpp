@@ -83,9 +83,7 @@ int main(int argc, char** argv) {
         const auto audio_preferences =
             load_audio_device_preferences(audio_preferences_path);
 
-        ClientRuntime client_runtime(io_context, startup_options.server_address,
-                                     startup_options.server_port,
-                                     startup_options.performer_join,
+        ClientRuntime client_runtime(io_context, startup_options.performer_join,
                                      audio_preferences_path, audio_preferences);
         ClientAppFacade& client_app = client_runtime.app_facade();
 
@@ -150,12 +148,14 @@ int main(int argc, char** argv) {
             startup_options.app_version.empty()
                 ? "Jam"
                 : "Jam " + startup_options.app_version;
-        JuceClientStartupAudioOptions startup_audio_options;
-        startup_audio_options.audio_preferences = audio_preferences;
-        startup_audio_options.required_audio_api = startup_options.required_audio_api;
-        startup_audio_options.startup_input_channel_index =
+        JuceClientStartupOptions gui_startup_options;
+        gui_startup_options.audio_preferences = audio_preferences;
+        gui_startup_options.required_audio_api = startup_options.required_audio_api;
+        gui_startup_options.startup_input_channel_index =
             startup_options.startup_input_channel_index;
-        run_juce_client_app(client_app, window_title, std::move(startup_audio_options),
+        gui_startup_options.server_address = startup_options.server_address;
+        gui_startup_options.server_port = startup_options.server_port;
+        run_juce_client_app(client_app, window_title, std::move(gui_startup_options),
                             [&io_context]() { io_context.stop(); });
 
         client_app.stop_audio_stream();

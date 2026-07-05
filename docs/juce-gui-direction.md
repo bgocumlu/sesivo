@@ -27,8 +27,10 @@ it should not copy the old layout or startup behavior.
   launched by the JUCE mixer after the window is running.
 - The device bar shows a loading state while that startup work runs off the UI
   thread.
-- Server connection still starts from `ClientRuntime` construction; move it
-  behind explicit joining/reconnecting state when room discovery is added.
+- Server connection is launched by the JUCE mixer after the window is running
+  and is shown in the status bar as connection/join state.
+- Room discovery can build on that startup state instead of connecting inside
+  `ClientRuntime` construction.
 
 ## Removed ImGui Behavior To Avoid Carrying Forward
 

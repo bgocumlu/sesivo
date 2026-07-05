@@ -6,7 +6,7 @@
 #include <utility>
 
 JuceMainWindow::JuceMainWindow(const juce::String& title, ClientAppFacade& client,
-                               JuceClientStartupAudioOptions startup_audio_options,
+                               JuceClientStartupOptions startup_options,
                                std::function<void()> close_callback)
     : DocumentWindow(title, juce::Colour(0xff111418),
                      juce::DocumentWindow::allButtons),
@@ -14,7 +14,7 @@ JuceMainWindow::JuceMainWindow(const juce::String& title, ClientAppFacade& clien
     setUsingNativeTitleBar(true);
     setResizable(true, true);
     setResizeLimits(900, 600, 2400, 1600);
-    setContentOwned(new JuceMixerComponent(client, std::move(startup_audio_options)), true);
+    setContentOwned(new JuceMixerComponent(client, std::move(startup_options)), true);
     centreWithSize(1080, 720);
     setVisible(true);
 }

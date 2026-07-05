@@ -78,7 +78,7 @@ constexpr bool AUDIO_CALLBACK_NOTIFY_ENABLED = true;
 
 class Client {
 public:
-    Client(asio::io_context& io_context, const std::string& server_address, uint16_t server_port,
+    Client(asio::io_context& io_context,
            PerformerJoinOptions performer_join_options = {},
            std::filesystem::path audio_preferences_path = {},
            AudioDevicePreferences audio_preferences = {})
@@ -107,9 +107,8 @@ public:
             configure_udp_socket_locked();
         }
 
-        // Audio devices are resolved by the GUI startup job so the window can
-        // paint before device enumeration or stream opening blocks anything.
-        start_connection(server_address, server_port);
+        // Server join is resolved by the GUI startup job so the window can
+        // show connection progress instead of blocking launch in this constructor.
     }
 
     // Start connection to server (or switch to new server)
@@ -206,6 +205,12 @@ public:
 
     // Stop connection (stops sending/receiving UDP packets)
     void stop_connection() {
+        const auto target = current_server_endpoint();
+        if (target.port() == 0) {
+            spdlog::info("Disconnect skipped; no server connection was started");
+            return;
+        }
+
         spdlog::info("Disconnecting from server...");
 
         // Stop receive scheduling before touching the socket from the caller thread.
@@ -220,7 +225,6 @@ public:
         chdr.type  = CtrlHdr::Cmd::LEAVE;
         std::error_code leave_error;
         std::error_code cancel_error;
-        const auto target = current_server_endpoint();
         {
             std::lock_guard<std::mutex> lock(socket_mutex_);
             socket_.send_to(asio::buffer(&chdr, sizeof(CtrlHdr)), target, 0, leave_error);
@@ -4133,6 +4137,10 @@ public:
         client_.reset_audio_path();
     }
 
+    void start_connection(const std::string& server_address, uint16_t server_port) override {
+        client_.start_connection(server_address, server_port);
+    }
+
     std::string get_server_address() const override {
         return client_.get_server_address();
     }
@@ -4407,12 +4415,10 @@ private:
 
 class ClientRuntime::Impl {
 public:
-    Impl(asio::io_context& io_context, const std::string& server_address,
-         uint16_t server_port, PerformerJoinOptions performer_join_options,
+    Impl(asio::io_context& io_context, PerformerJoinOptions performer_join_options,
          std::filesystem::path audio_preferences_path,
          AudioDevicePreferences audio_preferences)
-        : client(io_context, server_address, server_port,
-                 std::move(performer_join_options),
+        : client(io_context, std::move(performer_join_options),
                  std::move(audio_preferences_path), std::move(audio_preferences)),
           adapter(client) {
     }
@@ -4422,13 +4428,10 @@ public:
 };
 
 ClientRuntime::ClientRuntime(asio::io_context& io_context,
-                             const std::string& server_address,
-                             uint16_t server_port,
                              PerformerJoinOptions performer_join_options,
                              std::filesystem::path audio_preferences_path,
                              AudioDevicePreferences audio_preferences)
-    : impl_(std::make_unique<Impl>(io_context, server_address, server_port,
-                                   std::move(performer_join_options),
+    : impl_(std::make_unique<Impl>(io_context, std::move(performer_join_options),
                                    std::move(audio_preferences_path),
                                    std::move(audio_preferences))) {
 }

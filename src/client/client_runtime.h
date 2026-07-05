@@ -16,8 +16,7 @@ class io_context;
 
 class ClientRuntime {
 public:
-    ClientRuntime(asio::io_context& io_context, const std::string& server_address,
-                  uint16_t server_port,
+    ClientRuntime(asio::io_context& io_context,
                   PerformerJoinOptions performer_join_options = {},
                   std::filesystem::path audio_preferences_path = {},
                   AudioDevicePreferences audio_preferences = {});

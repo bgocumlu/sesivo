@@ -38,13 +38,6 @@ inline uint32_t extract_sender_id(const unsigned char* packet_data) {
     return sender_id;
 }
 
-// Extract encoded bytes from audio packet
-inline uint16_t extract_encoded_bytes(const unsigned char* packet_data) {
-    uint16_t encoded_bytes;
-    std::memcpy(&encoded_bytes, packet_data + sizeof(MsgHdr) + sizeof(uint32_t), sizeof(uint16_t));
-    return encoded_bytes;
-}
-
 template <size_t N>
 inline void write_fixed(Bytes<N>& target, const std::string& value) {
     const size_t copy_bytes = std::min(value.size(), target.size() - 1);
@@ -68,22 +61,9 @@ inline std::shared_ptr<std::vector<unsigned char>> create_participant_info_packe
     return buf;
 }
 
-inline uint16_t extract_v2_payload_bytes(const unsigned char* packet_data) {
-    const auto parsed = audio_packet::parse_audio_header(packet_data, audio_packet::v3_header_size());
-    return parsed.valid ? parsed.payload_bytes : 0;
-}
-
 inline uint16_t extract_audio_payload_bytes(const unsigned char* packet_data, size_t len) {
     const auto parsed = audio_packet::parse_audio_header(packet_data, len);
     return parsed.valid ? parsed.payload_bytes : 0;
-}
-
-inline const unsigned char* audio_v1_payload(const unsigned char* packet_data) {
-    return packet_data + sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t);
-}
-
-inline const unsigned char* audio_v2_payload(const unsigned char* packet_data) {
-    return packet_data + audio_packet::v2_header_size();
 }
 
 inline const unsigned char* audio_payload(const unsigned char* packet_data, size_t len) {

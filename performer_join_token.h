@@ -18,7 +18,6 @@ struct Claims {
     std::string server_id;
     std::string room_id;
     std::string profile_id;
-    std::string role;
     std::string nonce;
 };
 
@@ -83,7 +82,7 @@ inline std::string hmac_sha256_hex(const std::string& secret, const std::string&
 
 inline std::string signing_message(const Claims& claims) {
     return "v1|" + std::to_string(claims.expires_at_ms) + "|" + claims.server_id + "|" +
-           claims.room_id + "|" + claims.profile_id + "|" + claims.role + "|" + claims.nonce;
+           claims.room_id + "|" + claims.profile_id + "|" + claims.nonce;
 }
 
 inline std::string random_nonce() {
@@ -104,8 +103,8 @@ inline std::string sign(const Claims& claims, const std::string& secret) {
 
 inline std::string create(const Claims& claims, const std::string& secret) {
     return "v1." + std::to_string(claims.expires_at_ms) + "." + claims.server_id + "." +
-           claims.room_id + "." + claims.profile_id + "." + claims.role + "." + claims.nonce +
-           "." + sign(claims, secret);
+           claims.room_id + "." + claims.profile_id + "." + claims.nonce + "." +
+           sign(claims, secret);
 }
 
 inline std::vector<std::string> split(const std::string& value, char delimiter) {
@@ -132,8 +131,7 @@ inline bool constant_time_equal(const std::string& left, const std::string& righ
 inline ValidatedToken validate_with_claims(const std::string& token, const std::string& secret,
                                            const std::string& expected_server_id,
                                            const std::string& expected_room_id,
-                                           const std::string& expected_profile_id,
-                                           const std::string& expected_role = "performer") {
+                                           const std::string& expected_profile_id) {
     ValidatedToken detailed;
 
     if (secret.empty()) {
@@ -142,7 +140,7 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
     }
 
     const auto parts = split(token, '.');
-    if (parts.size() != 8 || parts[0] != "v1") {
+    if (parts.size() != 7 || parts[0] != "v1") {
         detailed.reason = "malformed token";
         return detailed;
     }
@@ -157,10 +155,9 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
     claims.server_id  = parts[2];
     claims.room_id    = parts[3];
     claims.profile_id = parts[4];
-    claims.role       = parts[5];
-    claims.nonce      = parts[6];
+    claims.nonce      = parts[5];
     detailed.claims = claims;
-    detailed.signature_hex = parts[7];
+    detailed.signature_hex = parts[6];
     detailed.signing_input = signing_message(claims);
 
     if (claims.expires_at_ms < now_ms()) {
@@ -179,13 +176,8 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
         detailed.reason = "wrong profile id";
         return detailed;
     }
-    if (claims.role != expected_role) {
-        detailed.reason = "wrong role";
-        return detailed;
-    }
-
     const std::string expected_signature = sign(claims, secret);
-    if (!constant_time_equal(expected_signature, parts[7])) {
+    if (!constant_time_equal(expected_signature, parts[6])) {
         detailed.reason = "invalid signature";
         return detailed;
     }
@@ -197,11 +189,9 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
 inline ValidationResult validate(const std::string& token, const std::string& secret,
                                  const std::string& expected_server_id,
                                  const std::string& expected_room_id,
-                                 const std::string& expected_profile_id,
-                                 const std::string& expected_role = "performer") {
+                                 const std::string& expected_profile_id) {
     const auto detailed = validate_with_claims(token, secret, expected_server_id,
-                                               expected_room_id, expected_profile_id,
-                                               expected_role);
+                                               expected_room_id, expected_profile_id);
     return {detailed.ok, detailed.reason};
 }
 

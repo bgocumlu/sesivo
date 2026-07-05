@@ -30,7 +30,7 @@ public:
         last_join_sent_ = now;
     }
 
-    void mark_join_ack(uint32_t participant_id, uint32_t server_capabilities = 0) {
+    void mark_join_ack(uint32_t participant_id, uint32_t server_capabilities) {
         participant_id_.store(participant_id, std::memory_order_release);
         server_capabilities_.store(server_capabilities, std::memory_order_release);
         join_confirmed_.store(true, std::memory_order_release);

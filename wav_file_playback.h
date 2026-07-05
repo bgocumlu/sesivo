@@ -34,7 +34,7 @@ struct WavHeader {
     uint32_t data_size;   // size of PCM data
 };
 
-// Validate that format is supported (16-bit PCM only for v1)
+// Validate that the current player supports the file format (16-bit PCM only).
 inline bool validate_format(const WavHeader& header) {
     // Check RIFF/WAVE signature
     if (std::memcmp(header.riff_id, "RIFF", 4) != 0 || std::memcmp(header.format, "WAVE", 4) != 0 ||
@@ -42,7 +42,7 @@ inline bool validate_format(const WavHeader& header) {
         return false;
     }
 
-    // V1: Only support PCM (format 1), 16-bit
+    // Only support PCM (format 1), 16-bit.
     if (header.audio_format != 1 || header.bits_per_sample != 16) {
         return false;
     }
@@ -292,7 +292,7 @@ public:
             return false;
         }
 
-        // Convert to float, always output as mono for v1
+        // Convert to float, always output as mono.
         // Create new vector and atomically swap via shared_ptr (thread-safe)
         auto new_pcm_data = std::make_shared<std::vector<float>>(total_frames);
         if (header.num_channels == 1) {
@@ -483,8 +483,7 @@ public:
 private:
     // Internal structure (private - can refactor later)
     // Use shared_ptr for thread-safe loading/unloading (audio thread keeps reference alive)
-    std::shared_ptr<const std::vector<float>> pcm_data_;  // V1: Load entire file
-                                                          // Future: Streaming/chunked loading
+    std::shared_ptr<const std::vector<float>> pcm_data_;  // Load entire file.
     int file_sample_rate_     = 0;
     int file_channels_        = 0;
     int file_bits_per_sample_ = 0;
@@ -493,7 +492,7 @@ private:
     std::atomic<bool>    playing_{false};
     std::atomic<int64_t> read_position_{0};
 
-    // Resampling state (v1: linear, future: strategy object)
+    // Linear resampling state.
     std::atomic<float>  resample_ratio_{1.0F};
     std::atomic<double> resample_position_frac_{0.0};  // Fractional source position for continuity
 };

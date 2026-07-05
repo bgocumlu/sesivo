@@ -6,7 +6,6 @@ const defaults = {
   server: "127.0.0.1",
   port: "9999",
   serverId: "local-dev",
-  role: "performer",
   codec: "opus",
   frames: "120",
   ttlMs: "120000",
@@ -25,7 +24,6 @@ function parseArgs(argv) {
     else if (arg === "--room" && next) options.room = argv[++i];
     else if ((arg === "--user" || arg === "--user-id") && next) options.user = argv[++i];
     else if (arg === "--display-name" && next) options.displayName = argv[++i];
-    else if (arg === "--role" && next) options.role = argv[++i];
     else if (arg === "--codec" && next) options.codec = argv[++i];
     else if (arg === "--frames" && next) options.frames = argv[++i];
     else if (arg === "--ttl-ms" && next) options.ttlMs = argv[++i];
@@ -66,7 +64,6 @@ const payload = [
   options.serverId,
   options.room,
   options.user,
-  options.role,
   nonce,
 ].join("|");
 const signature = crypto.createHmac("sha256", options.secret).update(payload).digest("hex");
@@ -76,7 +73,6 @@ const token = [
   options.serverId,
   options.room,
   options.user,
-  options.role,
   nonce,
   signature,
 ].join(".");

@@ -19,14 +19,13 @@ int main() {
     const udp::endpoint receiver(asio::ip::make_address("127.0.0.1"), 10003);
     const udp::endpoint secure(asio::ip::make_address("127.0.0.1"), 10004);
 
-    auto first_join = manager.register_performer_client(first, now, "room-a", "user-a",
-                                                        "User A");
-    auto receiver_join = manager.register_performer_client(receiver, now, "room-a", "user-b",
-                                                           "User B");
-    auto retry_same_endpoint = manager.register_performer_client(first, now + 1s, "room-a",
-                                                                 "user-a", "User A");
-    auto duplicate_join = manager.register_performer_client(second, now + 2s, "room-a",
-                                                            "user-a", "User A");
+    auto first_join = manager.register_client(first, now, "room-a", "user-a", "User A");
+    auto receiver_join = manager.register_client(receiver, now, "room-a", "user-b",
+                                                 "User B");
+    auto retry_same_endpoint = manager.register_client(first, now + 1s, "room-a",
+                                                       "user-a", "User A");
+    auto duplicate_join = manager.register_client(second, now + 2s, "room-a",
+                                                  "user-a", "User A");
 
     const auto second_targets = manager.get_room_endpoints_except(second);
     const auto first_targets = manager.get_room_endpoints_except(first);
@@ -81,8 +80,7 @@ int main() {
     security.token_nonce_key = "secure-room|secure-user|nonce-a";
     auto secure_join = manager.register_client(
         secure, now + 3s, "secure-room", "secure-user", "Secure User",
-        ClientRole::Performer, AUDIO_CAP_SECURE_AUDIO,
-        std::optional<ClientManager::ClientSecurityConfig>{security});
+        AUDIO_CAP_SECURE_AUDIO, std::optional<ClientManager::ClientSecurityConfig>{security});
     const auto secure_snapshot = manager.get_security(secure);
     if (secure_join.client_id == 0 || !secure_snapshot.has_value() ||
         secure_snapshot->session_key[0] != 0x42 ||
@@ -108,8 +106,7 @@ int main() {
     }
     auto secure_retry = manager.register_client(
         secure, now + 4s, "secure-room", "secure-user", "Secure User",
-        ClientRole::Performer, AUDIO_CAP_SECURE_AUDIO,
-        std::optional<ClientManager::ClientSecurityConfig>{security});
+        AUDIO_CAP_SECURE_AUDIO, std::optional<ClientManager::ClientSecurityConfig>{security});
     if (secure_retry.client_id != secure_join.client_id ||
         manager.accept_audio_nonce(secure, 1)) {
         std::cerr << "same secure session retry reset replay state\n";
@@ -119,7 +116,7 @@ int main() {
     rotated_security.token_nonce_key = "secure-room|secure-user|nonce-b";
     manager.register_client(
         secure, now + 5s, "secure-room", "secure-user", "Secure User",
-        ClientRole::Performer, AUDIO_CAP_SECURE_AUDIO,
+        AUDIO_CAP_SECURE_AUDIO,
         std::optional<ClientManager::ClientSecurityConfig>{rotated_security});
     if (!manager.accept_audio_nonce(secure, 1)) {
         std::cerr << "new secure session did not reset replay state\n";

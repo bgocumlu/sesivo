@@ -31,7 +31,7 @@ struct OpusPacket {
     bool                                  capture_timestamp_valid = false;
     int64_t                               capture_server_time_ns = 0;
 
-    // Helper to get data pointer and size (compatible with old vector API)
+    // Helper to expose the fixed payload buffer.
     const uint8_t* get_data() const {
         return data.data();
     }

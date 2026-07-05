@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
-import dgram from "node:dgram";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,8 +14,6 @@ const DEV = {
   codec: "opus",
   frames: "120",
   ttlMs: 10 * 60 * 1000,
-  spamPackets: 1000,
-  spamIntervalMs: 1,
   serverExe: "build/Debug/server.exe",
   clientExe: "build/Debug/client.exe",
   clients: {
@@ -35,18 +32,16 @@ function abs(relativePath) {
 function tokenFor(client) {
   const expiresAtMs = Date.now() + DEV.ttlMs;
   const nonce = crypto.randomBytes(16).toString("hex");
-  const role = "performer";
   const payload = [
     "v1",
     expiresAtMs,
     DEV.serverId,
     client.room,
     client.user,
-    role,
     nonce,
   ].join("|");
   const signature = crypto.createHmac("sha256", DEV.secret).update(payload).digest("hex");
-  return ["v1", expiresAtMs, DEV.serverId, client.room, client.user, role, nonce, signature].join(
+  return ["v1", expiresAtMs, DEV.serverId, client.room, client.user, nonce, signature].join(
     ".",
   );
 }
@@ -72,7 +67,6 @@ function usage() {
       "  node tools/dev-jam.mjs client a",
       "  node tools/dev-jam.mjs client b",
       "  node tools/dev-jam.mjs client c",
-      "  node tools/dev-jam.mjs spam",
       "",
       "defaults live at the top of tools/dev-jam.mjs",
       "default rooms: a+b in room-a, c in room-b",
@@ -119,33 +113,6 @@ if (command === "server") {
     "--frames",
     DEV.frames,
   ]);
-} else if (command === "spam") {
-  const socket = dgram.createSocket("udp4");
-  const packet = Buffer.alloc(10);
-  packet.writeUInt32LE(0x41554449, 0); // AUDIO_MAGIC
-  packet.writeUInt32LE(0, 4); // sender_id, ignored by the server
-  packet.writeUInt16LE(0, 8); // encoded_bytes
-
-  let sent = 0;
-  const sendOne = () => {
-    socket.send(packet, Number(DEV.port), DEV.serverHost, (error) => {
-      if (error) {
-        console.error(error.message);
-        socket.close();
-        process.exit(1);
-      }
-    });
-
-    sent += 1;
-    if (sent >= DEV.spamPackets) {
-      console.log(`sent ${sent} unjoined audio packets to ${DEV.serverHost}:${DEV.port}`);
-      socket.close();
-      return;
-    }
-    setTimeout(sendOne, DEV.spamIntervalMs);
-  };
-
-  sendOne();
 } else {
   usage();
   process.exit(command ? 2 : 0);

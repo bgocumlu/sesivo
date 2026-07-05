@@ -72,9 +72,6 @@
 using asio::ip::udp;
 using namespace std::chrono_literals;
 
-bool bind_udp_socket_in_range(udp::socket& socket, uint16_t first_port,
-                              uint16_t last_port, uint16_t& bound_port);
-
 static int normalized_buffer_frames_for_codec(AudioCodec codec, int frames_per_buffer) {
     (void)codec;
     return frames_per_buffer;
@@ -1691,12 +1688,8 @@ public:
         } else if (hdr.magic == AUDIO_REDUNDANT_MAGIC &&
                    bytes >= sizeof(AudioRedundantHdr)) {
             handle_audio_message(bytes, state->buffer.data());
-        } else if ((hdr.magic == AUDIO_MAGIC &&
-                    bytes >= sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t)) ||
-                   (hdr.magic == AUDIO_V2_MAGIC &&
-                    bytes >= audio_packet::v2_header_size()) ||
-                   (hdr.magic == AUDIO_V3_MAGIC &&
-                    bytes >= audio_packet::v3_header_size())) {
+        } else if (hdr.magic == AUDIO_V3_MAGIC &&
+                   bytes >= audio_packet::v3_header_size()) {
             handle_audio_message(bytes, state->buffer.data());
         } else {
             // Log unknown message with hex dump for debugging
@@ -1802,8 +1795,7 @@ private:
 
         MsgHdr hdr{};
         std::memcpy(&hdr, data, sizeof(hdr));
-        return hdr.magic == AUDIO_V2_MAGIC || hdr.magic == AUDIO_V3_MAGIC ||
-               hdr.magic == AUDIO_REDUNDANT_MAGIC;
+        return hdr.magic == AUDIO_V3_MAGIC || hdr.magic == AUDIO_REDUNDANT_MAGIC;
     }
 
     void send_audio_packet_sync(const unsigned char* data, std::size_t len) {
@@ -2071,7 +2063,7 @@ private:
 
         MsgHdr hdr{};
         std::memcpy(&hdr, data, sizeof(MsgHdr));
-        if (hdr.magic != AUDIO_V2_MAGIC && hdr.magic != AUDIO_V3_MAGIC) {
+        if (hdr.magic != AUDIO_V3_MAGIC) {
             return true;
         }
 
@@ -2246,34 +2238,15 @@ private:
         return steady_time_ns(time) + offset_ns;
     }
 
-    std::optional<int64_t> capture_timestamp_for_steady_time_if_ready(
-        std::chrono::steady_clock::time_point time) const {
-        if (!join_state_.server_supports(AUDIO_CAP_CAPTURE_TIMESTAMP)) {
-            return std::nullopt;
-        }
-        return server_time_for_steady_time_ns_if_ready(time);
-    }
-
-    bool can_send_capture_timestamps() const {
-        return join_state_.server_supports(AUDIO_CAP_CAPTURE_TIMESTAMP) &&
-               server_clock_ready_.load(std::memory_order_acquire);
-    }
-
     bool build_audio_packet_into(TxPacketBuffer& out, AudioCodec codec, uint32_t sequence,
                                  uint32_t sample_rate, uint16_t frame_count,
                                  uint8_t channels, const unsigned char* payload,
                                  uint16_t payload_bytes,
                                  std::chrono::steady_clock::time_point capture_time) const {
-        const auto capture_server_time_ns =
-            capture_timestamp_for_steady_time_if_ready(capture_time);
-        if (capture_server_time_ns.has_value()) {
-            return audio_packet::write_audio_packet_v3(
-                codec, sequence, sample_rate, frame_count, channels, payload, payload_bytes,
-                *capture_server_time_ns, out.data(), out.capacity(), out.size);
-        }
-        return audio_packet::write_audio_packet_v2(
+        const auto capture_server_time_ns = server_time_for_steady_time_ns_if_ready(capture_time);
+        return audio_packet::write_audio_packet_v3(
             codec, sequence, sample_rate, frame_count, channels, payload, payload_bytes,
-            out.data(), out.capacity(), out.size);
+            capture_server_time_ns.value_or(0), out.data(), out.capacity(), out.size);
     }
 
     static int64_t steady_now_ns() {
@@ -3613,1138 +3586,6 @@ public:
         return current_frame_count;
     }
 
-    static bool run_opus_audio_path_feedback_smoke(std::string& failure) {
-        auto expect = [&](uint16_t current, uint32_t received, uint32_t gaps,
-                          uint16_t expected, const char* label) {
-            const uint16_t actual =
-                opus_packet_frames_after_audio_path_feedback(current, received, gaps);
-            if (actual != expected) {
-                failure = std::string(label) + ": expected " +
-                          std::to_string(expected) + ", got " +
-                          std::to_string(actual);
-                return false;
-            }
-            return true;
-        };
-        auto expect_net_rate = [&](uint32_t received, uint32_t gaps,
-                                   uint32_t unrecovered_gaps, double expected,
-                                   const char* label) {
-            const double actual =
-                audio_path_feedback_net_gap_rate(received, gaps, unrecovered_gaps);
-            if (std::fabs(actual - expected) > 0.000001) {
-                failure = std::string(label) + ": expected net rate " +
-                          std::to_string(expected) + ", got " +
-                          std::to_string(actual);
-                return false;
-            }
-            return true;
-        };
-
-        return expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 100, 0,
-                      opus_network_clock::LOW_LATENCY_FRAME_COUNT, "clean low") &&
-               expect_net_rate(75, 25, 5, 0.05, "redundancy-repaired net loss") &&
-               expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 18, 1,
-                      opus_network_clock::LOW_LATENCY_FRAME_COUNT, "too few samples") &&
-               expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 90, 10,
-                      opus_network_clock::BALANCED_FRAME_COUNT, "unstable low") &&
-               expect(opus_network_clock::FAST_FRAME_COUNT, 75, 25,
-                      opus_network_clock::STABLE_FRAME_COUNT, "severe fast") &&
-               expect(opus_network_clock::BALANCED_FRAME_COUNT, 90, 10,
-                      opus_network_clock::BALANCED_FRAME_COUNT, "balanced moderate") &&
-               expect(opus_network_clock::BALANCED_FRAME_COUNT, 75, 25,
-                      opus_network_clock::STABLE_FRAME_COUNT, "severe balanced") &&
-               !should_rebind_udp_path_after_feedback(
-                   opus_network_clock::BALANCED_FRAME_COUNT, 5, 95) &&
-               !should_rebind_udp_path_after_feedback(
-                   opus_network_clock::STABLE_FRAME_COUNT, 6, 1) &&
-               should_rebind_udp_path_after_feedback(
-                   opus_network_clock::STABLE_FRAME_COUNT, 5, 5) &&
-               should_rebind_udp_path_after_severe_loss(5, 95);
-    }
-
-    static bool run_opus_ping_path_feedback_smoke(std::string& failure) {
-        auto expect = [&](uint16_t current, uint32_t received, uint32_t gaps,
-                          double rtt_ms, uint16_t expected, const char* label) {
-            const uint16_t actual =
-                opus_packet_frames_after_ping_path_feedback(current, received, gaps, rtt_ms);
-            if (actual != expected) {
-                failure = std::string(label) + ": expected " +
-                          std::to_string(expected) + ", got " +
-                          std::to_string(actual);
-                return false;
-            }
-            return true;
-        };
-        auto expect_missing = [&](uint32_t sent, uint32_t watch_start, bool have_reply,
-                                  uint32_t last_reply, uint32_t expected,
-                                  const char* label) {
-            const uint32_t actual = ping_path_missing_replies_for_timeout(
-                sent, watch_start, have_reply, last_reply);
-            if (actual != expected) {
-                failure = std::string(label) + ": expected missing " +
-                          std::to_string(expected) + ", got " +
-                          std::to_string(actual);
-                return false;
-            }
-            return true;
-        };
-
-        return expect(opus_network_clock::BALANCED_FRAME_COUNT, 8, 0, 30.0,
-                      opus_network_clock::BALANCED_FRAME_COUNT, "clean default") &&
-               expect(opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 0, 275.0,
-                      opus_network_clock::BALANCED_FRAME_COUNT, "high rtt low") &&
-               expect(opus_network_clock::BALANCED_FRAME_COUNT, 6, 2, 80.0,
-                      opus_network_clock::STABLE_FRAME_COUNT, "severe default") &&
-               expect(opus_network_clock::FAST_FRAME_COUNT, 7, 1, 80.0,
-                      opus_network_clock::BALANCED_FRAME_COUNT, "unstable fast") &&
-               expect(opus_network_clock::STABLE_FRAME_COUNT, 1, 99, 500.0,
-                      opus_network_clock::STABLE_FRAME_COUNT, "already stable") &&
-               !should_rebind_udp_path_after_ping_feedback(8, 0, 400.0) &&
-               !should_rebind_udp_path_after_ping_feedback(7, 1, 400.0) &&
-               !should_rebind_udp_path_after_ping_feedback(5, 3, 20.0) &&
-               should_rebind_udp_path_after_ping_feedback(5, 3, 400.0) &&
-               should_rebind_udp_path_after_feedback(
-                   opus_network_clock::STABLE_FRAME_COUNT, 1, 99) &&
-               !ping_reply_is_within_watch_window(34, 35) &&
-               ping_reply_is_within_watch_window(35, 35) &&
-               expect_missing(34, 35, false, 0, 0, "pre-watch send ignored") &&
-               expect_missing(35, 35, false, 0, 1, "first post-join send") &&
-               expect_missing(43, 35, false, 0, 9, "pre-threshold post-join sends") &&
-               expect_missing(44, 35, false, 0, 10, "threshold post-join sends") &&
-               expect_missing(44, 35, true, 40, 4, "missing after last reply") &&
-               expect_missing(44, 35, true, 50, 0, "reply ahead of send") &&
-               expect_missing(44, 35, true, 20, 10, "stale reply before watch");
-    }
-
-    static bool run_opus_redundancy_policy_smoke(std::string& failure) {
-        auto expect_depth = [&](int configured, uint16_t frame_count, int expected,
-                                const char* label) {
-            const int actual = effective_opus_redundancy_depth(configured, frame_count);
-            if (actual != expected) {
-                failure = std::string(label) + ": expected depth " +
-                          std::to_string(expected) + ", got " +
-                          std::to_string(actual);
-                return false;
-            }
-            return true;
-        };
-        auto expect_children = [&](int configured, uint16_t frame_count,
-                                   size_t available_previous, size_t expected,
-                                   const char* label) {
-            const size_t actual = opus_redundancy_child_count_for_policy(
-                configured, frame_count, available_previous);
-            if (actual != expected) {
-                failure = std::string(label) + ": expected child count " +
-                          std::to_string(expected) + ", got " +
-                          std::to_string(actual);
-                return false;
-            }
-            return true;
-        };
-
-        const bool policy_ok =
-            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                         opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1,
-                         "auto low latency depth") &&
-            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                         opus_network_clock::FAST_FRAME_COUNT, 2,
-                         "auto fast depth") &&
-            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                         opus_network_clock::DEFAULT_FRAME_COUNT, 2,
-                         "auto default depth") &&
-            expect_depth(OPUS_REDUNDANCY_DEPTH_AUTO,
-                         opus_network_clock::STABLE_FRAME_COUNT, 3,
-                         "auto stable depth") &&
-            expect_children(0, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 1,
-                            "off sends plain packet") &&
-            expect_children(1, opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
-                            "explicit one previous") &&
-            expect_children(2, opus_network_clock::DEFAULT_FRAME_COUNT, 8, 3,
-                            "explicit two previous") &&
-            expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
-                            opus_network_clock::LOW_LATENCY_FRAME_COUNT, 8, 2,
-                            "auto low latency child count") &&
-            expect_children(OPUS_REDUNDANCY_DEPTH_AUTO,
-                            opus_network_clock::STABLE_FRAME_COUNT, 8, 4,
-                            "auto stable child count") &&
-            expect_children(99, opus_network_clock::DEFAULT_FRAME_COUNT, 20,
-                            MAX_AUDIO_REDUNDANT_PACKETS,
-                            "explicit depth clamps to protocol max");
-        if (!policy_ok) {
-            return false;
-        }
-
-        asio::io_context io_context;
-        PerformerJoinOptions join_options{};
-        Client client(io_context, "127.0.0.1", 9, join_options);
-
-        TxPacketBuffer packet{};
-        const std::array<unsigned char, 3> payload{0x31, 0x32, 0x33};
-        if (!audio_packet::write_audio_packet_v2(
-                AudioCodec::Opus, 1, opus_network_clock::SAMPLE_RATE,
-                opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1, payload.data(),
-                static_cast<uint16_t>(payload.size()), packet.data(), packet.capacity(),
-                packet.size)) {
-            failure = "failed to build reset request seed packet";
-            client.stop_connection();
-            return false;
-        }
-
-        client.remember_recent_opus_audio_packet(packet);
-        if (client.recent_opus_audio_packet_count_ != 1) {
-            failure = "seed packet should populate recent Opus history";
-            client.stop_connection();
-            return false;
-        }
-
-        client.request_recent_opus_audio_packets_reset();
-        if (!client.recent_opus_audio_packets_reset_requested_.load(
-                std::memory_order_acquire)) {
-            failure = "reset request flag should be visible before sender consumption";
-            client.stop_connection();
-            return false;
-        }
-
-        if (!client.consume_recent_opus_audio_packets_reset_request_on_sender_thread()) {
-            failure = "sender-owned reset consumer should observe pending request";
-            client.stop_connection();
-            return false;
-        }
-        if (client.recent_opus_audio_packet_count_ != 0 ||
-            client.recent_opus_audio_packets_reset_requested_.load(
-                std::memory_order_acquire)) {
-            failure = "sender-owned reset consumer should clear history and request";
-            client.stop_connection();
-            return false;
-        }
-        if (client.consume_recent_opus_audio_packets_reset_request_on_sender_thread()) {
-            failure = "reset request should only be consumed once";
-            client.stop_connection();
-            return false;
-        }
-
-        client.stop_connection();
-        return true;
-    }
-
-    static bool run_opus_encode_buffer_smoke(std::string& failure) {
-        OpusEncoderWrapper encoder;
-        if (!encoder.create(opus_network_clock::SAMPLE_RATE, 1,
-                            OPUS_APPLICATION_RESTRICTED_LOWDELAY,
-                            AudioStream::AudioConfig::DEFAULT_BITRATE,
-                            AudioStream::AudioConfig::DEFAULT_COMPLEXITY)) {
-            failure = "failed to create Opus encoder";
-            return false;
-        }
-
-        std::array<float, opus_network_clock::LOW_LATENCY_FRAME_COUNT> input{};
-        std::array<unsigned char, AUDIO_BUF_SIZE> output{};
-        uint16_t encoded_bytes = 0;
-        if (!encoder.encode(input.data(), static_cast<int>(input.size()),
-                            output.data(), output.size(), encoded_bytes)) {
-            failure = "caller-owned encode failed";
-            return false;
-        }
-        if (encoded_bytes == 0 || encoded_bytes > output.size()) {
-            failure = "caller-owned encode returned invalid size";
-            return false;
-        }
-        return true;
-    }
-
-    static bool run_udp_audio_sync_send_smoke(std::string& failure) {
-        asio::io_context io_context;
-        asio::io_context aux_context;
-
-        udp::socket first_server(aux_context);
-        udp::socket second_server(aux_context);
-        uint16_t first_port = 0;
-        uint16_t second_port = 0;
-        if (!bind_udp_socket_in_range(first_server, 19300, 19350, first_port) ||
-            !bind_udp_socket_in_range(second_server, 19350, 19400, second_port)) {
-            failure = "could not bind dummy server port";
-            return false;
-        }
-        first_server.non_blocking(true);
-        second_server.non_blocking(true);
-
-        PerformerJoinOptions join_options{};
-        Client client(io_context, "127.0.0.1", first_port, join_options);
-        client.join_state_.mark_join_ack(1, AUDIO_SUPPORTED_CAPABILITIES);
-        client.server_clock_ready_.store(true, std::memory_order_release);
-
-        auto build_packet = [&](uint32_t sequence, uint8_t first_payload_byte,
-                                std::array<unsigned char, 128>& packet,
-                                size_t& packet_bytes) {
-            const std::array<unsigned char, 3> payload{
-                first_payload_byte,
-                static_cast<uint8_t>(first_payload_byte + 1),
-                static_cast<uint8_t>(first_payload_byte + 2),
-            };
-            if (!audio_packet::write_audio_packet_v3(
-                    AudioCodec::Opus, sequence, opus_network_clock::SAMPLE_RATE,
-                    opus_network_clock::LOW_LATENCY_FRAME_COUNT, 1, payload.data(),
-                    static_cast<uint16_t>(payload.size()), 12345 + sequence,
-                    packet.data(), packet.size(), packet_bytes)) {
-                failure = "failed to build V3 packet";
-                return false;
-            }
-            return true;
-        };
-
-        auto receive_matching_packet = [&](udp::socket& socket,
-                                           const unsigned char* expected,
-                                           size_t expected_bytes,
-                                           std::chrono::milliseconds timeout,
-                                           std::string& receive_failure) {
-            const auto deadline = std::chrono::steady_clock::now() + timeout;
-            std::array<unsigned char, 256> received{};
-            udp::endpoint sender;
-            while (std::chrono::steady_clock::now() < deadline) {
-                std::error_code ec;
-                const size_t bytes =
-                    socket.receive_from(asio::buffer(received), sender, 0, ec);
-                if (!ec) {
-                    if (bytes == expected_bytes &&
-                        std::memcmp(received.data(), expected, expected_bytes) == 0) {
-                        return true;
-                    }
-                    continue;
-                }
-                if (ec != asio::error::would_block && ec != asio::error::try_again) {
-                    receive_failure = "dummy receive failed: " + ec.message();
-                    return false;
-                }
-                std::this_thread::sleep_for(1ms);
-            }
-            return false;
-        };
-
-        auto expect_matching_packet = [&](udp::socket& socket,
-                                          const std::array<unsigned char, 128>& packet,
-                                          size_t packet_bytes, const char* label) {
-            std::string receive_failure;
-            if (receive_matching_packet(socket, packet.data(), packet_bytes, 500ms,
-                                        receive_failure)) {
-                return true;
-            }
-            failure = !receive_failure.empty()
-                          ? receive_failure
-                          : std::string(label) + ": sync audio packet was not received";
-            return false;
-        };
-
-        auto expect_no_matching_packet = [&](udp::socket& socket,
-                                             const std::array<unsigned char, 128>& packet,
-                                             size_t packet_bytes, const char* label) {
-            std::string receive_failure;
-            if (receive_matching_packet(socket, packet.data(), packet_bytes, 150ms,
-                                        receive_failure)) {
-                failure = std::string(label) + ": sync audio packet should not be received";
-                return false;
-            }
-            if (!receive_failure.empty()) {
-                failure = receive_failure;
-                return false;
-            }
-            return true;
-        };
-
-        std::array<unsigned char, 128> packet{};
-        size_t packet_bytes = 0;
-        if (!build_packet(99, 0x31, packet, packet_bytes)) {
-            client.stop_connection();
-            return false;
-        }
-
-        client.send_audio_packet_sync(packet.data(), packet_bytes);
-        bool got_packet =
-            expect_matching_packet(first_server, packet, packet_bytes, "initial send");
-        if (!got_packet) {
-            client.stop_connection();
-            return false;
-        }
-
-        client.stop_connection();
-
-        std::array<unsigned char, 128> stopped_packet{};
-        size_t stopped_packet_bytes = 0;
-        if (!build_packet(100, 0x41, stopped_packet, stopped_packet_bytes)) {
-            return false;
-        }
-        client.send_audio_packet_sync(stopped_packet.data(), stopped_packet_bytes);
-        if (!expect_no_matching_packet(first_server, stopped_packet, stopped_packet_bytes,
-                                       "post-stop guard")) {
-            return false;
-        }
-
-        client.start_connection("127.0.0.1", second_port);
-        client.join_state_.mark_join_ack(2, AUDIO_SUPPORTED_CAPABILITIES);
-        client.server_clock_ready_.store(true, std::memory_order_release);
-
-        std::array<unsigned char, 128> switched_packet{};
-        size_t switched_packet_bytes = 0;
-        if (!build_packet(101, 0x51, switched_packet, switched_packet_bytes)) {
-            client.stop_connection();
-            return false;
-        }
-        client.send_audio_packet_sync(switched_packet.data(), switched_packet_bytes);
-
-        if (!expect_matching_packet(second_server, switched_packet, switched_packet_bytes,
-                                    "new endpoint send")) {
-            client.stop_connection();
-            return false;
-        }
-        if (!expect_no_matching_packet(first_server, switched_packet, switched_packet_bytes,
-                                       "old endpoint guard")) {
-            client.stop_connection();
-            return false;
-        }
-
-        client.stop_connection();
-        return true;
-    }
-
-    static bool run_audio_v3_receive_smoke(std::string& failure) {
-        auto stamp_sender = [](const std::shared_ptr<std::vector<unsigned char>>& packet,
-                               uint32_t sender_id) {
-            if (packet == nullptr || packet->size() < sizeof(MsgHdr) + sizeof(sender_id)) {
-                return false;
-            }
-            std::memcpy(packet->data() + sizeof(MsgHdr), &sender_id, sizeof(sender_id));
-            return true;
-        };
-        auto make_v3 = [&](uint32_t sender_id, uint32_t sequence, uint8_t value) {
-            const std::array<unsigned char, 3> payload{value, static_cast<uint8_t>(value + 1),
-                                                       static_cast<uint8_t>(value + 2)};
-            auto packet = audio_packet::create_audio_packet_v3(
-                AudioCodec::Opus, sequence, opus_network_clock::SAMPLE_RATE,
-                opus_network_clock::DEFAULT_FRAME_COUNT, 1, payload.data(),
-                static_cast<uint16_t>(payload.size()), 123456789LL + sequence);
-            return stamp_sender(packet, sender_id) ? packet : nullptr;
-        };
-        auto expect_next_packet = [&](ParticipantData& participant, uint32_t sequence,
-                                      uint8_t first_byte, const char* label) {
-            OpusPacket packet{};
-            if (!participant.opus_queue.try_dequeue(packet)) {
-                failure = std::string(label) + ": no packet queued";
-                return false;
-            }
-            if (packet.codec != AudioCodec::Opus || !packet.sequence_valid ||
-                packet.sequence != sequence ||
-                packet.sample_rate != opus_network_clock::SAMPLE_RATE ||
-                packet.frame_count != opus_network_clock::DEFAULT_FRAME_COUNT ||
-                packet.channels != 1 || packet.size != 3 || packet.data[0] != first_byte) {
-                failure = std::string(label) + ": queued packet metadata mismatch";
-                return false;
-            }
-            return true;
-        };
-
-        asio::io_context io_context;
-        PerformerJoinOptions join_options{};
-        Client client(io_context, "127.0.0.1", 9, join_options);
-
-        constexpr uint32_t direct_sender = 77;
-        auto direct = make_v3(direct_sender, 7, 0x31);
-        if (direct == nullptr) {
-            failure = "failed to build direct V3 packet";
-            return false;
-        }
-        client.handle_audio_message(direct->size(),
-                                    reinterpret_cast<const char*>(direct->data()));
-
-        bool direct_ok = false;
-        if (!client.participant_manager_.with_participant(
-                direct_sender, [&](ParticipantData& participant) {
-                    direct_ok = expect_next_packet(participant, 7, 0x31, "direct V3");
-                }) ||
-            !direct_ok) {
-            if (failure.empty()) {
-                failure = "direct V3 sender was not registered";
-            }
-            client.stop_connection();
-            return false;
-        }
-
-        constexpr uint32_t redundant_sender = 78;
-        auto current = make_v3(redundant_sender, 21, 0x41);
-        auto previous = make_v3(redundant_sender, 20, 0x51);
-        if (current == nullptr || previous == nullptr) {
-            failure = "failed to build redundant V3 children";
-            client.stop_connection();
-            return false;
-        }
-        auto redundant =
-            audio_packet::create_redundant_audio_packet({current.get(), previous.get()});
-        if (redundant == nullptr) {
-            failure = "failed to build redundant V3 packet";
-            client.stop_connection();
-            return false;
-        }
-        client.handle_audio_message(redundant->size(),
-                                    reinterpret_cast<const char*>(redundant->data()));
-
-        bool redundant_ok = false;
-        if (!client.participant_manager_.with_participant(
-                redundant_sender, [&](ParticipantData& participant) {
-                    redundant_ok =
-                        expect_next_packet(participant, 20, 0x51, "redundant previous V3") &&
-                        expect_next_packet(participant, 21, 0x41, "redundant current V3");
-                }) ||
-            !redundant_ok) {
-            if (failure.empty()) {
-                failure = "redundant V3 sender was not registered";
-            }
-            client.stop_connection();
-            return false;
-        }
-
-        client.stop_connection();
-        return true;
-    }
-
-    static bool run_e2e_latency_metric_smoke(std::string& failure) {
-        ParticipantData participant;
-        const int64_t capture_ns = 10'000'000LL;
-        const int64_t playout_ns = 35'000'000LL;
-
-        OpusPacket packet;
-        packet.capture_server_time_ns = capture_ns;
-        packet.capture_timestamp_valid = true;
-        observe_capture_to_playout_latency(participant, packet, playout_ns);
-
-        const int64_t observed =
-            participant.capture_to_playout_latency_last_ns.load(std::memory_order_relaxed);
-        if (observed != 25'000'000LL) {
-            failure = "direct packet latency observation should be 25 ms";
-            return false;
-        }
-
-        {
-            asio::io_context io_context;
-            PerformerJoinOptions join_options{};
-            Client client(io_context, "127.0.0.1", 9, join_options);
-
-            constexpr uint32_t sender_id = 101;
-            std::array<unsigned char, 120 * sizeof(int16_t)> pcm_payload{};
-            auto timestamped_packet = audio_packet::create_audio_packet_v3(
-                AudioCodec::PcmInt16, 1, opus_network_clock::SAMPLE_RATE, 120, 1,
-                pcm_payload.data(), static_cast<uint16_t>(pcm_payload.size()), capture_ns);
-            if (timestamped_packet == nullptr ||
-                timestamped_packet->size() < sizeof(MsgHdr) + sizeof(sender_id)) {
-                failure = "failed to build timestamped V3 PCM packet";
-                client.stop_connection();
-                return false;
-            }
-            std::memcpy(timestamped_packet->data() + sizeof(MsgHdr), &sender_id,
-                        sizeof(sender_id));
-
-            client.handle_audio_message(
-                timestamped_packet->size(),
-                reinterpret_cast<const char*>(timestamped_packet->data()));
-
-            bool consumed = false;
-            if (!client.participant_manager_.with_participant(
-                    sender_id, [&](ParticipantData& data) {
-                        OpusPacket received;
-                        if (!data.opus_queue.try_dequeue(received)) {
-                            failure = "timestamped V3 packet should be queued";
-                            return;
-                        }
-                        if (received.codec != AudioCodec::PcmInt16 ||
-                            !received.capture_timestamp_valid ||
-                            received.capture_server_time_ns != capture_ns) {
-                            failure = "timestamped V3 packet metadata mismatch";
-                            return;
-                        }
-
-                        client.observe_capture_to_playout_latency_if_clock_ready(
-                            data, received, std::chrono::steady_clock::now());
-                        const uint64_t unsynced_samples =
-                            data.capture_to_playout_latency_samples.load(
-                                std::memory_order_relaxed);
-                        if (unsynced_samples != 0) {
-                            failure = "unsynced V3 packet should not observe E2E latency";
-                            return;
-                        }
-
-                        const auto synced_playout = std::chrono::steady_clock::now();
-                        client.server_clock_offset_ns_.store(
-                            (capture_ns + 25'000'000LL) -
-                                steady_time_ns(synced_playout),
-                            std::memory_order_release);
-                        client.server_clock_ready_.store(true, std::memory_order_release);
-                        client.observe_capture_to_playout_latency_if_clock_ready(
-                            data, received, synced_playout);
-
-                        const uint64_t synced_samples =
-                            data.capture_to_playout_latency_samples.load(
-                                std::memory_order_relaxed);
-                        const int64_t synced_latency =
-                            data.capture_to_playout_latency_last_ns.load(
-                                std::memory_order_relaxed);
-                        if (synced_samples != 1 || synced_latency != 25'000'000LL) {
-                            failure = "synced V3 packet should observe 25 ms E2E latency";
-                            return;
-                        }
-                        consumed = true;
-                    }) ||
-                !consumed) {
-                if (failure.empty()) {
-                    failure = "timestamped V3 sender was not registered";
-                }
-                client.stop_connection();
-                return false;
-            }
-
-            client.join_state_.mark_join_ack(22, AUDIO_CAP_CAPTURE_TIMESTAMP);
-            client.server_clock_offset_ns_.store(987'654'321LL,
-                                                 std::memory_order_release);
-            client.server_clock_ready_.store(true, std::memory_order_release);
-            client.rtt_ms_.store(12.5, std::memory_order_relaxed);
-            client.rtt_last_ns_.store(12'500'000LL, std::memory_order_relaxed);
-            client.rtt_min_ns_.store(11'000'000LL, std::memory_order_relaxed);
-            client.rtt_avg_ns_.store(12'000'000LL, std::memory_order_relaxed);
-            client.rtt_max_ns_.store(13'000'000LL, std::memory_order_relaxed);
-            client.have_ping_reply_sequence_.store(true, std::memory_order_release);
-            client.ping_tx_sequence_.store(44, std::memory_order_release);
-            client.last_ping_reply_sequence_.store(43, std::memory_order_release);
-            client.ping_path_interval_received_.store(5, std::memory_order_relaxed);
-            client.ping_path_interval_missing_.store(2, std::memory_order_relaxed);
-            client.ping_path_total_received_.store(7, std::memory_order_relaxed);
-            client.ping_path_total_missing_.store(3, std::memory_order_relaxed);
-            client.ping_path_consecutive_missing_.store(2, std::memory_order_relaxed);
-            client.ping_path_watch_start_sequence_.store(44, std::memory_order_release);
-            if (!client.can_send_capture_timestamps()) {
-                failure = "synced timestamp-capable client should allow capture timestamps";
-                client.stop_connection();
-                return false;
-            }
-
-            client.start_connection("127.0.0.1", 10);
-            if (client.server_clock_ready_.load(std::memory_order_acquire) ||
-                client.server_clock_offset_ns_.load(std::memory_order_acquire) != 0 ||
-                client.have_ping_reply_sequence_.load(std::memory_order_acquire) ||
-                client.ping_tx_sequence_.load(std::memory_order_acquire) != 0 ||
-                client.last_ping_reply_sequence_.load(std::memory_order_acquire) != 0 ||
-                client.ping_path_interval_received_.load(std::memory_order_relaxed) != 0 ||
-                client.ping_path_interval_missing_.load(std::memory_order_relaxed) != 0 ||
-                client.ping_path_total_received_.load(std::memory_order_relaxed) != 0 ||
-                client.ping_path_total_missing_.load(std::memory_order_relaxed) != 0 ||
-                client.ping_path_consecutive_missing_.load(std::memory_order_relaxed) != 0 ||
-                client.ping_path_watch_start_sequence_.load(std::memory_order_acquire) != 0 ||
-                client.rtt_ms_.load(std::memory_order_relaxed) != 0.0 ||
-                client.rtt_last_ns_.load(std::memory_order_relaxed) != 0 ||
-                client.rtt_min_ns_.load(std::memory_order_relaxed) != 0 ||
-                client.rtt_avg_ns_.load(std::memory_order_relaxed) != 0 ||
-                client.rtt_max_ns_.load(std::memory_order_relaxed) != 0) {
-                failure = "new start_connection should clear stale clock and ping state";
-                client.stop_connection();
-                return false;
-            }
-            if (client.can_send_capture_timestamps() ||
-                client.server_time_for_steady_time_ns_if_ready(
-                    std::chrono::steady_clock::now())
-                    .has_value()) {
-                failure = "new start_connection should gate capture timestamps until sync";
-                client.stop_connection();
-                return false;
-            }
-
-            ParticipantData reset_participant;
-            OpusPacket reset_packet;
-            reset_packet.capture_server_time_ns = capture_ns;
-            reset_packet.capture_timestamp_valid = true;
-            client.observe_capture_to_playout_latency_if_clock_ready(
-                reset_participant, reset_packet, std::chrono::steady_clock::now());
-            if (reset_participant.capture_to_playout_latency_samples.load(
-                    std::memory_order_relaxed) != 0) {
-                failure = "new start_connection should gate E2E latency samples until sync";
-                client.stop_connection();
-                return false;
-            }
-
-            client.stop_connection();
-        }
-
-        ParticipantManager manager;
-        if (!manager.register_participant(99, 48000, 1)) {
-            failure = "participant registration should succeed";
-            return false;
-        }
-        manager.with_participant(99, [](ParticipantData& data) {
-            data.capture_to_playout_latency_last_ns.store(11'000'000LL,
-                                                          std::memory_order_relaxed);
-            data.capture_to_playout_latency_avg_ns.store(12'000'000LL,
-                                                         std::memory_order_relaxed);
-            data.capture_to_playout_latency_max_ns.store(13'000'000LL,
-                                                         std::memory_order_relaxed);
-            data.capture_to_playout_latency_samples.store(3,
-                                                          std::memory_order_relaxed);
-        });
-        const auto infos = manager.get_all_info();
-        if (infos.empty() || infos.front().capture_to_playout_latency_avg_ms != 12.0 ||
-            infos.front().capture_to_playout_latency_samples != 3) {
-            failure = "participant info should publish E2E latency fields";
-            return false;
-        }
-
-        append_opus_capture_chunk(participant, 120, capture_ns, true);
-        append_opus_capture_chunk(participant, 120, 20'000'000LL, true);
-        observe_and_consume_opus_capture_chunks(participant, 120, 40'000'000LL);
-        const int64_t first_chunk =
-            participant.capture_to_playout_latency_last_ns.load(std::memory_order_relaxed);
-        if (first_chunk != 30'000'000LL) {
-            failure = "first Opus capture chunk should observe 30 ms";
-            return false;
-        }
-        observe_and_consume_opus_capture_chunks(participant, 120, 45'000'000LL);
-        const int64_t second_chunk =
-            participant.capture_to_playout_latency_last_ns.load(std::memory_order_relaxed);
-        if (second_chunk != 25'000'000LL) {
-            failure = "second Opus capture chunk should observe 25 ms";
-            return false;
-        }
-
-        return true;
-    }
-
-    static bool run_opus_empty_playout_auto_jitter_smoke(std::string& failure) {
-        auto initialize_auto_participant = [](ParticipantData& target) {
-            target.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
-            target.buffer_ready.store(true, std::memory_order_relaxed);
-            apply_opus_jitter_policy_to_participant(
-                target, DEFAULT_OPUS_JITTER_PACKETS,
-                DEFAULT_OPUS_AUTO_START_JITTER_PACKETS, true, true);
-            target.buffer_ready.store(true, std::memory_order_relaxed);
-        };
-        auto observe_stable_callbacks = [](ParticipantData& target, int callbacks) {
-            for (int i = 0; i < callbacks; ++i) {
-                observe_auto_jitter_stable(target);
-            }
-        };
-
-        ParticipantData participant;
-        initialize_auto_participant(participant);
-
-        const size_t before_target =
-            participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        const uint64_t before_increases =
-            participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
-
-        observe_auto_jitter_instability(participant);
-
-        const size_t after_target =
-            participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        const uint64_t after_increases =
-            participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
-
-        if (before_target != DEFAULT_OPUS_AUTO_START_JITTER_PACKETS) {
-            failure = "unexpected auto-start jitter target";
-            return false;
-        }
-        if (after_target != before_target) {
-            failure = "isolated instability event raised jitter target immediately";
-            return false;
-        }
-        if (!participant.buffer_ready.load(std::memory_order_relaxed)) {
-            failure = "jitter target increase forced an unnecessary rebuffer";
-            return false;
-        }
-        if (after_increases != before_increases) {
-            failure = "isolated instability event counted as target increase";
-            return false;
-        }
-
-        observe_stable_callbacks(participant,
-                                 OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS - 1);
-        if (participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
-            before_target) {
-            failure = "sparse instability window should hold the target";
-            return false;
-        }
-        observe_stable_callbacks(participant,
-                                 OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS);
-        if (participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
-            before_target - 1) {
-            failure = "clean window after sparse event did not decay the target";
-            return false;
-        }
-
-        ParticipantData burst_participant;
-        initialize_auto_participant(burst_participant);
-        const size_t burst_before_target =
-            burst_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        const uint64_t burst_before_increases =
-            burst_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
-        for (int i = 0; i < OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE; ++i) {
-            observe_auto_jitter_instability(burst_participant);
-        }
-        observe_stable_callbacks(
-            burst_participant,
-            OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS -
-                OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE);
-        const size_t burst_after_target =
-            burst_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        const size_t burst_after_floor =
-            burst_participant.jitter_buffer_floor_packets.load(std::memory_order_relaxed);
-        const size_t burst_after_queue_limit =
-            burst_participant.opus_queue_limit_packets.load(std::memory_order_relaxed);
-        const uint64_t burst_after_increases =
-            burst_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
-        if (burst_after_target != burst_before_target + 1) {
-            failure = "instability window did not raise jitter target by one";
-            return false;
-        }
-        if (burst_after_floor != burst_after_target) {
-            failure = "jitter display floor did not follow raised target";
-            return false;
-        }
-        if (burst_after_queue_limit < burst_after_target + 3) {
-            failure = "queue limit did not expand with raised target";
-            return false;
-        }
-        if (!burst_participant.buffer_ready.load(std::memory_order_relaxed)) {
-            failure = "windowed jitter target increase forced rebuffer";
-            return false;
-        }
-        if (burst_after_increases != burst_before_increases + 1) {
-            failure = "auto jitter increase counter did not increment";
-            return false;
-        }
-
-        ParticipantData decay_participant;
-        initialize_auto_participant(decay_participant);
-        const size_t decay_start =
-            decay_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        const size_t decay_floor =
-            decay_participant.opus_jitter_auto_floor_packets.load(std::memory_order_relaxed);
-        observe_stable_callbacks(
-            decay_participant,
-            static_cast<int>((decay_start - decay_floor) *
-                             OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS));
-        if (decay_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
-            decay_floor) {
-            failure = "clean auto-jitter decay did not reach configured floor";
-            return false;
-        }
-        if (decay_participant.opus_jitter_auto_decreases.load(std::memory_order_relaxed) !=
-            decay_start - decay_floor) {
-            failure = "auto jitter decrease counter did not match decay";
-            return false;
-        }
-
-        ParticipantData age_drop_participant;
-        initialize_auto_participant(age_drop_participant);
-        const size_t age_before_target =
-            age_drop_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
-        const uint64_t age_before_increases =
-            age_drop_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed);
-
-        observe_opus_age_limit_drop(age_drop_participant);
-
-        if (age_drop_participant.jitter_age_drops.load(std::memory_order_relaxed) != 1 ||
-            age_drop_participant.opus_age_limit_drops.load(std::memory_order_relaxed) != 1) {
-            failure = "age drop diagnostics were not counted";
-            return false;
-        }
-        if (age_drop_participant.jitter_buffer_min_packets.load(std::memory_order_relaxed) !=
-            age_before_target) {
-            failure = "age drop raised auto jitter target";
-            return false;
-        }
-        if (age_drop_participant.opus_jitter_auto_increases.load(std::memory_order_relaxed) !=
-            age_before_increases) {
-            failure = "age drop counted as auto jitter instability";
-            return false;
-        }
-        const int participant_jitter_ms =
-            clamp_opus_jitter_ms_for_age_limit(150, 100);
-        const size_t participant_jitter_packets =
-            opus_jitter_packets_for_ms(participant_jitter_ms, 48000,
-                                       opus_network_clock::DEFAULT_FRAME_COUNT);
-        if (participant_jitter_ms != 100 || participant_jitter_packets != 10) {
-            failure = "participant jitter ms did not clamp to packet age limit";
-            return false;
-        }
-
-        return true;
-    }
-
-    static bool run_opus_playout_policy_smoke(std::string& failure) {
-        auto make_packet = [](uint32_t sequence) {
-            OpusPacket packet{};
-            packet.sequence = sequence;
-            packet.sequence_valid = true;
-            packet.frame_count = 480;
-            packet.size = 1;
-            packet.data[0] = static_cast<uint8_t>(sequence);
-            packet.timestamp = std::chrono::steady_clock::now();
-            return packet;
-        };
-
-        auto ratio_at_depth = [&](size_t jitter_packets, size_t queue_limit,
-                                  size_t queued_packets) {
-            ParticipantData participant;
-            participant.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
-            participant.last_packet_frame_count.store(480, std::memory_order_relaxed);
-            participant.last_callback_frame_count.store(240, std::memory_order_relaxed);
-            participant.jitter_buffer_min_packets.store(jitter_packets,
-                                                        std::memory_order_relaxed);
-            participant.opus_queue_limit_packets.store(queue_limit,
-                                                       std::memory_order_relaxed);
-            for (size_t i = 0; i < queued_packets; ++i) {
-                (void)participant.opus_queue.enqueue(make_packet(
-                    static_cast<uint32_t>(i + 1)));
-            }
-            return opus_playout_rate_ratio(participant);
-        };
-
-        for (size_t jitter_packets = 1; jitter_packets <= 8; ++jitter_packets) {
-            for (size_t queue_limit: {size_t{8}, size_t{16}, size_t{64}, size_t{128}}) {
-                const double ratio =
-                    ratio_at_depth(jitter_packets, queue_limit, jitter_packets);
-                if (std::abs(ratio - 1.0) > 0.0001) {
-                    failure = "playout ratio drifted at jitter target depth: jitter=" +
-                              std::to_string(jitter_packets) +
-                              " queue_limit=" + std::to_string(queue_limit) +
-                              " ratio=" + std::to_string(ratio);
-                    return false;
-                }
-            }
-        }
-
-        const double underfilled_ratio = ratio_at_depth(6, 64, 1);
-        if (underfilled_ratio < 0.995 || underfilled_ratio >= 1.0) {
-            failure = "underfilled queue ratio should stay within drift-scale slow clamp";
-            return false;
-        }
-
-        const double overfilled_ratio = ratio_at_depth(6, 64, 24);
-        if (overfilled_ratio <= 1.0 || overfilled_ratio > 1.005) {
-            failure = "overfilled queue ratio should stay within drift-scale fast clamp";
-            return false;
-        }
-
-        ParticipantData trim_participant;
-        trim_participant.last_codec.store(AudioCodec::Opus, std::memory_order_relaxed);
-        trim_participant.last_packet_frame_count.store(120, std::memory_order_relaxed);
-        trim_participant.last_callback_frame_count.store(480, std::memory_order_relaxed);
-        trim_participant.jitter_buffer_min_packets.store(8, std::memory_order_relaxed);
-        for (size_t i = 0; i < 40; ++i) {
-            (void)trim_participant.opus_queue.enqueue(
-                make_packet(static_cast<uint32_t>(i + 1)));
-        }
-        OpusPacket first_trim_packet;
-        if (trim_participant.opus_queue.dequeue(first_trim_packet, 0) !=
-                ParticipantOpusDequeueStatus::Packet ||
-            first_trim_packet.sequence != 1) {
-            failure = "trim setup failed to initialize sequenced playout";
-            return false;
-        }
-        const size_t trim_threshold =
-            opus_latency_trim_threshold_packets(trim_participant);
-        const size_t queue_after_trim =
-            trim_opus_queue_to_latency_target(trim_participant);
-        if (trim_threshold != 12 || queue_after_trim != trim_threshold) {
-            failure = "Opus target trim did not reduce burst backlog to target headroom";
-            return false;
-        }
-        if (trim_participant.opus_target_trim_drops.load(std::memory_order_relaxed) !=
-            27) {
-            failure = "Opus target trim did not count discarded backlog packets";
-            return false;
-        }
-        OpusPacket post_trim_packet;
-        if (trim_participant.opus_queue.dequeue(post_trim_packet, 0) !=
-                ParticipantOpusDequeueStatus::Packet ||
-            post_trim_packet.loss_concealment || post_trim_packet.sequence != 29) {
-            failure = "Opus target trim left a self-inflicted sequence gap";
-            return false;
-        }
-
-        ParticipantData gap_wait_participant;
-        gap_wait_participant.last_packet_frame_count.store(480, std::memory_order_relaxed);
-        gap_wait_participant.last_callback_frame_count.store(240, std::memory_order_relaxed);
-        gap_wait_participant.jitter_buffer_min_packets.store(6, std::memory_order_relaxed);
-        gap_wait_participant.opus_queue_limit_packets.store(64, std::memory_order_relaxed);
-        const size_t default_gap_wait =
-            opus_gap_wait_dequeue_attempts(gap_wait_participant);
-        gap_wait_participant.opus_queue_limit_packets.store(128, std::memory_order_relaxed);
-        const size_t deep_queue_gap_wait =
-            opus_gap_wait_dequeue_attempts(gap_wait_participant);
-        if (default_gap_wait != 2 || deep_queue_gap_wait != default_gap_wait) {
-            failure = "gap wait should be one packet interval and independent of queue limit";
-            return false;
-        }
-
-        gap_wait_participant.last_packet_frame_count.store(960, std::memory_order_relaxed);
-        const size_t stable_packet_gap_wait =
-            opus_gap_wait_dequeue_attempts(gap_wait_participant);
-        if (stable_packet_gap_wait != 4) {
-            failure = "gap wait should scale to one packet interval for larger packets";
-            return false;
-        }
-
-        return true;
-    }
-
-    void log_baseline_snapshot(const std::string& label) {
-        const auto latency = get_latency_info();
-        const auto callback = get_callback_timing_info();
-        const auto devices = get_device_info();
-        const auto encoder = get_encoder_info();
-        const auto participants = participant_manager_.get_all_info();
-        const auto ns_to_ms = [](int64_t ns) {
-            return static_cast<double>(ns) / 1'000'000.0;
-        };
-
-        Log::info(
-            "Baseline snapshot [{}]: platform={} arch={} codec={} audio_active={} "
-            "input='{}' input_api={} input_channels={} input_channel={} "
-            "input_sample_rate={:.1f} "
-            "output='{}' output_api={} output_channels={} output_sample_rate={:.1f} "
-            "requested_frames={} actual_frames={} buffer_ms={:.3f} "
-            "backend_latency_available={} input_latency_ms={:.3f} output_latency_ms={:.3f} "
-            "callback_ms last/avg/max/deadline={:.3f}/{:.3f}/{:.3f}/{:.3f} "
-            "callback_count={} over_deadline={} "
-            "jitter_floor={} auto_start_jitter={} queue_limit={} age_limit_ms={} auto_jitter={} "
-            "tx_packets={} tx_drops pcm/opus={}/{} "
-            "tx_malformed={} "
-            "sendq_ms pcm_last/avg/max={:.3f}/{:.3f}/{:.3f} "
-            "opus_last/avg/max={:.3f}/{:.3f}/{:.3f} opus_p99={:.3f} "
-            "encode_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
-            "send_pace_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
-            "rx_decode_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
-            "rx_playout_ms last/avg/max={:.3f}/{:.3f}/{:.3f} "
-            "rtt_ms={:.3f} rx_bytes={} tx_bytes={} participants={} "
-            "encoder channels={} sample_rate={} bitrate={} actual_bitrate={} complexity={}",
-            label,
-            runtime_platform_name(),
-            runtime_arch_name(),
-            get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
-            is_audio_stream_active() ? "true" : "false",
-            devices.input_device_name,
-            devices.input_api,
-            devices.input_channels,
-            devices.input_channel_index,
-            devices.input_sample_rate,
-            devices.output_device_name,
-            devices.output_api,
-            devices.output_channels,
-            devices.output_sample_rate,
-            latency.requested_buffer_frames,
-            latency.actual_buffer_frames,
-            latency.buffer_duration_ms,
-            latency.backend_latency_available ? "true" : "false",
-            latency.input_latency_ms,
-            latency.output_latency_ms,
-            callback.last_ms,
-            callback.avg_ms,
-            callback.max_ms,
-            callback.deadline_ms,
-            callback.callback_count,
-            callback.over_deadline_count,
-            get_opus_jitter_buffer_packets(),
-            get_opus_auto_jitter_default()
-                ? std::to_string(get_opus_auto_start_jitter_packets())
-                : "disabled",
-            get_opus_queue_limit_packets(),
-            get_jitter_packet_age_limit_ms(),
-            get_opus_auto_jitter_default() ? "true" : "false",
-            audio_tx_sequence_.load(std::memory_order_relaxed),
-            pcm_send_drops_.load(std::memory_order_relaxed),
-            opus_send_drops_.load(std::memory_order_relaxed),
-            outbound_malformed_audio_drops_.load(std::memory_order_relaxed),
-            ns_to_ms(pcm_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(pcm_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(pcm_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(opus_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(opus_send_queue_age_avg_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(opus_send_queue_age_max_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(opus_send_queue_age_p99_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(tx_encode_last_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(tx_encode_avg_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(tx_encode_max_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(tx_send_pace_last_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(tx_send_pace_avg_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(tx_send_pace_max_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(rx_decode_last_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(rx_decode_avg_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(rx_decode_max_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(rx_playout_last_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(rx_playout_avg_ns_.load(std::memory_order_relaxed)),
-            ns_to_ms(rx_playout_max_ns_.load(std::memory_order_relaxed)),
-            get_rtt_ms(),
-            total_bytes_rx_.load(std::memory_order_relaxed),
-            total_bytes_tx_.load(std::memory_order_relaxed),
-            participants.size(),
-            encoder.channels,
-            encoder.sample_rate,
-            encoder.bitrate,
-            encoder.actual_bitrate,
-            encoder.complexity);
-
-        for (const auto& p: participants) {
-            Log::info(
-                "Baseline participant [{}] id={} profile='{}' name='{}' ready={} "
-                "queue={} queue_avg={} queue_max={} queue_drift={:.2f} "
-                "jitter_buffer={} jitter_floor={} queue_limit={} auto_jitter={} "
-                "auto_increases={} auto_decreases={} pkt_frames={} cb_frames={} "
-                "decoded_frames={} decoded_packets={} age_ms last/avg/max={:.1f}/{:.1f}/{:.1f} "
-                "e2e_ms last/avg/max={:.1f}/{:.1f}/{:.1f} e2e_samples={} "
-                "drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} "
-                "pcm_hold={} pcm_drift_drops={} drops jitter_depth/jitter_age={}/{} "
-                "drop_detail limit/age/overflow/target={}/{}/{}/{} "
-                "seq gap/recovered/unresolved/late={}/{}/{}/{} "
-                "playout_ratio={:.4f} correction_callbacks={}",
-                label,
-                p.id,
-                p.profile_id,
-                p.display_name,
-                p.buffer_ready ? "true" : "false",
-                p.queue_size,
-                p.queue_size_avg,
-                p.queue_size_max,
-                p.queue_drift_packets,
-                p.jitter_buffer_min_packets,
-                p.jitter_buffer_floor_packets,
-                p.opus_queue_limit_packets,
-                p.opus_jitter_auto_enabled ? "true" : "false",
-                p.opus_jitter_auto_increases,
-                p.opus_jitter_auto_decreases,
-                p.last_packet_frame_count,
-                p.last_callback_frame_count,
-                p.opus_pcm_buffered_frames,
-                p.opus_packets_decoded_in_callback,
-                p.packet_age_last_ms,
-                p.packet_age_avg_ms,
-                p.packet_age_max_ms,
-                p.capture_to_playout_latency_last_ms,
-                p.capture_to_playout_latency_avg_ms,
-                p.capture_to_playout_latency_max_ms,
-                p.capture_to_playout_latency_samples,
-                p.receiver_drift_ppm_last,
-                p.receiver_drift_ppm_avg,
-                p.receiver_drift_ppm_abs_max,
-                p.underrun_count,
-                p.pcm_concealment_frames,
-                p.pcm_drift_drops,
-                p.jitter_depth_drops,
-                p.jitter_age_drops,
-                p.opus_queue_limit_drops,
-                p.opus_age_limit_drops,
-                p.opus_decode_buffer_overflow_drops,
-                p.opus_target_trim_drops,
-                p.sequence_gaps,
-                p.sequence_gap_recoveries,
-                p.sequence_unresolved_gaps,
-                p.sequence_late_or_reordered,
-                p.opus_playout_rate_ratio,
-                p.opus_rate_correction_callbacks);
-        }
-    }
 
 private:
     void handle_ctrl_message(std::size_t bytes, const char* recv_data) {
@@ -4780,13 +3621,6 @@ private:
                 }
                 const auto profile_id = fixed_string(info.profile_id);
                 const auto display_name = fixed_string(info.display_name);
-                if (!join_state_.is_join_confirmed()) {
-                    join_state_.mark_join_ack(info.participant_id);
-                    reset_ping_path_feedback_to_current_sequence();
-                    server_audio_replay_window_.reset();
-                    Log::info("JOIN confirmed by participant metadata (participant ID: {})",
-                              info.participant_id);
-                }
                 participant_manager_.set_participant_metadata(info.participant_id, profile_id,
                                                               display_name);
                 recording_writer_.set_participant_metadata(info.participant_id, profile_id,
@@ -5091,29 +3925,22 @@ private:
             return;
         }
 
-        const bool is_audio_v2 = msg_hdr.magic == AUDIO_V2_MAGIC;
-        const bool is_audio_v3 = msg_hdr.magic == AUDIO_V3_MAGIC;
-        const bool is_versioned_audio = is_audio_v2 || is_audio_v3;
-        const auto parsed_audio =
-            is_versioned_audio
-                ? audio_packet::parse_audio_header(
-                      reinterpret_cast<const unsigned char*>(recv_data), bytes)
-                : audio_packet::ParsedAudioHeader{};
-        const size_t min_packet_size =
-            is_audio_v3 ? audio_packet::v3_header_size()
-                        : (is_audio_v2 ? audio_packet::v2_header_size()
-                                       : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
+        if (msg_hdr.magic != AUDIO_V3_MAGIC) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        const auto parsed_audio = audio_packet::parse_audio_header(
+            reinterpret_cast<const unsigned char*>(recv_data), bytes);
+        const size_t min_packet_size = audio_packet::v3_header_size();
 
         if (!message_validator::is_valid_audio_packet(bytes, min_packet_size)) {
             return;
         }
 
         const auto* packet_bytes = reinterpret_cast<const unsigned char*>(recv_data);
-        uint32_t sender_id = is_versioned_audio ? parsed_audio.sender_id
-                                                 : packet_builder::extract_sender_id(packet_bytes);
-        uint16_t payload_bytes =
-            is_versioned_audio ? parsed_audio.payload_bytes
-                                : packet_builder::extract_encoded_bytes(packet_bytes);
+        uint32_t sender_id = parsed_audio.sender_id;
+        uint16_t payload_bytes = parsed_audio.payload_bytes;
 
         size_t expected_size = min_packet_size + payload_bytes;
         if (!message_validator::has_complete_payload(bytes, expected_size, 0)) {
@@ -5129,31 +3956,26 @@ private:
             return;
         }
 
-        if (is_versioned_audio) {
-            std::string reason;
-            if (!audio_packet::validate_audio_packet_bytes(packet_bytes, bytes, &reason)) {
-                const uint64_t count =
-                    inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (count == 1 || count % 100 == 0) {
-                    Log::warn(
-                        "Dropping invalid versioned audio: reason={} sender={} seq={} "
-                        "sample_rate={} frame_count={} channels={} payload_bytes={} drops={}",
-                        reason, sender_id, parsed_audio.sequence, parsed_audio.sample_rate,
-                        parsed_audio.frame_count, static_cast<int>(parsed_audio.channels),
-                        parsed_audio.payload_bytes, count);
-                }
-                return;
+        std::string reason;
+        if (!audio_packet::validate_audio_packet_bytes(packet_bytes, bytes, &reason)) {
+            const uint64_t count =
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count % 100 == 0) {
+                Log::warn(
+                    "Dropping invalid audio: reason={} sender={} seq={} "
+                    "sample_rate={} frame_count={} channels={} payload_bytes={} drops={}",
+                    reason, sender_id, parsed_audio.sequence, parsed_audio.sample_rate,
+                    parsed_audio.frame_count, static_cast<int>(parsed_audio.channels),
+                    parsed_audio.payload_bytes, count);
             }
+            return;
         }
 
         // Register participant if not known
         if (!participant_manager_.exists(sender_id)) {
             // Validate audio_config_ before using it
-            const int decoder_sample_rate =
-                is_versioned_audio ? static_cast<int>(parsed_audio.sample_rate)
-                                    : current_audio_sample_rate();
-            const int decoder_channels =
-                is_versioned_audio ? static_cast<int>(parsed_audio.channels) : 1;
+            const int decoder_sample_rate = static_cast<int>(parsed_audio.sample_rate);
+            const int decoder_channels = static_cast<int>(parsed_audio.channels);
             if (decoder_sample_rate == 0 || current_audio_frames_per_buffer() == 0 ||
                 decoder_channels == 0) {
                 Log::error(
@@ -5177,9 +3999,7 @@ private:
         // Add to total bytes received
         total_bytes_rx_.fetch_add(bytes, std::memory_order_relaxed);
 
-        const unsigned char* audio_data =
-            is_versioned_audio ? packet_builder::audio_payload(packet_bytes, bytes)
-                                : packet_builder::audio_v1_payload(packet_bytes);
+        const unsigned char* audio_data = packet_builder::audio_payload(packet_bytes, bytes);
         if (audio_data == nullptr) {
             return;
         }
@@ -5193,46 +4013,38 @@ private:
                 std::memcpy(packet.data.data(), audio_data, payload_bytes);
                 packet.size      = payload_bytes;
                 packet.timestamp = std::chrono::steady_clock::now();
-                if (is_versioned_audio) {
-                    packet.codec       = parsed_audio.codec;
-                    packet.sequence    = parsed_audio.sequence;
-                    packet.sequence_valid = true;
-                    packet.sample_rate = parsed_audio.sample_rate;
-                    packet.frame_count = parsed_audio.frame_count;
-                    packet.channels    = parsed_audio.channels;
-                    packet.capture_timestamp_valid =
-                        parsed_audio.capture_timestamp_valid;
-                    packet.capture_server_time_ns =
-                        parsed_audio.capture_server_time_ns;
-                    const auto sequence_delta =
-                        participant.sequence_tracker.record(packet.sequence);
-                    if (sequence_delta.gaps_detected > 0) {
-                        participant.sequence_gaps.fetch_add(
-                            sequence_delta.gaps_detected,
-                            std::memory_order_relaxed);
-                    }
-                    if (sequence_delta.gaps_recovered > 0) {
-                        participant.sequence_gap_recoveries.fetch_add(
-                            sequence_delta.gaps_recovered,
-                            std::memory_order_relaxed);
-                    }
-                    participant.sequence_unresolved_gaps.store(
-                        participant.sequence_tracker.unresolved_gaps(),
+                packet.codec       = parsed_audio.codec;
+                packet.sequence    = parsed_audio.sequence;
+                packet.sequence_valid = true;
+                packet.sample_rate = parsed_audio.sample_rate;
+                packet.frame_count = parsed_audio.frame_count;
+                packet.channels    = parsed_audio.channels;
+                packet.capture_timestamp_valid =
+                    parsed_audio.capture_timestamp_valid;
+                packet.capture_server_time_ns =
+                    parsed_audio.capture_server_time_ns;
+                const auto sequence_delta =
+                    participant.sequence_tracker.record(packet.sequence);
+                if (sequence_delta.gaps_detected > 0) {
+                    participant.sequence_gaps.fetch_add(
+                        sequence_delta.gaps_detected,
                         std::memory_order_relaxed);
-                    if (sequence_delta.late_or_duplicate &&
-                        (count_duplicate_late || sequence_delta.gaps_recovered > 0)) {
-                        participant.sequence_late_or_reordered.fetch_add(
-                            1, std::memory_order_relaxed);
-                    }
-                    if (!sequence_arrival_should_enqueue(sequence_delta)) {
-                        return;
-                    }
-                } else {
-                    packet.codec       = AudioCodec::Opus;
-                    packet.sample_rate = static_cast<uint32_t>(current_audio_sample_rate());
-                    packet.frame_count =
-                        static_cast<uint16_t>(current_audio_frames_per_buffer());
-                    packet.channels    = 1;
+                }
+                if (sequence_delta.gaps_recovered > 0) {
+                    participant.sequence_gap_recoveries.fetch_add(
+                        sequence_delta.gaps_recovered,
+                        std::memory_order_relaxed);
+                }
+                participant.sequence_unresolved_gaps.store(
+                    participant.sequence_tracker.unresolved_gaps(),
+                    std::memory_order_relaxed);
+                if (sequence_delta.late_or_duplicate &&
+                    (count_duplicate_late || sequence_delta.gaps_recovered > 0)) {
+                    participant.sequence_late_or_reordered.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (!sequence_arrival_should_enqueue(sequence_delta)) {
+                    return;
                 }
             } else {
                 Log::error("Packet too large: {} bytes (max {})", payload_bytes, AUDIO_BUF_SIZE);
@@ -7719,35 +6531,12 @@ struct ClientStartupOptions {
     bool startup_auto_jitter = false;
     bool startup_disable_auto_jitter = false;
     bool list_audio_devices = false;
-    bool audio_open_smoke = false;
     bool low_latency_check = false;
-    bool startup_config_smoke = false;
-    bool udp_endpoint_guard_smoke = false;
-    bool auto_jitter_empty_playout_smoke = false;
-    bool audio_path_feedback_smoke = false;
-    bool opus_playout_policy_smoke = false;
-    bool opus_redundancy_policy_smoke = false;
-    bool opus_encode_buffer_smoke = false;
-    bool udp_audio_sync_send_smoke = false;
-    bool audio_v3_receive_smoke = false;
-    bool e2e_latency_metric_smoke = false;
-    int baseline_snapshot_seconds = 0;
-    int baseline_snapshot_interval_seconds = 5;
-    std::string baseline_snapshot_label = "manual";
     std::optional<AudioCodec> startup_codec;
     std::string required_audio_api;
     std::string log_file_path;
     PerformerJoinOptions performer_join;
 };
-
-int run_audio_open_smoke(const ClientStartupOptions& startup_options);
-int run_udp_endpoint_guard_smoke(const ClientStartupOptions& startup_options);
-
-bool bind_udp_socket_in_range(udp::socket& socket, uint16_t first_port,
-                              uint16_t last_port, uint16_t& bound_port);
-bool receive_ctrl_command(udp::socket& socket, CtrlHdr::Cmd expected_cmd,
-                          std::chrono::milliseconds timeout);
-int run_udp_send_endpoint_snapshot_smoke(const ClientStartupOptions& startup_options);
 
 int parse_opus_redundancy_depth_option(const std::string& value) {
     std::string normalized = value;
@@ -7820,36 +6609,8 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.startup_disable_auto_jitter = true;
         } else if (arg == "--list-audio-devices" || arg == "--audio-devices") {
             options.list_audio_devices = true;
-        } else if (arg == "--audio-open-smoke") {
-            options.audio_open_smoke = true;
-        } else if (arg == "--startup-config-smoke" || arg == "--config-smoke") {
-            options.startup_config_smoke = true;
-        } else if (arg == "--udp-endpoint-guard-smoke") {
-            options.udp_endpoint_guard_smoke = true;
-        } else if (arg == "--auto-jitter-empty-playout-smoke") {
-            options.auto_jitter_empty_playout_smoke = true;
-        } else if (arg == "--audio-path-feedback-smoke") {
-            options.audio_path_feedback_smoke = true;
-        } else if (arg == "--opus-playout-policy-smoke") {
-            options.opus_playout_policy_smoke = true;
-        } else if (arg == "--opus-redundancy-policy-smoke") {
-            options.opus_redundancy_policy_smoke = true;
-        } else if (arg == "--opus-encode-buffer-smoke") {
-            options.opus_encode_buffer_smoke = true;
-        } else if (arg == "--udp-audio-sync-send-smoke") {
-            options.udp_audio_sync_send_smoke = true;
-        } else if (arg == "--audio-v3-receive-smoke") {
-            options.audio_v3_receive_smoke = true;
-        } else if (arg == "--e2e-latency-metric-smoke") {
-            options.e2e_latency_metric_smoke = true;
         } else if (arg == "--low-latency-check" || arg == "--backend-check") {
             options.low_latency_check = true;
-        } else if (arg == "--baseline-snapshot-seconds" && i + 1 < argc) {
-            options.baseline_snapshot_seconds = std::stoi(argv[++i]);
-        } else if (arg == "--baseline-snapshot-interval-seconds" && i + 1 < argc) {
-            options.baseline_snapshot_interval_seconds = std::stoi(argv[++i]);
-        } else if (arg == "--baseline-snapshot-label" && i + 1 < argc) {
-            options.baseline_snapshot_label = argv[++i];
         } else if (arg == "--codec" && i + 1 < argc) {
             std::string codec = argv[++i];
             std::transform(codec.begin(), codec.end(), codec.begin(),
@@ -7951,6 +6712,51 @@ bool required_api_has_duplex_devices(const std::string& api_name) {
            find_device_for_api(api_name, false) != AudioStream::NO_DEVICE;
 }
 
+int silence_audio_callback(const void*, void* output, unsigned long frame_count, void* user_data) {
+    auto* stream = static_cast<AudioStream*>(user_data);
+    if (output == nullptr || stream == nullptr) {
+        return 0;
+    }
+
+    const size_t channels = static_cast<size_t>(stream->get_output_channel_count());
+    std::memset(output, 0, frame_count * channels * sizeof(float));
+    return 0;
+}
+
+int run_audio_backend_open_check(const ClientStartupOptions& startup_options) {
+    AudioStream::DeviceIndex input_dev = AudioStream::get_default_input_device();
+    AudioStream::DeviceIndex output_dev = AudioStream::get_default_output_device();
+    if (!startup_options.required_audio_api.empty()) {
+        input_dev = find_device_for_api(startup_options.required_audio_api, true);
+        output_dev = find_device_for_api(startup_options.required_audio_api, false);
+    }
+
+    if (input_dev == AudioStream::NO_DEVICE || output_dev == AudioStream::NO_DEVICE) {
+        Log::error("Audio backend check has no valid input/output device");
+        print_audio_backend_inventory();
+        return 2;
+    }
+
+    AudioStream stream;
+    AudioStream::AudioConfig config;
+    config.frames_per_buffer =
+        startup_options.requested_frames > 0 ? startup_options.requested_frames : 120;
+    if (startup_options.startup_input_channel_index.has_value()) {
+        config.input_channel_index = *startup_options.startup_input_channel_index;
+    }
+
+    if (!stream.start_audio_stream(input_dev, output_dev, config, silence_audio_callback,
+                                   &stream)) {
+        Log::error("Audio backend check failed: {}", AudioStream::get_last_error());
+        return 3;
+    }
+
+    stream.print_latency_info();
+    stream.stop_audio_stream();
+    Log::info("Audio backend check succeeded");
+    return 0;
+}
+
 int run_low_latency_backend_check(const ClientStartupOptions& startup_options) {
     const std::string api_name =
         startup_options.required_audio_api.empty() ? "ASIO" : startup_options.required_audio_api;
@@ -7964,334 +6770,15 @@ int run_low_latency_backend_check(const ClientStartupOptions& startup_options) {
         return 2;
     }
 
-    ClientStartupOptions smoke_options = startup_options;
-    smoke_options.required_audio_api = api_name;
-    smoke_options.requested_frames = frames;
-    const int smoke_result = run_audio_open_smoke(smoke_options);
-    if (smoke_result != 0) {
-        return smoke_result;
+    ClientStartupOptions check_options = startup_options;
+    check_options.required_audio_api = api_name;
+    check_options.requested_frames = frames;
+    const int open_result = run_audio_backend_open_check(check_options);
+    if (open_result != 0) {
+        return open_result;
     }
 
     Log::info("Low-latency backend '{}' is ready for validation", api_name);
-    return 0;
-}
-
-int smoke_audio_callback(const void*, void* output, unsigned long frame_count, void* user_data) {
-    auto* stream = static_cast<AudioStream*>(user_data);
-    if (output == nullptr || stream == nullptr) {
-        return 0;
-    }
-
-    const size_t channels = static_cast<size_t>(stream->get_output_channel_count());
-    std::memset(output, 0, frame_count * channels * sizeof(float));
-    return 0;
-}
-
-int run_audio_open_smoke(const ClientStartupOptions& startup_options) {
-    AudioStream::DeviceIndex input_dev = AudioStream::get_default_input_device();
-    AudioStream::DeviceIndex output_dev = AudioStream::get_default_output_device();
-    if (!startup_options.required_audio_api.empty()) {
-        input_dev = find_device_for_api(startup_options.required_audio_api, true);
-        output_dev = find_device_for_api(startup_options.required_audio_api, false);
-    }
-
-    if (input_dev == AudioStream::NO_DEVICE || output_dev == AudioStream::NO_DEVICE) {
-        Log::error("Audio open smoke has no valid input/output device");
-        print_audio_backend_inventory();
-        return 2;
-    }
-
-    AudioStream stream;
-    AudioStream::AudioConfig config;
-    config.frames_per_buffer =
-        startup_options.requested_frames > 0 ? startup_options.requested_frames : 120;
-    if (startup_options.startup_input_channel_index.has_value()) {
-        config.input_channel_index = *startup_options.startup_input_channel_index;
-    }
-
-    if (!stream.start_audio_stream(input_dev, output_dev, config, smoke_audio_callback, &stream)) {
-        Log::error("Audio open smoke failed: {}", AudioStream::get_last_error());
-        return 3;
-    }
-
-    stream.print_latency_info();
-    stream.stop_audio_stream();
-    Log::info("Audio open smoke succeeded");
-    return 0;
-}
-
-bool bind_udp_socket_in_range(udp::socket& socket, uint16_t first_port,
-                              uint16_t last_port, uint16_t& bound_port) {
-    for (uint16_t port = first_port; port < last_port; ++port) {
-        std::error_code ec;
-        socket.open(udp::v4(), ec);
-        if (!ec) {
-            socket.bind(udp::endpoint(udp::v4(), port), ec);
-        }
-        if (!ec) {
-            bound_port = port;
-            return true;
-        }
-        socket.close();
-    }
-    return false;
-}
-
-bool receive_ctrl_command(udp::socket& socket, CtrlHdr::Cmd expected_cmd,
-                          std::chrono::milliseconds timeout) {
-    socket.non_blocking(true);
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::array<unsigned char, sizeof(JoinHdr)> buffer{};
-    udp::endpoint sender;
-    while (std::chrono::steady_clock::now() < deadline) {
-        std::error_code ec;
-        const auto bytes = socket.receive_from(asio::buffer(buffer), sender, 0, ec);
-        if (!ec && bytes >= sizeof(CtrlHdr)) {
-            CtrlHdr hdr{};
-            std::memcpy(&hdr, buffer.data(), sizeof(CtrlHdr));
-            if (hdr.magic == CTRL_MAGIC && hdr.type == expected_cmd) {
-                return true;
-            }
-        } else if (ec != asio::error::would_block && ec != asio::error::try_again) {
-            return false;
-        }
-        std::this_thread::sleep_for(5ms);
-    }
-    return false;
-}
-
-int run_udp_send_endpoint_snapshot_smoke(const ClientStartupOptions& startup_options) {
-    asio::io_context io_context;
-    asio::io_context aux_context;
-
-    udp::socket first_server(aux_context);
-    udp::socket second_server(aux_context);
-    uint16_t first_port = 0;
-    uint16_t second_port = 0;
-    if (!bind_udp_socket_in_range(first_server, 19150, 19200, first_port) ||
-        !bind_udp_socket_in_range(second_server, 19200, 19250, second_port)) {
-        Log::error("UDP endpoint snapshot smoke could not bind dummy server ports");
-        return 6;
-    }
-
-    ClientStartupOptions smoke_options = startup_options;
-    smoke_options.server_address = "127.0.0.1";
-    smoke_options.server_port = first_port;
-
-    Client client(io_context, smoke_options.server_address, smoke_options.server_port,
-                  smoke_options.performer_join);
-
-    CtrlHdr alive{};
-    alive.magic = CTRL_MAGIC;
-    alive.type = CtrlHdr::Cmd::ALIVE;
-    client.send(&alive, sizeof(alive));
-
-    client.start_connection("127.0.0.1", second_port);
-
-    std::thread io_thread([&io_context]() { io_context.run(); });
-    const bool first_received_alive =
-        receive_ctrl_command(first_server, CtrlHdr::Cmd::ALIVE, 500ms);
-    const bool second_received_alive =
-        receive_ctrl_command(second_server, CtrlHdr::Cmd::ALIVE, 100ms);
-
-    client.stop_connection();
-    io_context.stop();
-    if (io_thread.joinable()) {
-        io_thread.join();
-    }
-
-    if (first_received_alive || second_received_alive) {
-        Log::error(
-            "UDP endpoint snapshot smoke failed: first_received_alive={} "
-            "second_received_alive={} first_port={} second_port={}",
-            first_received_alive ? "true" : "false",
-            second_received_alive ? "true" : "false", first_port, second_port);
-        return 7;
-    }
-
-    Log::info(
-        "UDP endpoint snapshot smoke passed: queued pre-reconnect send was suppressed "
-        "(old=127.0.0.1:{}, new=127.0.0.1:{})",
-        first_port, second_port);
-    return 0;
-}
-
-int run_udp_post_stop_send_smoke(const ClientStartupOptions& startup_options) {
-    asio::io_context io_context;
-    asio::io_context aux_context;
-
-    udp::socket dummy_server(aux_context);
-    uint16_t dummy_port = 0;
-    if (!bind_udp_socket_in_range(dummy_server, 19250, 19300, dummy_port)) {
-        Log::error("UDP post-stop send smoke could not bind a dummy server port");
-        return 8;
-    }
-
-    ClientStartupOptions smoke_options = startup_options;
-    smoke_options.server_address = "127.0.0.1";
-    smoke_options.server_port = dummy_port;
-
-    Client client(io_context, smoke_options.server_address, smoke_options.server_port,
-                  smoke_options.performer_join);
-
-    CtrlHdr alive{};
-    alive.magic = CTRL_MAGIC;
-    alive.type = CtrlHdr::Cmd::ALIVE;
-    client.send(&alive, sizeof(alive));
-    client.stop_connection();
-
-    std::thread io_thread([&io_context]() { io_context.run(); });
-    std::this_thread::sleep_for(50ms);
-    io_context.stop();
-    if (io_thread.joinable()) {
-        io_thread.join();
-    }
-
-    const bool stale_alive_received =
-        receive_ctrl_command(dummy_server, CtrlHdr::Cmd::ALIVE, 150ms);
-    if (stale_alive_received) {
-        Log::error("UDP post-stop send smoke failed: queued ALIVE escaped after stop");
-        return 9;
-    }
-
-    Log::info("UDP post-stop send smoke passed: queued send suppressed after stop");
-    return 0;
-}
-
-int run_udp_endpoint_guard_smoke(const ClientStartupOptions& startup_options) {
-    const int snapshot_result = run_udp_send_endpoint_snapshot_smoke(startup_options);
-    if (snapshot_result != 0) {
-        return snapshot_result;
-    }
-    const int post_stop_result = run_udp_post_stop_send_smoke(startup_options);
-    if (post_stop_result != 0) {
-        return post_stop_result;
-    }
-
-    asio::io_context io_context;
-    asio::io_context aux_context;
-
-    udp::socket dummy_server(aux_context);
-    uint16_t guarded_port = 0;
-    if (!bind_udp_socket_in_range(dummy_server, 19097, 19150, guarded_port)) {
-        Log::error("UDP endpoint guard smoke could not bind a dummy server port");
-        return 2;
-    }
-
-
-    ClientStartupOptions smoke_options = startup_options;
-    smoke_options.server_address = "127.0.0.1";
-    smoke_options.server_port = guarded_port;
-
-    Client client(io_context, smoke_options.server_address, smoke_options.server_port,
-                  smoke_options.performer_join);
-    std::thread io_thread([&io_context]() { io_context.run(); });
-
-    std::vector<unsigned char> invalid_audio(audio_packet::v2_header_size() + 8, 0x5A);
-    AudioHdrV2 invalid_hdr{};
-    invalid_hdr.magic = AUDIO_V2_MAGIC;
-    invalid_hdr.sender_id = 77;
-    invalid_hdr.sequence = 1;
-    invalid_hdr.sample_rate = 44100;
-    invalid_hdr.frame_count = opus_network_clock::BALANCED_FRAME_COUNT;
-    invalid_hdr.payload_bytes = 8;
-    invalid_hdr.channels = 1;
-    invalid_hdr.codec = AudioCodec::Opus;
-    std::memcpy(invalid_audio.data(), &invalid_hdr, audio_packet::v2_header_size());
-
-    std::error_code send_error;
-    dummy_server.send_to(asio::buffer(invalid_audio),
-                         udp::endpoint(asio::ip::make_address("127.0.0.1"),
-                                       client.get_local_port()),
-                         0, send_error);
-    if (send_error) {
-        Log::error("UDP endpoint guard smoke failed to send expected-endpoint invalid audio: {}",
-                   send_error.message());
-        client.stop_connection();
-        io_context.stop();
-        if (io_thread.joinable()) {
-            io_thread.join();
-        }
-        return 10;
-    }
-
-    for (int i = 0; i < 100 && client.get_inbound_malformed_audio_drops() == 0; ++i) {
-        std::this_thread::sleep_for(10ms);
-    }
-    const bool dropped_expected_invalid_audio =
-        client.get_inbound_malformed_audio_drops() > 0;
-    const auto stray_before_rogue = client.get_stray_udp_packets();
-
-    udp::socket rogue(aux_context, udp::endpoint(udp::v4(), 0));
-    MsgHdr rogue_hdr{};
-    rogue_hdr.magic = PING_MAGIC;
-    rogue.send_to(asio::buffer(&rogue_hdr, sizeof(rogue_hdr)),
-                  udp::endpoint(asio::ip::make_address("127.0.0.1"),
-                                client.get_local_port()),
-                  0, send_error);
-
-    if (send_error) {
-        Log::error("UDP endpoint guard smoke failed to send rogue packet: {}",
-                   send_error.message());
-        client.stop_connection();
-        io_context.stop();
-        if (io_thread.joinable()) {
-            io_thread.join();
-        }
-        return 3;
-    }
-
-    for (int i = 0; i < 100 && client.get_stray_udp_packets() <= stray_before_rogue; ++i) {
-        std::this_thread::sleep_for(10ms);
-    }
-
-    const bool ignored_rogue = client.get_stray_udp_packets() > stray_before_rogue;
-    const bool endpoint_stable =
-        client.get_server_address() == "127.0.0.1" &&
-        client.get_server_port() == guarded_port;
-
-    const auto final_address = client.get_server_address();
-    const auto final_port = client.get_server_port();
-    const auto ignored_count_before_stop = client.get_stray_udp_packets();
-
-    client.stop_connection();
-
-    rogue.send_to(asio::buffer(&rogue_hdr, sizeof(rogue_hdr)),
-                  udp::endpoint(asio::ip::make_address("127.0.0.1"),
-                                client.get_local_port()),
-                  0, send_error);
-    if (send_error) {
-        Log::error("UDP endpoint guard smoke failed to send post-stop rogue packet: {}",
-                   send_error.message());
-        io_context.stop();
-        if (io_thread.joinable()) {
-            io_thread.join();
-        }
-        return 5;
-    }
-    std::this_thread::sleep_for(100ms);
-    const auto ignored_count_after_stop = client.get_stray_udp_packets();
-
-    io_context.stop();
-    if (io_thread.joinable()) {
-        io_thread.join();
-    }
-
-    if (!dropped_expected_invalid_audio || !ignored_rogue || !endpoint_stable ||
-        ignored_count_after_stop != ignored_count_before_stop) {
-        Log::error(
-            "UDP endpoint guard smoke failed: invalid_audio_dropped={} ignored_rogue={} "
-            "ignored_before={} ignored_after_stop={} endpoint={}:{} expected=127.0.0.1:{}",
-            dropped_expected_invalid_audio ? "true" : "false",
-            ignored_rogue ? "true" : "false", ignored_count_before_stop,
-            ignored_count_after_stop, final_address, final_port, guarded_port);
-        return 4;
-    }
-
-    Log::info(
-        "UDP endpoint guard smoke passed: invalid_audio_drops={} ignored={} "
-        "endpoint=127.0.0.1:{}",
-        client.get_inbound_malformed_audio_drops(), ignored_count_before_stop, guarded_port);
     return 0;
 }
 
@@ -8304,7 +6791,7 @@ int main(int argc, char** argv) {
         if (!startup_options.log_file_path.empty()) {
             Log::info("Logging to {}", startup_options.log_file_path);
         }
-        Log::info("Runtime: role=client platform={} arch={}", runtime_platform_name(),
+        Log::info("Runtime: process=client platform={} arch={}", runtime_platform_name(),
                   runtime_arch_name());
         if (startup_options.startup_jitter_packets.has_value() &&
             startup_options.startup_jitter_ms.has_value()) {
@@ -8333,110 +6820,6 @@ int main(int argc, char** argv) {
             log.flush();
             return 2;
         }
-        if (startup_options.audio_open_smoke) {
-            const int result = run_audio_open_smoke(startup_options);
-            log.flush();
-            return result;
-        }
-        if (startup_options.udp_endpoint_guard_smoke) {
-            const int result = run_udp_endpoint_guard_smoke(startup_options);
-            log.flush();
-            return result;
-        }
-        if (startup_options.auto_jitter_empty_playout_smoke) {
-            std::string failure;
-            if (!Client::run_opus_empty_playout_auto_jitter_smoke(failure)) {
-                Log::error("Opus empty playout auto jitter smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            Log::info("Opus empty playout auto jitter smoke passed");
-            log.flush();
-            return 0;
-        }
-        if (startup_options.audio_path_feedback_smoke) {
-            std::string failure;
-            if (!Client::run_opus_audio_path_feedback_smoke(failure)) {
-                Log::error("Opus audio path feedback smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            if (!Client::run_opus_ping_path_feedback_smoke(failure)) {
-                Log::error("Opus ping path feedback smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            Log::info("Opus audio path feedback smoke passed");
-            log.flush();
-            return 0;
-        }
-        if (startup_options.opus_playout_policy_smoke) {
-            std::string failure;
-            if (!Client::run_opus_playout_policy_smoke(failure)) {
-                Log::error("Opus playout policy smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            Log::info("Opus playout policy smoke passed");
-            log.flush();
-            return 0;
-        }
-        if (startup_options.opus_redundancy_policy_smoke) {
-            std::string failure;
-            if (!Client::run_opus_redundancy_policy_smoke(failure)) {
-                Log::error("Opus redundancy policy smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            Log::info("Opus redundancy policy smoke passed");
-            log.flush();
-            return 0;
-        }
-        if (startup_options.opus_encode_buffer_smoke) {
-            std::string failure;
-            if (!Client::run_opus_encode_buffer_smoke(failure)) {
-                Log::error("Opus encode buffer smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            Log::info("Opus encode buffer smoke passed");
-            log.flush();
-            return 0;
-        }
-        if (startup_options.udp_audio_sync_send_smoke) {
-            std::string failure;
-            if (!Client::run_udp_audio_sync_send_smoke(failure)) {
-                Log::error("UDP audio sync send smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            Log::info("UDP audio sync send smoke passed");
-            log.flush();
-            return 0;
-        }
-        if (startup_options.audio_v3_receive_smoke) {
-            std::string failure;
-            if (!Client::run_audio_v3_receive_smoke(failure)) {
-                Log::error("Audio V3 receive smoke failed: {}", failure);
-                log.flush();
-                return 2;
-            }
-            Log::info("Audio V3 receive smoke passed");
-            log.flush();
-            return 0;
-        }
-        if (startup_options.e2e_latency_metric_smoke) {
-            std::string failure;
-            if (!Client::run_e2e_latency_metric_smoke(failure)) {
-                Log::error("E2E latency metric smoke failed: {}", failure);
-                log.flush();
-                return 16;
-            }
-            Log::info("E2E latency metric smoke passed");
-            log.flush();
-            return 0;
-        }
-
         asio::io_context io_context;
         const auto audio_preferences_path =
             client_config_path(argv[0], startup_options.config_dir);
@@ -8521,35 +6904,6 @@ int main(int argc, char** argv) {
             client_instance.set_opus_auto_jitter_default(true);
             Log::info("Startup Opus auto jitter default enabled");
         }
-        if (startup_options.startup_config_smoke) {
-            Log::info(
-                "Startup config smoke: codec={} frames={} opus_packet={} jitter_floor={} "
-                "jitter_ms={} input_channel={} auto_start_jitter={} queue_limit={} "
-                "age_limit_ms={} auto_jitter={} redundancy_depth={} effective_redundancy_depth={} "
-                "app_version={}",
-                client_instance.get_audio_codec() == AudioCodec::Opus ? "opus" : "pcm",
-                client_instance.get_audio_config().frames_per_buffer,
-                client_instance.get_opus_network_frame_count(),
-                client_instance.get_opus_jitter_buffer_packets(),
-                client_instance.get_opus_jitter_buffer_ms(),
-                client_instance.get_input_channel_index(),
-                client_instance.get_opus_auto_jitter_default()
-                    ? std::to_string(client_instance.get_opus_auto_start_jitter_packets())
-                    : "disabled",
-                client_instance.get_opus_queue_limit_packets(),
-                client_instance.get_jitter_packet_age_limit_ms(),
-                client_instance.get_opus_auto_jitter_default() ? "true" : "false",
-                client_instance.get_opus_redundancy_depth_setting() ==
-                        OPUS_REDUNDANCY_DEPTH_AUTO
-                    ? "auto"
-                    : std::to_string(client_instance.get_opus_redundancy_depth_setting()),
-                client_instance.get_effective_opus_redundancy_depth(),
-                startup_options.app_version.empty() ? "none" : startup_options.app_version);
-            client_instance.stop_connection();
-            log.flush();
-            return 0;
-        }
-
         // Auto-start audio stream with default devices
         {
             AudioStream::DeviceIndex input_dev  = client_instance.get_selected_input_device();
@@ -8567,45 +6921,19 @@ int main(int argc, char** argv) {
         // Run io_context in background thread (GLFW must be on main thread on macOS)
         std::thread io_thread([&io_context]() { io_context.run(); });
 
-        if (startup_options.baseline_snapshot_seconds > 0) {
-            const int interval_seconds =
-                std::max(1, startup_options.baseline_snapshot_interval_seconds);
-            const int total_seconds = std::max(1, startup_options.baseline_snapshot_seconds);
-            Log::info("Baseline snapshot run: label={} seconds={} interval_seconds={}",
-                      startup_options.baseline_snapshot_label, total_seconds, interval_seconds);
-            client_instance.log_baseline_snapshot(startup_options.baseline_snapshot_label +
-                                                  ":start");
-            Logger::instance().flush();
+        // Run UI on main thread (required for GLFW on macOS)
+        const std::string window_title =
+            startup_options.app_version.empty()
+                ? "Jam"
+                : "Jam " + startup_options.app_version;
+        Gui app(810, 555, window_title.c_str(), false, 60);
 
-            for (int elapsed_seconds = 0; elapsed_seconds < total_seconds;
-                 elapsed_seconds += interval_seconds) {
-                const int sleep_seconds = std::min(interval_seconds,
-                                                   total_seconds - elapsed_seconds);
-                std::this_thread::sleep_for(std::chrono::seconds(sleep_seconds));
-                const int snapshot_seconds = elapsed_seconds + sleep_seconds;
-                client_instance.log_baseline_snapshot(
-                    startup_options.baseline_snapshot_label + ":" +
-                    std::to_string(snapshot_seconds) + "s");
-                Logger::instance().flush();
-            }
-        } else {
-            // Run UI on main thread (required for GLFW on macOS)
-            const std::string window_title =
-                startup_options.app_version.empty()
-                    ? "Jam"
-                    : "Jam " + startup_options.app_version;
-            Gui app(810, 555, window_title.c_str(), false, 60);
+        app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });
 
-            // Clean lambda - just delegates to separate function
-            app.set_draw_callback([&client_instance]() { draw_client_ui(client_instance); });
-
-            app.set_close_callback([&io_context]() {
-                // Stop io_context to exit the application
-                io_context.stop();
-            });
-            app.run();
-        }
-
+        app.set_close_callback([&io_context]() {
+            io_context.stop();
+        });
+        app.run();
         // Clean up Client resources before exit
         client_instance.stop_audio_stream();
         client_instance.stop_connection();

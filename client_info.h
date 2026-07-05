@@ -16,7 +16,6 @@ struct ClientInfo {
     std::string                           profile_id;
     std::string                           display_name;
     uint32_t                              capabilities = 0;
-    ClientRole                            role = ClientRole::Performer;
     bool                                  joined_with_metadata = false;
     bool                                  has_session_key = false;
     session_crypto::SessionKey            session_key{};

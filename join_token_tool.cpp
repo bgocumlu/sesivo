@@ -11,7 +11,7 @@ namespace {
     throw std::runtime_error(
         reason +
         "\nUsage: join_token_tool --secret <secret> --server-id <id> --room <room> "
-        "--profile <profile> [--role performer|listener] [--ttl-ms ms]\n");
+        "--profile <profile> [--ttl-ms ms]\n");
 }
 
 }  // namespace
@@ -22,7 +22,6 @@ int main(int argc, char** argv) {
         std::string server_id = "local-dev";
         std::string room;
         std::string profile;
-        std::string role = "performer";
         int64_t     ttl_ms = 120000;
 
         for (int i = 1; i < argc; ++i) {
@@ -42,8 +41,6 @@ int main(int argc, char** argv) {
                 room = require_value(arg);
             } else if (arg == "--profile") {
                 profile = require_value(arg);
-            } else if (arg == "--role") {
-                role = require_value(arg);
             } else if (arg == "--ttl-ms") {
                 ttl_ms = std::stoll(require_value(arg));
             } else {
@@ -60,16 +57,11 @@ int main(int argc, char** argv) {
         if (profile.empty()) {
             usage("--profile is required");
         }
-        if (role != "performer" && role != "listener") {
-            usage("--role must be performer or listener");
-        }
-
         performer_join_token::Claims claims;
         claims.expires_at_ms = performer_join_token::now_ms() + ttl_ms;
         claims.server_id = server_id;
         claims.room_id = room;
         claims.profile_id = profile;
-        claims.role = role;
         claims.nonce = performer_join_token::random_nonce();
 
         std::cout << performer_join_token::create(claims, secret) << "\n";

@@ -35,23 +35,22 @@ int main() {
     require(!state.should_send_join(now + 500ms), "join retry should respect retry interval");
     require(state.should_send_join(now + 1000ms), "join retry should fire after retry interval");
 
-    state.mark_join_ack(42);
+    state.mark_join_ack(42, AUDIO_SUPPORTED_CAPABILITIES);
     require(state.is_join_confirmed(), "join ack should confirm connection");
     require(state.can_send_audio(), "audio should be allowed after join ack");
     require(state.participant_id() == 42, "join ack should store participant id");
-    require(state.server_capabilities() == 0,
-            "legacy join ack should default to no server capabilities");
+    require(state.server_supports(AUDIO_CAP_REDUNDANCY),
+            "join ack should store redundancy capability");
+    require(state.server_supports(AUDIO_CAP_SECURE_AUDIO),
+            "join ack should store secure audio capability");
     require(!state.should_send_join(now + 2s), "confirmed connection should stop join retries");
 
     state.mark_join_ack(43, AUDIO_CAP_REDUNDANCY);
     require(state.participant_id() == 43, "extended join ack should update participant id");
     require(state.server_supports(AUDIO_CAP_REDUNDANCY),
-            "extended join ack should store server capabilities");
-    state.mark_join_ack(43, AUDIO_SUPPORTED_CAPABILITIES);
-    require(state.server_supports(AUDIO_CAP_CAPTURE_TIMESTAMP),
-            "join state should report capture timestamp capability");
-    require(state.server_supports(AUDIO_CAP_SECURE_AUDIO),
-            "join state should report secure audio capability");
+            "join ack should update server capabilities");
+    require(!state.server_supports(AUDIO_CAP_SECURE_AUDIO),
+            "join ack should replace old server capabilities");
 
     state.mark_join_required();
     require(!state.is_join_confirmed(), "join required should clear confirmation");

@@ -23,10 +23,10 @@ std::shared_ptr<std::vector<unsigned char>> make_audio_packet(uint32_t sequence,
                                                               uint8_t marker) {
     const std::array<unsigned char, 3> payload{marker, static_cast<unsigned char>(marker + 1),
                                               static_cast<unsigned char>(marker + 2)};
-    return audio_packet::create_audio_packet_v2(
+    return audio_packet::create_audio_packet_v3(
         AudioCodec::Opus, sequence, opus_network_clock::SAMPLE_RATE,
         opus_network_clock::DEFAULT_FRAME_COUNT, 1, payload.data(),
-        static_cast<uint16_t>(payload.size()));
+        static_cast<uint16_t>(payload.size()), 1000000LL + sequence);
 }
 
 std::shared_ptr<std::vector<unsigned char>> make_redundant_packet(
@@ -58,11 +58,11 @@ public:
             audio_packet::for_each_redundant_audio_child_reverse(
                 packet.data(), packet.size(),
                 [this](const unsigned char* child, size_t child_len, uint8_t) {
-                    receive_v2(child, child_len);
+                    receive_current(child, child_len);
                 });
             return;
         }
-        receive_v2(packet.data(), packet.size());
+        receive_current(packet.data(), packet.size());
     }
 
     size_t queued_packets() const {
@@ -84,19 +84,19 @@ private:
         return magic;
     }
 
-    void receive_v2(const unsigned char* data, size_t len) {
-        require(audio_packet::validate_audio_packet_v2_bytes(data, len),
-                "test packet should be valid v2 audio");
+    void receive_current(const unsigned char* data, size_t len) {
+        require(audio_packet::validate_audio_packet_bytes(data, len),
+                "test packet should be valid audio");
 
-        AudioHdrV2 hdr{};
-        std::memcpy(&hdr, data, audio_packet::v2_header_size());
+        const auto hdr = audio_packet::parse_audio_header(data, len);
+        require(hdr.valid, "test packet header should parse");
         const auto delta = sequence_tracker_.record(hdr.sequence);
         if (!sequence_arrival_should_enqueue(delta)) {
             return;
         }
 
         OpusPacket packet{};
-        std::memcpy(packet.data.data(), packet_builder_payload(data), hdr.payload_bytes);
+        std::memcpy(packet.data.data(), packet_payload(data, len), hdr.payload_bytes);
         packet.size = hdr.payload_bytes;
         packet.timestamp = std::chrono::steady_clock::now();
         packet.codec = hdr.codec;
@@ -109,8 +109,8 @@ private:
                 "receiver policy should enqueue admissible packet");
     }
 
-    static const unsigned char* packet_builder_payload(const unsigned char* data) {
-        return data + audio_packet::v2_header_size();
+    static const unsigned char* packet_payload(const unsigned char* data, size_t len) {
+        return audio_packet::audio_payload(data, len);
     }
 
     SequenceArrivalTracker sequence_tracker_;
@@ -207,7 +207,7 @@ void test_duplicate_redundant_datagram_does_not_inflate_queue() {
     receiver.require_next(1);
 }
 
-void test_plain_duplicate_v2_packet_is_rejected_before_queue() {
+void test_plain_duplicate_packet_is_rejected_before_queue() {
     auto packet0 = make_audio_packet(0, 60);
 
     SimulatedRedundantReceiver receiver;
@@ -215,7 +215,7 @@ void test_plain_duplicate_v2_packet_is_rejected_before_queue() {
     receiver.receive(*packet0);
 
     require(receiver.queued_packets() == 1,
-            "plain duplicate v2 packet should not inflate receive queue");
+            "plain duplicate packet should not inflate receive queue");
     receiver.require_next(0);
 }
 
@@ -226,7 +226,7 @@ int main() {
     test_two_dropped_datagrams_recover_from_deeper_redundant_packet();
     test_ten_dropped_datagrams_recover_from_bounded_redundant_packet();
     test_duplicate_redundant_datagram_does_not_inflate_queue();
-    test_plain_duplicate_v2_packet_is_rejected_before_queue();
+    test_plain_duplicate_packet_is_rejected_before_queue();
 
     std::cout << "redundant receive policy self-test passed\n";
     return 0;

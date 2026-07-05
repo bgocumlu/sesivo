@@ -7,8 +7,6 @@
 // Packet identification magic numbers
 constexpr uint32_t PING_MAGIC  = 0x50494E47;  // 'PING'
 constexpr uint32_t CTRL_MAGIC  = 0x4354524C;  // 'CTRL'
-constexpr uint32_t AUDIO_MAGIC = 0x41554449;  // 'AUDI'
-constexpr uint32_t AUDIO_V2_MAGIC = 0x41553249;  // 'AU2I'
 constexpr uint32_t AUDIO_V3_MAGIC = 0x41553349;  // 'AU3I'
 constexpr uint32_t AUDIO_REDUNDANT_MAGIC = 0x41555244;  // 'AURD'
 constexpr uint32_t SECURE_AUDIO_MAGIC = 0x53454341;  // 'SECA'
@@ -17,7 +15,7 @@ constexpr uint32_t SECURE_AUDIO_MAGIC = 0x53454341;  // 'SECA'
 constexpr size_t AUDIO_BUF_SIZE = 512;
 constexpr int UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
 
-// Jitter buffer configuration (CLIENT/LISTENER ONLY - server just relays packets)
+// Jitter buffer configuration (client only - server just relays packets)
 constexpr size_t MAX_OPUS_QUEUE_SIZE       = 128; // Hard safety cap for Opus receive queue
 constexpr size_t TARGET_OPUS_QUEUE_SIZE    = 3;   // Target queue size for adaptive management
 constexpr size_t MIN_JITTER_BUFFER_PACKETS = 3;   // Minimum packets before playback starts
@@ -43,10 +41,9 @@ constexpr int    MAX_OPUS_REDUNDANCY_DEPTH_PACKETS =
 
 // Endpoint capabilities negotiated in extended JOIN/JOIN_ACK packets.
 constexpr uint32_t AUDIO_CAP_REDUNDANCY = 1U << 0;
-constexpr uint32_t AUDIO_CAP_CAPTURE_TIMESTAMP = 1U << 1;
 constexpr uint32_t AUDIO_CAP_SECURE_AUDIO = 1U << 2;
 constexpr uint32_t AUDIO_SUPPORTED_CAPABILITIES =
-    AUDIO_CAP_REDUNDANCY | AUDIO_CAP_CAPTURE_TIMESTAMP | AUDIO_CAP_SECURE_AUDIO;
+    AUDIO_CAP_REDUNDANCY | AUDIO_CAP_SECURE_AUDIO;
 
 // Secure audio packet envelope: MsgHdr, uint64 nonce, uint16 ciphertext bytes,
 // uint16 reserved, ciphertext, 16-byte authentication tag.
@@ -87,20 +84,12 @@ struct CtrlHdr : MsgHdr {
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
 
-enum class ClientRole : uint8_t {
-    Performer = 1,
-    Listener  = 2,
-};
-
-constexpr size_t JOIN_HDR_LEGACY_SIZE = sizeof(CtrlHdr) + (64 * 4) + 512;
-
 struct JoinHdr : CtrlHdr {
     Bytes<64>  room_id;
     Bytes<64>  room_handle;
     Bytes<64>  profile_id;
     Bytes<64>  display_name;
     Bytes<512> join_token;
-    ClientRole role = ClientRole::Performer;
     uint32_t   capabilities = 0;
 };
 
@@ -128,26 +117,9 @@ struct MetronomeSyncHdr : CtrlHdr {
     uint32_t sequence = 0;
 };
 
-struct AudioHdr : MsgHdr {
-    uint32_t              sender_id;      // Unique sender identifier
-    uint16_t              encoded_bytes;  // size of the encoded Opus data
-    Bytes<AUDIO_BUF_SIZE> buf;
-};
-
 enum class AudioCodec : uint8_t {
     Opus     = 1,
     PcmInt16 = 2,
-};
-
-struct AudioHdrV2 : MsgHdr {
-    uint32_t              sender_id;      // Server-owned sender identifier
-    uint32_t              sequence;       // Sender-local packet sequence
-    uint32_t              sample_rate;    // Packet sample rate
-    uint16_t              frame_count;    // Frames per packet
-    uint16_t              payload_bytes;  // Audio payload bytes
-    uint8_t               channels;       // Channel count in payload
-    AudioCodec            codec;          // Payload codec
-    Bytes<AUDIO_BUF_SIZE> buf;
 };
 
 struct AudioHdrV3 : MsgHdr {

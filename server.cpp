@@ -181,8 +181,7 @@ public:
             handle_ping_message(bytes);
         } else if (hdr.magic == CTRL_MAGIC) {
             handle_ctrl_message(bytes);
-        } else if (hdr.magic == AUDIO_MAGIC || hdr.magic == AUDIO_V2_MAGIC ||
-                   hdr.magic == AUDIO_V3_MAGIC || hdr.magic == AUDIO_REDUNDANT_MAGIC) {
+        } else if (hdr.magic == AUDIO_V3_MAGIC || hdr.magic == AUDIO_REDUNDANT_MAGIC) {
             handle_audio_message(bytes);
         } else if (hdr.magic == SECURE_AUDIO_MAGIC) {
             handle_secure_audio_message(bytes);
@@ -230,7 +229,6 @@ private:
         int64_t       expires_at_ms = 0;
         std::string   room_id;
         std::string   profile_id;
-        std::string   role;
     };
 
     struct AudioForwardStats {
@@ -335,9 +333,7 @@ private:
                 auto leaving_client = client_manager_.remove_client_with_info(remote_endpoint_);
                 if (leaving_client.has_value()) {
                     release_token_nonce_for_client(*leaving_client);
-                    if (leaving_client->role == ClientRole::Performer) {
-                        broadcast_participant_leave(leaving_client->client_id);
-                    }
+                    broadcast_participant_leave(leaving_client->client_id);
                 }
                 break;
             }
@@ -389,7 +385,6 @@ private:
             token.claims.expires_at_ms,
             token.claims.room_id,
             token.claims.profile_id,
-            token.claims.role,
         };
         return true;
     }
@@ -402,7 +397,7 @@ private:
     }
 
     void handle_join(std::size_t bytes, std::chrono::steady_clock::time_point now) {
-        if (bytes < JOIN_HDR_LEGACY_SIZE) {
+        if (bytes < sizeof(JoinHdr)) {
             Log::warn("Rejecting JOIN from {}:{}: packet too small",
                       remote_endpoint_.address().to_string(), remote_endpoint_.port());
             return;
@@ -415,9 +410,6 @@ private:
         const std::string profile_id   = fixed_string(join.profile_id);
         const std::string display_name = fixed_string(join.display_name);
         const std::string token        = fixed_string(join.join_token);
-        const ClientRole  role = join.role == ClientRole::Listener ? ClientRole::Listener
-                                                                    : ClientRole::Performer;
-        const std::string role_name = role == ClientRole::Listener ? "listener" : "performer";
         const uint32_t client_capabilities = join.capabilities & AUDIO_SUPPORTED_CAPABILITIES;
 
         if (room_id.empty() || profile_id.empty()) {
@@ -433,7 +425,7 @@ private:
         std::optional<ClientManager::ClientSecurityConfig> security;
         if (!token.empty() && !options_.allow_insecure_dev_joins) {
             const auto result = performer_join_token::validate_with_claims(
-                token, options_.join_secret, options_.server_id, room_id, profile_id, role_name);
+                token, options_.join_secret, options_.server_id, room_id, profile_id);
             if (!result.ok) {
                 Log::warn("Rejecting JOIN from {}:{} room '{}': {}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
@@ -459,8 +451,8 @@ private:
         }
 
         auto registration = client_manager_.register_client(
-            remote_endpoint_, now, room_id, profile_id, display_name, role,
-            registered_capabilities, security);
+            remote_endpoint_, now, room_id, profile_id, display_name, registered_capabilities,
+            security);
         for (uint32_t removed_client_id: registration.removed_client_ids) {
             Log::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
                       removed_client_id, room_id, profile_id);
@@ -469,19 +461,17 @@ private:
 
         uint32_t client_id = registration.client_id;
         Log::info(
-                  "JOIN: {}:{} room='{}' user='{}' display='{}' role='{}' "
+                  "JOIN: {}:{} room='{}' user='{}' display='{}' "
                   "(ID: {}, {}, capabilities=0x{:08x})",
                   remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id,
-                  profile_id, display_name, role_name, client_id,
+                  profile_id, display_name, client_id,
                   token.empty() ? "insecure-dev" : "token-present", registered_capabilities);
         uint32_t ack_capabilities = AUDIO_SUPPORTED_CAPABILITIES;
         if (!security.has_value()) {
             ack_capabilities &= ~AUDIO_CAP_SECURE_AUDIO;
         }
         send_join_ack(remote_endpoint_, client_id, ack_capabilities);
-        if (role == ClientRole::Performer) {
-            broadcast_participant_info(remote_endpoint_, client_id, profile_id, display_name);
-        }
+        broadcast_participant_info(remote_endpoint_, client_id, profile_id, display_name);
         send_existing_participant_info_to(remote_endpoint_);
     }
 
@@ -513,19 +503,13 @@ private:
             return found;
         }
 
-        if (hdr.magic == AUDIO_V2_MAGIC || hdr.magic == AUDIO_V3_MAGIC) {
+        if (hdr.magic == AUDIO_V3_MAGIC) {
             const auto parsed = audio_packet::parse_audio_header(packet_data, bytes);
             if (!parsed.valid) {
                 return false;
             }
             sample_rate = parsed.sample_rate;
             frame_count = parsed.frame_count;
-            return true;
-        }
-
-        if (hdr.magic == AUDIO_MAGIC) {
-            sample_rate = 48000;
-            frame_count = 480;
             return true;
         }
 
@@ -625,12 +609,12 @@ private:
             return;
         }
 
-        const size_t min_audio_packet_size =
-            hdr.magic == AUDIO_V2_MAGIC
-                ? audio_packet::v2_header_size()
-                : (hdr.magic == AUDIO_V3_MAGIC
-                       ? audio_packet::v3_header_size()
-                       : sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t));
+        if (hdr.magic != AUDIO_V3_MAGIC) {
+            record_invalid_audio_drop();
+            return;
+        }
+
+        const size_t min_audio_packet_size = audio_packet::v3_header_size();
         if (!message_validator::is_valid_audio_packet(bytes, min_audio_packet_size)) {
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
@@ -745,7 +729,7 @@ private:
     bool validate_complete_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
         MsgHdr hdr{};
         std::memcpy(&hdr, packet_data, sizeof(MsgHdr));
-        if (hdr.magic != AUDIO_V2_MAGIC && hdr.magic != AUDIO_V3_MAGIC) {
+        if (hdr.magic != AUDIO_V3_MAGIC) {
             return true;
         }
 
@@ -969,9 +953,6 @@ private:
     void send_existing_participant_info_to(const udp::endpoint& joined_endpoint) {
         auto existing_clients = client_manager_.get_room_clients_except(joined_endpoint);
         for (const auto& [endpoint, info]: existing_clients) {
-            if (info.role != ClientRole::Performer) {
-                continue;
-            }
             if (info.profile_id.empty() && info.display_name.empty()) {
                 continue;
             }
@@ -992,18 +973,6 @@ private:
 
         for (const auto& endpoint: endpoints) {
             record_audio_forward_datagram(sender_id, endpoint, packet_data, packet_size);
-            auto fallback = packet_for_receiver_capabilities(endpoint, packet_data, packet_size);
-            if (fallback != nullptr) {
-                auto secure_packet =
-                    secure_packet_for_receiver(endpoint, fallback->data(), fallback->size());
-                if (secure_packet != nullptr) {
-                    send(secure_packet->data(), secure_packet->size(), endpoint, secure_packet);
-                } else if (!client_manager_.has_session_key(endpoint)) {
-                    send(fallback->data(), fallback->size(), endpoint, fallback);
-                }
-                continue;
-            }
-
             auto secure_packet = secure_packet_for_receiver(
                 endpoint, static_cast<const unsigned char*>(packet_data), packet_size);
             if (secure_packet != nullptr) {
@@ -1037,88 +1006,6 @@ private:
         }
         secure_packet->resize(bytes_written);
         return secure_packet;
-    }
-
-    std::shared_ptr<std::vector<unsigned char>> packet_for_receiver_capabilities(
-        const udp::endpoint& endpoint, void* packet_data, std::size_t packet_size) {
-        MsgHdr hdr{};
-        std::memcpy(&hdr, packet_data, sizeof(MsgHdr));
-
-        const bool receiver_supports_timestamp =
-            client_manager_.client_supports(endpoint, AUDIO_CAP_CAPTURE_TIMESTAMP);
-        const bool receiver_supports_redundancy =
-            client_manager_.client_supports(endpoint, AUDIO_CAP_REDUNDANCY);
-
-        if (hdr.magic == AUDIO_REDUNDANT_MAGIC) {
-            if (!receiver_supports_redundancy) {
-                auto fallback = first_redundant_child_copy(packet_data, packet_size);
-                if (fallback != nullptr && !receiver_supports_timestamp &&
-                    packet_magic(fallback->data(), fallback->size()) == AUDIO_V3_MAGIC) {
-                    return audio_packet::strip_audio_v3_timestamp(fallback->data(),
-                                                                  fallback->size());
-                }
-                return fallback;
-            }
-            if (!receiver_supports_timestamp) {
-                return redundant_without_timestamps_copy(packet_data, packet_size);
-            }
-            return nullptr;
-        }
-
-        if (hdr.magic == AUDIO_V3_MAGIC && !receiver_supports_timestamp) {
-            return audio_packet::strip_audio_v3_timestamp(
-                static_cast<const unsigned char*>(packet_data), packet_size);
-        }
-
-        return nullptr;
-    }
-
-    std::shared_ptr<std::vector<unsigned char>> first_redundant_child_copy(
-        void* packet_data, std::size_t packet_size) {
-        std::shared_ptr<std::vector<unsigned char>> fallback;
-        std::string reason;
-        audio_packet::for_each_redundant_audio_child(
-            static_cast<unsigned char*>(packet_data), packet_size,
-            [&](unsigned char* child, size_t child_len, uint8_t index) {
-                if (index != 0 || fallback != nullptr) {
-                    return;
-                }
-                fallback = std::make_shared<std::vector<unsigned char>>(child,
-                                                                        child + child_len);
-            },
-            &reason);
-        return fallback;
-    }
-
-    std::shared_ptr<std::vector<unsigned char>> redundant_without_timestamps_copy(
-        void* packet_data, std::size_t packet_size) {
-        std::vector<std::shared_ptr<std::vector<unsigned char>>> converted_children;
-        std::vector<const std::vector<unsigned char>*> child_refs;
-        std::string reason;
-
-        const bool ok = audio_packet::for_each_redundant_audio_child(
-            static_cast<unsigned char*>(packet_data), packet_size,
-            [&](unsigned char* child, size_t child_len, uint8_t) {
-                auto child_copy = std::make_shared<std::vector<unsigned char>>(
-                    child, child + child_len);
-                if (packet_magic(child_copy->data(), child_copy->size()) == AUDIO_V3_MAGIC) {
-                    child_copy = audio_packet::strip_audio_v3_timestamp(
-                        child_copy->data(), child_copy->size());
-                }
-                if (child_copy != nullptr) {
-                    converted_children.push_back(child_copy);
-                }
-            },
-            &reason);
-        if (!ok || converted_children.empty()) {
-            return nullptr;
-        }
-
-        child_refs.reserve(converted_children.size());
-        for (const auto& child: converted_children) {
-            child_refs.push_back(child.get());
-        }
-        return audio_packet::create_redundant_audio_packet(child_refs);
     }
 
     static uint32_t packet_magic(const unsigned char* packet_data, std::size_t packet_size) {
@@ -1161,8 +1048,7 @@ private:
 
         const auto parsed = audio_packet::parse_audio_header(
             static_cast<const unsigned char*>(packet_data), packet_size);
-        if (!parsed.valid ||
-            (parsed.magic != AUDIO_V2_MAGIC && parsed.magic != AUDIO_V3_MAGIC)) {
+        if (!parsed.valid || parsed.magic != AUDIO_V3_MAGIC) {
             return;
         }
 
@@ -1198,8 +1084,7 @@ private:
 
         const auto parsed = audio_packet::parse_audio_header(
             static_cast<const unsigned char*>(packet_data), packet_size);
-        if (!parsed.valid ||
-            (parsed.magic != AUDIO_V2_MAGIC && parsed.magic != AUDIO_V3_MAGIC)) {
+        if (!parsed.valid || parsed.magic != AUDIO_V3_MAGIC) {
             return;
         }
 
@@ -1538,615 +1423,6 @@ private:
     PeriodicTimer alive_check_timer_;
 };
 
-void require_smoke(bool condition, const char* message) {
-    if (!condition) {
-        throw std::runtime_error(message);
-    }
-}
-
-uint32_t packet_magic(const std::vector<unsigned char>& packet) {
-    require_smoke(packet.size() >= sizeof(MsgHdr), "packet too small for magic");
-    uint32_t magic = 0;
-    std::memcpy(&magic, packet.data(), sizeof(magic));
-    return magic;
-}
-
-uint32_t packet_u32_at(const std::vector<unsigned char>& packet, size_t offset) {
-    require_smoke(packet.size() >= offset + sizeof(uint32_t), "packet too small for u32");
-    uint32_t value = 0;
-    std::memcpy(&value, packet.data() + offset, sizeof(value));
-    return value;
-}
-
-std::vector<unsigned char> make_smoke_join_packet(const std::string& name,
-                                                  uint32_t capabilities,
-                                                  const std::string& room =
-                                                      "redundancy-smoke",
-                                                  const std::string& token = "") {
-    JoinHdr join{};
-    join.magic = CTRL_MAGIC;
-    join.type = CtrlHdr::Cmd::JOIN;
-    join.role = ClientRole::Performer;
-    join.capabilities = capabilities;
-    packet_builder::write_fixed(join.room_id, room);
-    packet_builder::write_fixed(join.room_handle, room);
-    packet_builder::write_fixed(join.profile_id, name);
-    packet_builder::write_fixed(join.display_name, name);
-    packet_builder::write_fixed(join.join_token, token);
-
-    std::vector<unsigned char> packet(sizeof(join));
-    std::memcpy(packet.data(), &join, sizeof(join));
-    return packet;
-}
-
-void send_smoke_packet(udp::socket& socket, const udp::endpoint& endpoint,
-                       const std::vector<unsigned char>& packet) {
-    socket.send_to(asio::buffer(packet), endpoint);
-}
-
-template <typename Predicate>
-std::vector<unsigned char> receive_smoke_until(udp::socket& socket, Predicate&& predicate,
-                                               std::chrono::milliseconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::array<unsigned char, server_config::RECV_BUF_SIZE> buffer{};
-
-    while (std::chrono::steady_clock::now() < deadline) {
-        std::error_code ec;
-        const auto available = socket.available(ec);
-        if (ec) {
-            throw std::runtime_error("socket available failed: " + ec.message());
-        }
-
-        if (available > 0) {
-            udp::endpoint sender;
-            const auto bytes = socket.receive_from(asio::buffer(buffer), sender, 0, ec);
-            if (ec) {
-                throw std::runtime_error("socket receive failed: " + ec.message());
-            }
-
-            std::vector<unsigned char> packet(buffer.begin(), buffer.begin() + bytes);
-            if (predicate(packet)) {
-                return packet;
-            }
-        } else {
-            std::this_thread::sleep_for(2ms);
-        }
-    }
-
-    throw std::runtime_error("timed out waiting for expected UDP packet");
-}
-
-template <typename Predicate>
-bool receive_smoke_maybe(udp::socket& socket, Predicate&& predicate,
-                         std::chrono::milliseconds timeout,
-                         std::vector<unsigned char>* out = nullptr) {
-    try {
-        auto packet = receive_smoke_until(socket, std::forward<Predicate>(predicate), timeout);
-        if (out != nullptr) {
-            *out = std::move(packet);
-        }
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-JoinAckHdr join_smoke_client(udp::socket& socket, const udp::endpoint& server_endpoint,
-                             const std::string& name, uint32_t capabilities,
-                             const std::string& room = "redundancy-smoke",
-                             const std::string& token = "") {
-    const auto join = make_smoke_join_packet(name, capabilities, room, token);
-    send_smoke_packet(socket, server_endpoint, join);
-    const auto ack_packet = receive_smoke_until(
-        socket,
-        [](const std::vector<unsigned char>& packet) {
-            if (packet.size() < sizeof(CtrlHdr) || packet_magic(packet) != CTRL_MAGIC) {
-                return false;
-            }
-            CtrlHdr ctrl{};
-            std::memcpy(&ctrl, packet.data(), sizeof(ctrl));
-            return ctrl.type == CtrlHdr::Cmd::JOIN_ACK;
-        },
-        1500ms);
-    JoinAckHdr ack{};
-    std::memcpy(&ack, ack_packet.data(), std::min(ack_packet.size(), sizeof(ack)));
-    return ack;
-}
-
-std::string make_security_smoke_token(const std::string& secret,
-                                      const std::string& server_id,
-                                      const std::string& room,
-                                      const std::string& profile) {
-    performer_join_token::Claims claims;
-    claims.expires_at_ms = performer_join_token::now_ms() + 120000;
-    claims.server_id = server_id;
-    claims.room_id = room;
-    claims.profile_id = profile;
-    claims.role = "performer";
-    claims.nonce = performer_join_token::random_nonce();
-    return performer_join_token::create(claims, secret);
-}
-
-int run_redundancy_relay_smoke() {
-    asio::io_context server_io;
-    ServerOptions options;
-    options.port = 0;
-    options.allow_insecure_dev_joins = true;
-    options.server_id = "redundancy-relay-smoke";
-
-    Server server(server_io, options);
-    const udp::endpoint server_endpoint(asio::ip::make_address("127.0.0.1"),
-                                        server.local_port());
-
-    std::thread server_thread([&server_io]() { server_io.run(); });
-    try {
-        asio::io_context client_io;
-        udp::socket rx_new(client_io, udp::endpoint(udp::v4(), 0));
-        udp::socket rx_legacy(client_io, udp::endpoint(udp::v4(), 0));
-        udp::socket tx(client_io, udp::endpoint(udp::v4(), 0));
-
-        join_smoke_client(rx_new, server_endpoint, "rx-new", AUDIO_CAP_REDUNDANCY);
-        join_smoke_client(rx_legacy, server_endpoint, "rx-legacy", 0);
-        join_smoke_client(tx, server_endpoint, "tx", AUDIO_CAP_REDUNDANCY);
-
-        const std::array<unsigned char, 3> previous_payload{1, 2, 3};
-        const std::array<unsigned char, 3> current_payload{4, 5, 6};
-        auto previous = audio_packet::create_audio_packet_v2(
-            AudioCodec::Opus, 0, opus_network_clock::SAMPLE_RATE,
-            opus_network_clock::DEFAULT_FRAME_COUNT, 1, previous_payload.data(),
-            static_cast<uint16_t>(previous_payload.size()));
-        auto current = audio_packet::create_audio_packet_v2(
-            AudioCodec::Opus, 1, opus_network_clock::SAMPLE_RATE,
-            opus_network_clock::DEFAULT_FRAME_COUNT, 1, current_payload.data(),
-            static_cast<uint16_t>(current_payload.size()));
-        auto redundant =
-            audio_packet::create_redundant_audio_packet({current.get(), previous.get()});
-        require_smoke(redundant != nullptr, "redundant packet should build");
-
-        send_smoke_packet(tx, server_endpoint, *redundant);
-
-        auto redundant_forward = receive_smoke_until(
-            rx_new,
-            [](const std::vector<unsigned char>& packet) {
-                return packet.size() >= audio_packet::redundant_header_size() &&
-                       packet_magic(packet) == AUDIO_REDUNDANT_MAGIC;
-            },
-            1500ms);
-        auto legacy_forward = receive_smoke_until(
-            rx_legacy,
-            [](const std::vector<unsigned char>& packet) {
-                return packet.size() >= audio_packet::v2_header_size() &&
-                       packet_magic(packet) == AUDIO_V2_MAGIC;
-            },
-            1500ms);
-
-        require_smoke(redundant_forward.size() == redundant->size(),
-                      "redundant receiver should get full redundant datagram");
-        require_smoke(legacy_forward.size() == current->size(),
-                      "legacy receiver should get current v2 fallback only");
-
-        const uint32_t sender_id = packet_u32_at(legacy_forward, sizeof(MsgHdr));
-        std::array<uint32_t, 2> child_sender_ids{};
-        std::array<uint32_t, 2> child_sequences{};
-        int child_count = 0;
-        const auto* redundant_bytes = redundant_forward.data();
-        audio_packet::for_each_redundant_audio_child(
-            redundant_bytes, redundant_forward.size(),
-            [&](const unsigned char* child, size_t, uint8_t index) {
-                require_smoke(index < child_sender_ids.size(),
-                              "unexpected redundant child index");
-                AudioHdrV2 hdr{};
-                std::memcpy(&hdr, child, audio_packet::v2_header_size());
-                child_sender_ids[index] = hdr.sender_id;
-                child_sequences[index] = hdr.sequence;
-                ++child_count;
-            });
-
-        require_smoke(child_count == 2, "redundant receiver should get two children");
-        require_smoke(child_sender_ids[0] == sender_id && child_sender_ids[1] == sender_id,
-                      "server should stamp sender id into every redundant child");
-        require_smoke(child_sequences[0] == 1 && child_sequences[1] == 0,
-                      "redundant children should preserve current-then-previous order");
-        require_smoke(packet_u32_at(legacy_forward, sizeof(MsgHdr) + sizeof(uint32_t)) == 1,
-                      "legacy fallback should forward current packet");
-
-        server_io.stop();
-        server_thread.join();
-        std::cout << "server redundancy relay smoke passed\n";
-        return 0;
-    } catch (...) {
-        server_io.stop();
-        server_thread.join();
-        throw;
-    }
-}
-
-int run_timestamp_relay_smoke() {
-    asio::io_context server_io;
-    ServerOptions options;
-    options.port = 0;
-    options.allow_insecure_dev_joins = true;
-    options.server_id = "timestamp-relay-smoke";
-
-    Server server(server_io, options);
-    const udp::endpoint server_endpoint(asio::ip::make_address("127.0.0.1"),
-                                        server.local_port());
-
-    std::thread server_thread([&server_io]() { server_io.run(); });
-    try {
-        asio::io_context client_io;
-        udp::socket rx_timestamp(client_io, udp::endpoint(udp::v4(), 0));
-        udp::socket rx_legacy(client_io, udp::endpoint(udp::v4(), 0));
-        udp::socket tx(client_io, udp::endpoint(udp::v4(), 0));
-
-        join_smoke_client(rx_timestamp, server_endpoint, "rx-timestamp",
-                          AUDIO_CAP_REDUNDANCY | AUDIO_CAP_CAPTURE_TIMESTAMP);
-        join_smoke_client(rx_legacy, server_endpoint, "rx-legacy",
-                          AUDIO_CAP_REDUNDANCY);
-        join_smoke_client(tx, server_endpoint, "tx",
-                          AUDIO_CAP_REDUNDANCY | AUDIO_CAP_CAPTURE_TIMESTAMP);
-
-        const std::array<unsigned char, 4> payload{9, 8, 7, 6};
-        auto timestamped = audio_packet::create_audio_packet_v3(
-            AudioCodec::Opus, 11, opus_network_clock::SAMPLE_RATE,
-            opus_network_clock::DEFAULT_FRAME_COUNT, 1, payload.data(),
-            static_cast<uint16_t>(payload.size()), 123456789LL);
-
-        send_smoke_packet(tx, server_endpoint, *timestamped);
-
-        auto timestamp_forward = receive_smoke_until(
-            rx_timestamp,
-            [](const std::vector<unsigned char>& packet) {
-                return packet.size() >= audio_packet::v3_header_size() &&
-                       packet_magic(packet) == AUDIO_V3_MAGIC;
-            },
-            1500ms);
-        auto legacy_forward = receive_smoke_until(
-            rx_legacy,
-            [](const std::vector<unsigned char>& packet) {
-                return packet.size() >= audio_packet::v2_header_size() &&
-                       packet_magic(packet) == AUDIO_V2_MAGIC;
-            },
-            1500ms);
-
-        const auto timestamp_parsed =
-            audio_packet::parse_audio_header(timestamp_forward.data(), timestamp_forward.size());
-        require_smoke(timestamp_parsed.valid, "timestamp receiver should get valid v3");
-        require_smoke(timestamp_parsed.capture_server_time_ns == 123456789LL,
-                      "timestamp receiver should preserve capture timestamp");
-
-        const auto legacy_parsed =
-            audio_packet::parse_audio_header(legacy_forward.data(), legacy_forward.size());
-        require_smoke(legacy_parsed.valid, "legacy receiver should get valid audio");
-        require_smoke(legacy_parsed.magic == AUDIO_V2_MAGIC,
-                      "legacy receiver should get v2 fallback");
-        require_smoke(legacy_parsed.sequence == 11,
-                      "legacy fallback should preserve sequence");
-
-        server_io.stop();
-        server_thread.join();
-        std::cout << "server timestamp relay smoke passed\n";
-        return 0;
-    } catch (...) {
-        server_io.stop();
-        server_thread.join();
-        throw;
-    }
-}
-
-int run_dual_stack_relay_smoke() {
-    asio::io_context server_io;
-    ServerOptions    options;
-    options.port = 0;
-    options.allow_insecure_dev_joins = true;
-    options.server_id = "dual-stack-relay-smoke";
-
-    Server server(server_io, options);
-    if (!server.is_dual_stack_socket()) {
-        std::cout << "server dual-stack relay smoke skipped: IPv6 dual-stack unavailable\n";
-        return 0;
-    }
-
-    const uint16_t server_port = server.local_port();
-    const udp::endpoint server_v4(asio::ip::make_address("127.0.0.1"), server_port);
-    const udp::endpoint server_v6(asio::ip::make_address("::1"), server_port);
-
-    std::thread server_thread([&server_io]() { server_io.run(); });
-    try {
-        asio::io_context client_io;
-        udp::socket      v4_client(client_io, udp::endpoint(udp::v4(), 0));
-        udp::socket      v6_client(client_io);
-        std::error_code  ec;
-        v6_client.open(udp::v6(), ec);
-        if (!ec) {
-            v6_client.bind(udp::endpoint(udp::v6(), 0), ec);
-        }
-        if (ec) {
-            server_io.stop();
-            server_thread.join();
-            std::cout << "server dual-stack relay smoke skipped: IPv6 loopback unavailable\n";
-            return 0;
-        }
-
-        const std::string room = "dual-stack-smoke";
-        const auto        v4_ack =
-            join_smoke_client(v4_client, server_v4, "v4-client", AUDIO_CAP_REDUNDANCY, room);
-        const auto v6_ack =
-            join_smoke_client(v6_client, server_v6, "v6-client", AUDIO_CAP_REDUNDANCY, room);
-        require_smoke(v4_ack.participant_id != 0, "v4 client should join");
-        require_smoke(v6_ack.participant_id != 0, "v6 client should join");
-
-        const std::array<unsigned char, 3> v4_payload{4, 5, 6};
-        auto v4_packet = audio_packet::create_audio_packet_v2(
-            AudioCodec::Opus, 10, opus_network_clock::SAMPLE_RATE,
-            opus_network_clock::DEFAULT_FRAME_COUNT, 1, v4_payload.data(),
-            static_cast<uint16_t>(v4_payload.size()));
-        require_smoke(v4_packet != nullptr, "v4 packet should build");
-        send_smoke_packet(v4_client, server_v4, *v4_packet);
-
-        const auto v6_forward = receive_smoke_until(
-            v6_client,
-            [](const std::vector<unsigned char>& packet) {
-                return packet.size() >= audio_packet::v2_header_size() &&
-                       packet_magic(packet) == AUDIO_V2_MAGIC;
-            },
-            1500ms);
-        const auto v6_parsed =
-            audio_packet::parse_audio_header(v6_forward.data(), v6_forward.size());
-        require_smoke(v6_parsed.valid, "v6 receiver should get valid v4 audio");
-        require_smoke(v6_parsed.sender_id == v4_ack.participant_id,
-                      "v4 sender id should be stamped on v6 forward");
-
-        const std::array<unsigned char, 3> v6_payload{7, 8, 9};
-        auto v6_packet = audio_packet::create_audio_packet_v2(
-            AudioCodec::Opus, 11, opus_network_clock::SAMPLE_RATE,
-            opus_network_clock::DEFAULT_FRAME_COUNT, 1, v6_payload.data(),
-            static_cast<uint16_t>(v6_payload.size()));
-        require_smoke(v6_packet != nullptr, "v6 packet should build");
-        send_smoke_packet(v6_client, server_v6, *v6_packet);
-
-        const auto v4_forward = receive_smoke_until(
-            v4_client,
-            [](const std::vector<unsigned char>& packet) {
-                return packet.size() >= audio_packet::v2_header_size() &&
-                       packet_magic(packet) == AUDIO_V2_MAGIC;
-            },
-            1500ms);
-        const auto v4_parsed =
-            audio_packet::parse_audio_header(v4_forward.data(), v4_forward.size());
-        require_smoke(v4_parsed.valid, "v4 receiver should get valid v6 audio");
-        require_smoke(v4_parsed.sender_id == v6_ack.participant_id,
-                      "v6 sender id should be stamped on v4 forward");
-
-        server_io.stop();
-        server_thread.join();
-        std::cout << "server dual-stack relay smoke passed\n";
-        return 0;
-    } catch (...) {
-        server_io.stop();
-        server_thread.join();
-        throw;
-    }
-}
-
-int run_security_smoke() {
-    asio::io_context server_io;
-    ServerOptions options;
-    options.port = 0;
-    options.server_id = "security-smoke";
-    options.join_secret = "security-smoke-secret";
-
-    Server server(server_io, options);
-    const udp::endpoint server_endpoint(asio::ip::make_address("127.0.0.1"),
-                                        server.local_port());
-
-    std::thread server_thread([&server_io]() { server_io.run(); });
-    try {
-        asio::io_context client_io;
-        udp::socket rx(client_io, udp::endpoint(udp::v4(), 0));
-        udp::socket tx(client_io, udp::endpoint(udp::v4(), 0));
-        udp::socket replay(client_io, udp::endpoint(udp::v4(), 0));
-
-        const std::string room = "security-smoke-room";
-        const std::string rx_token = make_security_smoke_token(
-            options.join_secret, options.server_id, room, "rx-secure");
-        const std::string tx_token = make_security_smoke_token(
-            options.join_secret, options.server_id, room, "tx-secure");
-        const auto rx_key = session_crypto::derive_key_from_join_token_string(rx_token);
-        const auto tx_key = session_crypto::derive_key_from_join_token_string(tx_token);
-        require_smoke(rx_key.has_value(), "receiver key should derive from token");
-        require_smoke(tx_key.has_value(), "sender key should derive from token");
-
-        const auto rx_ack = join_smoke_client(
-            rx, server_endpoint, "rx-secure", AUDIO_SUPPORTED_CAPABILITIES, room, rx_token);
-        const auto tx_ack = join_smoke_client(
-            tx, server_endpoint, "tx-secure", AUDIO_SUPPORTED_CAPABILITIES, room, tx_token);
-        require_smoke((rx_ack.capabilities & AUDIO_CAP_SECURE_AUDIO) != 0,
-                      "receiver should get secure audio capability");
-        require_smoke((tx_ack.capabilities & AUDIO_CAP_SECURE_AUDIO) != 0,
-                      "sender should get secure audio capability");
-
-        const std::array<unsigned char, 4> payload{0x41, 0x42, 0x43, 0x44};
-        auto plaintext_audio = audio_packet::create_audio_packet_v2(
-            AudioCodec::Opus, 1, opus_network_clock::SAMPLE_RATE,
-            opus_network_clock::DEFAULT_FRAME_COUNT, 1, payload.data(),
-            static_cast<uint16_t>(payload.size()));
-        require_smoke(plaintext_audio != nullptr, "plaintext smoke audio should build");
-
-        send_smoke_packet(tx, server_endpoint, *plaintext_audio);
-        const auto is_audio_or_secure = [](const std::vector<unsigned char>& packet) {
-            return packet.size() >= sizeof(MsgHdr) &&
-                   (packet_magic(packet) == AUDIO_V2_MAGIC ||
-                    packet_magic(packet) == AUDIO_V3_MAGIC ||
-                    packet_magic(packet) == AUDIO_REDUNDANT_MAGIC ||
-                    packet_magic(packet) == SECURE_AUDIO_MAGIC);
-        };
-        require_smoke(!receive_smoke_maybe(rx, is_audio_or_secure, 250ms),
-                      "signed session plaintext audio must not be relayed");
-
-        std::vector<unsigned char> secure_audio(
-            SECURE_PACKET_HEADER_BYTES + plaintext_audio->size() + SECURE_PACKET_TAG_BYTES);
-        size_t secure_bytes = 0;
-        require_smoke(session_crypto::seal_audio_packet(
-                          *tx_key, 1, plaintext_audio->data(), plaintext_audio->size(),
-                          secure_audio.data(), secure_audio.size(), secure_bytes),
-                      "sender secure audio should seal");
-        secure_audio.resize(secure_bytes);
-        send_smoke_packet(tx, server_endpoint, secure_audio);
-
-        std::vector<unsigned char> secure_forward;
-        require_smoke(receive_smoke_maybe(rx, is_audio_or_secure, 1500ms, &secure_forward),
-                      "receiver should get secure forwarded audio");
-        require_smoke(packet_magic(secure_forward) == SECURE_AUDIO_MAGIC,
-                      "forwarded audio should be secure");
-
-        std::array<unsigned char, 2048> opened{};
-        uint64_t forward_nonce = 0;
-        size_t opened_bytes = 0;
-        require_smoke(session_crypto::open_audio_packet(
-                          *rx_key, secure_forward.data(), secure_forward.size(),
-                          forward_nonce, opened.data(), opened.size(), opened_bytes),
-                      "receiver should open secure forwarded audio");
-        const auto parsed = audio_packet::parse_audio_header(opened.data(), opened_bytes);
-        require_smoke(parsed.valid && parsed.magic == AUDIO_V2_MAGIC,
-                      "opened forwarded audio should be valid v2");
-        require_smoke(parsed.sender_id == tx_ack.participant_id,
-                      "server should stamp sender id before encryption");
-
-        send_smoke_packet(tx, server_endpoint, secure_audio);
-        require_smoke(!receive_smoke_maybe(rx, is_audio_or_secure, 250ms),
-                      "replayed secure audio nonce must not be relayed");
-
-        const auto replay_join =
-            make_smoke_join_packet("tx-secure", AUDIO_SUPPORTED_CAPABILITIES, room, tx_token);
-        send_smoke_packet(replay, server_endpoint, replay_join);
-        const bool replay_join_acked = receive_smoke_maybe(
-            replay,
-            [](const std::vector<unsigned char>& packet) {
-                if (packet.size() < sizeof(CtrlHdr) || packet_magic(packet) != CTRL_MAGIC) {
-                    return false;
-                }
-                CtrlHdr ctrl{};
-                std::memcpy(&ctrl, packet.data(), sizeof(ctrl));
-                return ctrl.type == CtrlHdr::Cmd::JOIN_ACK;
-            },
-            300ms);
-        require_smoke(!replay_join_acked,
-                      "token nonce replay from another endpoint must not join");
-
-        CtrlHdr leave{};
-        leave.magic = CTRL_MAGIC;
-        leave.type = CtrlHdr::Cmd::LEAVE;
-        std::vector<unsigned char> leave_packet(sizeof(leave));
-        std::memcpy(leave_packet.data(), &leave, sizeof(leave));
-        send_smoke_packet(tx, server_endpoint, leave_packet);
-        require_smoke(receive_smoke_maybe(
-                          rx,
-                          [](const std::vector<unsigned char>& packet) {
-                              if (packet.size() < sizeof(CtrlHdr) ||
-                                  packet_magic(packet) != CTRL_MAGIC) {
-                                  return false;
-                              }
-                              CtrlHdr ctrl{};
-                              std::memcpy(&ctrl, packet.data(), sizeof(ctrl));
-                              return ctrl.type == CtrlHdr::Cmd::PARTICIPANT_LEAVE;
-                          },
-                          1000ms),
-                      "active client leave should be broadcast before token rejoin");
-
-        send_smoke_packet(replay, server_endpoint, replay_join);
-        const bool rejoin_acked = receive_smoke_maybe(
-            replay,
-            [](const std::vector<unsigned char>& packet) {
-                if (packet.size() < sizeof(CtrlHdr) || packet_magic(packet) != CTRL_MAGIC) {
-                    return false;
-                }
-                CtrlHdr ctrl{};
-                std::memcpy(&ctrl, packet.data(), sizeof(ctrl));
-                return ctrl.type == CtrlHdr::Cmd::JOIN_ACK;
-            },
-            1000ms);
-        require_smoke(rejoin_acked,
-                      "same join token should rejoin after original endpoint leaves");
-
-        server_io.stop();
-        server_thread.join();
-        std::cout << "server security smoke passed\n";
-        return 0;
-    } catch (...) {
-        server_io.stop();
-        server_thread.join();
-        throw;
-    }
-}
-
-int run_metrics_export_smoke() {
-    asio::io_context server_io;
-    const auto dir =
-        std::filesystem::temp_directory_path() /
-        ("jam-server-metrics-smoke-" +
-         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-
-    ServerOptions options;
-    options.port = 0;
-    options.server_id = "metrics-smoke";
-    options.allow_insecure_dev_joins = true;
-    options.metrics_jsonl_path = (dir / "metrics.jsonl").string();
-
-    std::filesystem::remove_all(dir);
-    Server server(server_io, options);
-    require_smoke(server.export_metrics_snapshot(), "metrics export should succeed");
-
-    {
-        std::ifstream in(options.metrics_jsonl_path, std::ios::binary);
-        std::string body((std::istreambuf_iterator<char>(in)),
-                         std::istreambuf_iterator<char>());
-        require_smoke(body.find("\"schema\":\"jam_server_metrics_v1\"") != std::string::npos,
-                      "metrics smoke missing schema");
-        require_smoke(body.find("\"server_id\":\"metrics-smoke\"") != std::string::npos,
-                      "metrics smoke missing server id");
-        require_smoke(body.find("\"connected_clients\":0") != std::string::npos,
-                      "metrics smoke missing client count");
-    }
-
-    std::filesystem::remove_all(dir);
-    std::cout << "server metrics export smoke passed\n";
-    return 0;
-}
-
-int run_crash_report_smoke() {
-    const auto dir =
-        std::filesystem::temp_directory_path() /
-        ("jam-server-crash-smoke-" +
-         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-
-    crash_reporter::Options options;
-    options.report_dir = dir;
-    options.process_name = "server";
-    options.platform = runtime_platform_name();
-    options.arch = runtime_arch_name();
-
-    std::filesystem::remove_all(dir);
-    const auto report = crash_reporter::write_report(options, "server crash smoke", nullptr);
-    require_smoke(std::filesystem::exists(report), "crash smoke report missing");
-
-    {
-        std::ifstream in(report, std::ios::binary);
-        std::string body((std::istreambuf_iterator<char>(in)),
-                         std::istreambuf_iterator<char>());
-        require_smoke(body.find("\"schema\":\"jam_crash_report_v1\"") != std::string::npos,
-                      "crash smoke missing schema");
-        require_smoke(body.find("\"process\":\"server\"") != std::string::npos,
-                      "crash smoke missing process");
-        require_smoke(body.find("\"reason\":\"server crash smoke\"") != std::string::npos,
-                      "crash smoke missing reason");
-    }
-
-    std::filesystem::remove_all(dir);
-    std::cout << "server crash report smoke passed\n";
-    return 0;
-}
-
 size_t parse_positive_size_arg(const std::string& value, const char* option_name) {
     try {
         size_t consumed = 0;
@@ -2190,15 +1466,6 @@ ServerOptions parse_server_options(int argc, char** argv) {
     return options;
 }
 
-bool has_arg(int argc, char** argv, const std::string& expected) {
-    for (int i = 1; i < argc; ++i) {
-        if (argv[i] == expected) {
-            return true;
-        }
-    }
-    return false;
-}
-
 int main(int argc, char** argv) {
     try {
         asio::io_context io_context;
@@ -2207,25 +1474,6 @@ int main(int argc, char** argv) {
         auto& log = Logger::instance();
         log.init(true, false, !options.log_file_path.empty(), options.log_file_path,
                  spdlog::level::info, options.log_max_bytes, options.log_max_files);
-
-        if (has_arg(argc, argv, "--redundancy-relay-smoke")) {
-            return run_redundancy_relay_smoke();
-        }
-        if (has_arg(argc, argv, "--timestamp-relay-smoke")) {
-            return run_timestamp_relay_smoke();
-        }
-        if (has_arg(argc, argv, "--dual-stack-relay-smoke")) {
-            return run_dual_stack_relay_smoke();
-        }
-        if (has_arg(argc, argv, "--security-smoke")) {
-            return run_security_smoke();
-        }
-        if (has_arg(argc, argv, "--metrics-export-smoke")) {
-            return run_metrics_export_smoke();
-        }
-        if (has_arg(argc, argv, "--crash-report-smoke")) {
-            return run_crash_report_smoke();
-        }
 
         if (options.crash_reports_enabled) {
             crash_reporter::Options crash_options;
@@ -2238,7 +1486,7 @@ int main(int argc, char** argv) {
         }
 
         Log::info("Starting SFU server on [::]:{} (dual-stack preferred)", options.port);
-        Log::info("Runtime: role=server platform={} arch={}", runtime_platform_name(),
+        Log::info("Runtime: process=server platform={} arch={}", runtime_platform_name(),
                   runtime_arch_name());
         if (!options.log_file_path.empty()) {
             Log::info("Logging to {}", options.log_file_path);

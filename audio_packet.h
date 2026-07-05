@@ -7,18 +7,18 @@
 #include <string>
 #include <utility>
 #include <vector>
+
 #include "opus_network_clock.h"
 #include "protocol.h"
 
-// Audio packet construction utilities (extends packet_builder for client-specific needs)
 namespace audio_packet {
 
-inline constexpr size_t v2_header_size() {
-    return sizeof(AudioHdrV2) - AUDIO_BUF_SIZE;
+inline constexpr size_t header_size() {
+    return sizeof(AudioHdrV3) - AUDIO_BUF_SIZE;
 }
 
 inline constexpr size_t v3_header_size() {
-    return sizeof(AudioHdrV3) - AUDIO_BUF_SIZE;
+    return header_size();
 }
 
 inline constexpr size_t redundant_header_size() {
@@ -48,51 +48,29 @@ inline ParsedAudioHeader parse_audio_header(const unsigned char* data, size_t le
 
     MsgHdr msg{};
     std::memcpy(&msg, data, sizeof(MsgHdr));
-    if (msg.magic == AUDIO_V2_MAGIC) {
-        if (len < v2_header_size()) {
-            return parsed;
-        }
-        AudioHdrV2 hdr{};
-        std::memcpy(&hdr, data, v2_header_size());
-        parsed.valid = true;
-        parsed.magic = hdr.magic;
-        parsed.sender_id = hdr.sender_id;
-        parsed.sequence = hdr.sequence;
-        parsed.sample_rate = hdr.sample_rate;
-        parsed.frame_count = hdr.frame_count;
-        parsed.payload_bytes = hdr.payload_bytes;
-        parsed.channels = hdr.channels;
-        parsed.codec = hdr.codec;
-        parsed.header_size = v2_header_size();
+    if (msg.magic != AUDIO_V3_MAGIC || len < header_size()) {
         return parsed;
     }
 
-    if (msg.magic == AUDIO_V3_MAGIC) {
-        if (len < v3_header_size()) {
-            return parsed;
-        }
-        AudioHdrV3 hdr{};
-        std::memcpy(&hdr, data, v3_header_size());
-        parsed.valid = true;
-        parsed.magic = hdr.magic;
-        parsed.sender_id = hdr.sender_id;
-        parsed.sequence = hdr.sequence;
-        parsed.sample_rate = hdr.sample_rate;
-        parsed.frame_count = hdr.frame_count;
-        parsed.payload_bytes = hdr.payload_bytes;
-        parsed.channels = hdr.channels;
-        parsed.codec = hdr.codec;
-        parsed.capture_timestamp_valid = hdr.capture_server_time_ns > 0;
-        parsed.capture_server_time_ns = hdr.capture_server_time_ns;
-        parsed.header_size = v3_header_size();
-        return parsed;
-    }
-
+    AudioHdrV3 hdr{};
+    std::memcpy(&hdr, data, header_size());
+    parsed.valid = true;
+    parsed.magic = hdr.magic;
+    parsed.sender_id = hdr.sender_id;
+    parsed.sequence = hdr.sequence;
+    parsed.sample_rate = hdr.sample_rate;
+    parsed.frame_count = hdr.frame_count;
+    parsed.payload_bytes = hdr.payload_bytes;
+    parsed.channels = hdr.channels;
+    parsed.codec = hdr.codec;
+    parsed.capture_timestamp_valid = hdr.capture_server_time_ns > 0;
+    parsed.capture_server_time_ns = hdr.capture_server_time_ns;
+    parsed.header_size = header_size();
     return parsed;
 }
 
-inline bool validate_audio_packet_v2_shape(const AudioHdrV2& hdr,
-                                           std::string* reason = nullptr) {
+inline bool validate_audio_packet_shape(const ParsedAudioHeader& hdr,
+                                        std::string* reason = nullptr) {
     if (hdr.sample_rate != opus_network_clock::SAMPLE_RATE || hdr.channels != 1 ||
         hdr.frame_count == 0) {
         if (reason != nullptr) {
@@ -135,20 +113,6 @@ inline bool validate_audio_packet_v2_shape(const AudioHdrV2& hdr,
     return false;
 }
 
-inline bool validate_audio_packet_shape(const ParsedAudioHeader& hdr,
-                                        std::string* reason = nullptr) {
-    AudioHdrV2 v2{};
-    v2.magic = AUDIO_V2_MAGIC;
-    v2.sender_id = hdr.sender_id;
-    v2.sequence = hdr.sequence;
-    v2.sample_rate = hdr.sample_rate;
-    v2.frame_count = hdr.frame_count;
-    v2.payload_bytes = hdr.payload_bytes;
-    v2.channels = hdr.channels;
-    v2.codec = hdr.codec;
-    return validate_audio_packet_v2_shape(v2, reason);
-}
-
 inline bool validate_audio_packet_bytes(const unsigned char* data, size_t len,
                                         std::string* reason = nullptr) {
     const auto hdr = parse_audio_header(data, len);
@@ -180,46 +144,6 @@ inline const unsigned char* audio_payload(const unsigned char* data, size_t len)
     return hdr.valid ? data + hdr.header_size : nullptr;
 }
 
-inline bool validate_audio_packet_v2_bytes(const unsigned char* data, size_t len,
-                                           std::string* reason = nullptr) {
-    if (data == nullptr) {
-        if (reason != nullptr) {
-            *reason = "null packet";
-        }
-        return false;
-    }
-    if (len < v2_header_size()) {
-        if (reason != nullptr) {
-            *reason = "short header";
-        }
-        return false;
-    }
-
-    AudioHdrV2 hdr{};
-    std::memcpy(&hdr, data, v2_header_size());
-    if (hdr.magic != AUDIO_V2_MAGIC) {
-        if (reason != nullptr) {
-            *reason = "wrong magic";
-        }
-        return false;
-    }
-    if (hdr.payload_bytes > AUDIO_BUF_SIZE) {
-        if (reason != nullptr) {
-            *reason = "payload too large";
-        }
-        return false;
-    }
-
-    const size_t expected = v2_header_size() + hdr.payload_bytes;
-    if (len != expected) {
-        if (reason != nullptr) {
-            *reason = "length mismatch";
-        }
-        return false;
-    }
-    return validate_audio_packet_v2_shape(hdr, reason);
-}
-
 inline bool next_redundant_child(const unsigned char* data, size_t len, size_t& offset,
                                  const unsigned char*& child, size_t& child_len,
                                  std::string* reason = nullptr) {
@@ -233,7 +157,7 @@ inline bool next_redundant_child(const unsigned char* data, size_t len, size_t& 
     child = data + offset;
     MsgHdr msg{};
     std::memcpy(&msg, child, sizeof(MsgHdr));
-    if (msg.magic != AUDIO_V2_MAGIC && msg.magic != AUDIO_V3_MAGIC) {
+    if (msg.magic != AUDIO_V3_MAGIC) {
         if (reason != nullptr) {
             *reason = "redundant child wrong magic";
         }
@@ -261,7 +185,7 @@ inline bool next_redundant_child(const unsigned char* data, size_t len, size_t& 
         }
         return false;
     }
-    if (!validate_audio_packet_bytes(child, child_len, reason)) {
+    if (!validate_audio_packet_shape(child_hdr, reason)) {
         return false;
     }
 
@@ -273,7 +197,7 @@ inline bool validate_redundant_audio_packet_bytes(const unsigned char* data, siz
                                                   std::string* reason = nullptr) {
     if (data == nullptr) {
         if (reason != nullptr) {
-            *reason = "null redundant packet";
+            *reason = "null packet";
         }
         return false;
     }
@@ -294,7 +218,7 @@ inline bool validate_redundant_audio_packet_bytes(const unsigned char* data, siz
     }
     if (hdr.packet_count == 0 || hdr.packet_count > MAX_AUDIO_REDUNDANT_PACKETS) {
         if (reason != nullptr) {
-            *reason = "invalid redundant packet count";
+            *reason = "invalid redundant child count";
         }
         return false;
     }
@@ -307,10 +231,9 @@ inline bool validate_redundant_audio_packet_bytes(const unsigned char* data, siz
             return false;
         }
     }
-
     if (offset != len) {
         if (reason != nullptr) {
-            *reason = "redundant trailing bytes";
+            *reason = "redundant length mismatch";
         }
         return false;
     }
@@ -348,6 +271,7 @@ inline bool for_each_redundant_audio_child_reverse(const unsigned char* data, si
 
     AudioRedundantHdr hdr{};
     std::memcpy(&hdr, data, redundant_header_size());
+
     std::array<std::pair<const unsigned char*, size_t>, MAX_AUDIO_REDUNDANT_PACKETS>
         children{};
     size_t offset = redundant_header_size();
@@ -394,36 +318,6 @@ struct AudioPacketView {
     size_t size = 0;
 };
 
-inline bool write_audio_packet_v2(AudioCodec codec, uint32_t sequence, uint32_t sample_rate,
-                                  uint16_t frame_count, uint8_t channels,
-                                  const unsigned char* payload, uint16_t payload_bytes,
-                                  unsigned char* out, size_t out_capacity,
-                                  size_t& bytes_written) {
-    bytes_written = 0;
-    const size_t required = v2_header_size() + payload_bytes;
-    if (out == nullptr || out_capacity < required ||
-        (payload_bytes > 0 && payload == nullptr)) {
-        return false;
-    }
-
-    AudioHdrV2 hdr{};
-    hdr.magic = AUDIO_V2_MAGIC;
-    hdr.sender_id = 0;
-    hdr.sequence = sequence;
-    hdr.sample_rate = sample_rate;
-    hdr.frame_count = frame_count;
-    hdr.payload_bytes = payload_bytes;
-    hdr.channels = channels;
-    hdr.codec = codec;
-
-    std::memcpy(out, &hdr, v2_header_size());
-    if (payload_bytes > 0) {
-        std::memcpy(out + v2_header_size(), payload, payload_bytes);
-    }
-    bytes_written = required;
-    return true;
-}
-
 inline bool write_audio_packet_v3(AudioCodec codec, uint32_t sequence, uint32_t sample_rate,
                                   uint16_t frame_count, uint8_t channels,
                                   const unsigned char* payload, uint16_t payload_bytes,
@@ -431,7 +325,7 @@ inline bool write_audio_packet_v3(AudioCodec codec, uint32_t sequence, uint32_t 
                                   unsigned char* out, size_t out_capacity,
                                   size_t& bytes_written) {
     bytes_written = 0;
-    const size_t required = v3_header_size() + payload_bytes;
+    const size_t required = header_size() + payload_bytes;
     if (out == nullptr || out_capacity < required ||
         (payload_bytes > 0 && payload == nullptr)) {
         return false;
@@ -448,9 +342,9 @@ inline bool write_audio_packet_v3(AudioCodec codec, uint32_t sequence, uint32_t 
     hdr.codec = codec;
     hdr.capture_server_time_ns = capture_server_time_ns;
 
-    std::memcpy(out, &hdr, v3_header_size());
+    std::memcpy(out, &hdr, header_size());
     if (payload_bytes > 0) {
-        std::memcpy(out + v3_header_size(), payload, payload_bytes);
+        std::memcpy(out + header_size(), payload, payload_bytes);
     }
     bytes_written = required;
     return true;
@@ -541,58 +435,12 @@ inline std::shared_ptr<std::vector<unsigned char>> create_redundant_audio_packet
     return redundant;
 }
 
-// Create audio packet with encoded data
-// Returns shared_ptr for async send safety
-inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet(
-    const std::vector<unsigned char>& encoded_data) {
-    uint16_t encoded_bytes = static_cast<uint16_t>(encoded_data.size());
-
-    auto packet = std::make_shared<std::vector<unsigned char>>();
-    packet->reserve(sizeof(MsgHdr) + sizeof(uint32_t) + sizeof(uint16_t) + encoded_bytes);
-
-    // Write magic
-    uint32_t magic = AUDIO_MAGIC;
-    packet->insert(packet->end(), reinterpret_cast<const unsigned char*>(&magic),
-                   reinterpret_cast<const unsigned char*>(&magic) + sizeof(uint32_t));
-
-    // Write sender_id (0, server will overwrite)
-    uint32_t sender_id = 0;
-    packet->insert(packet->end(), reinterpret_cast<const unsigned char*>(&sender_id),
-                   reinterpret_cast<const unsigned char*>(&sender_id) + sizeof(uint32_t));
-
-    // Write encoded_bytes
-    packet->insert(packet->end(), reinterpret_cast<const unsigned char*>(&encoded_bytes),
-                   reinterpret_cast<const unsigned char*>(&encoded_bytes) + sizeof(uint16_t));
-
-    // Write encoded audio data (if any)
-    if (encoded_bytes > 0) {
-        packet->insert(packet->end(), encoded_data.begin(), encoded_data.end());
-    }
-
-    return packet;
-}
-
-inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v2(
-    AudioCodec codec, uint32_t sequence, uint32_t sample_rate, uint16_t frame_count,
-    uint8_t channels, const unsigned char* payload, uint16_t payload_bytes) {
-    auto packet = std::make_shared<std::vector<unsigned char>>();
-    packet->resize(v2_header_size() + payload_bytes);
-    size_t bytes_written = 0;
-    if (!write_audio_packet_v2(codec, sequence, sample_rate, frame_count, channels,
-                               payload, payload_bytes, packet->data(), packet->size(),
-                               bytes_written)) {
-        return nullptr;
-    }
-    packet->resize(bytes_written);
-    return packet;
-}
-
 inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v3(
     AudioCodec codec, uint32_t sequence, uint32_t sample_rate, uint16_t frame_count,
     uint8_t channels, const unsigned char* payload, uint16_t payload_bytes,
     int64_t capture_server_time_ns) {
     auto packet = std::make_shared<std::vector<unsigned char>>();
-    packet->resize(v3_header_size() + payload_bytes);
+    packet->resize(header_size() + payload_bytes);
     size_t bytes_written = 0;
     if (!write_audio_packet_v3(codec, sequence, sample_rate, frame_count, channels,
                                payload, payload_bytes, capture_server_time_ns,
@@ -600,25 +448,6 @@ inline std::shared_ptr<std::vector<unsigned char>> create_audio_packet_v3(
         return nullptr;
     }
     packet->resize(bytes_written);
-    return packet;
-}
-
-inline std::shared_ptr<std::vector<unsigned char>> strip_audio_v3_timestamp(
-    const unsigned char* data, size_t len) {
-    const auto parsed = parse_audio_header(data, len);
-    if (!parsed.valid || parsed.magic != AUDIO_V3_MAGIC ||
-        len != parsed.header_size + parsed.payload_bytes) {
-        return nullptr;
-    }
-
-    const unsigned char* payload = audio_payload(data, len);
-    auto packet = create_audio_packet_v2(parsed.codec, parsed.sequence, parsed.sample_rate,
-                                         parsed.frame_count, parsed.channels, payload,
-                                         parsed.payload_bytes);
-    AudioHdrV2 hdr{};
-    std::memcpy(&hdr, packet->data(), v2_header_size());
-    hdr.sender_id = parsed.sender_id;
-    std::memcpy(packet->data(), &hdr, v2_header_size());
     return packet;
 }
 

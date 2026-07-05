@@ -89,6 +89,7 @@ target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
 add_executable(client
     ${JAM_CLIENT_DIR}/client.cpp
     ${JAM_CLIENT_DIR}/client_audio_devices.cpp
+    ${JAM_CLIENT_DIR}/client_join_session.cpp
     ${JAM_CLIENT_DIR}/client_startup.cpp
     ${JAM_CLIENT_DIR}/gui.cpp
     ${JAM_CLIENT_DIR}/audio_stream.cpp

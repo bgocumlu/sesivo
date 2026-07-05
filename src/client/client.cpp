@@ -49,9 +49,9 @@
 #include "audio_packet.h"
 #include "audio_stream.h"
 #include "client_audio_devices.h"
+#include "client_join_session.h"
 #include "client_startup.h"
 #include "gui.h"
-#include "join_reliability.h"
 #include "jitter_policy.h"
 #include "logging_setup.h"
 #include "message_validator.h"
@@ -96,7 +96,7 @@ public:
            AudioDevicePreferences audio_preferences = {})
         : io_context_(io_context),
           socket_(io_context),
-          performer_join_options_(std::move(performer_join_options)),
+          join_session_(std::move(performer_join_options), 1s),
           audio_preferences_path_(std::move(audio_preferences_path)),
           selected_audio_api_filter_(audio_preferences.audio_api.empty()
                                          ? "All"
@@ -192,7 +192,7 @@ public:
             qos = socket_qos_.ensure_flow(socket_, resolved_endpoint);
         }
         log_udp_qos_result(resolved_endpoint, qos);
-        join_state_.reset();
+        join_session_.reset();
         reset_session_security();
         reset_server_clock_and_ping_state();
         receive_generation_.fetch_add(1, std::memory_order_acq_rel);
@@ -207,23 +207,15 @@ public:
     }
 
     void send_join() {
-        JoinHdr join{};
-        join.magic = CTRL_MAGIC;
-        join.type  = CtrlHdr::Cmd::JOIN;
-        write_fixed(join.room_id, performer_join_options_.room_id);
-        write_fixed(join.room_handle, performer_join_options_.room_handle);
-        write_fixed(join.profile_id, performer_join_options_.user_id);
-        write_fixed(join.display_name, performer_join_options_.display_name);
-        write_fixed(join.join_token, performer_join_options_.join_token);
-        join.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
+        const JoinHdr join = join_session_.make_join_header();
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinHdr));
         std::memcpy(buf->data(), &join, sizeof(JoinHdr));
         update_session_key_from_join_token();
-        join_state_.mark_join_sent(std::chrono::steady_clock::now());
+        join_session_.mark_join_sent(std::chrono::steady_clock::now());
         send(buf->data(), buf->size(), buf);
-        spdlog::info("Sent JOIN for room '{}' user '{}' token {}", performer_join_options_.room_id,
-                  performer_join_options_.user_id,
-                  performer_join_options_.join_token.empty() ? "missing" : "present");
+        spdlog::info("Sent JOIN for room '{}' user '{}' token {}", join_session_.room_id(),
+                  join_session_.user_id(),
+                  join_session_.has_join_token() ? "present" : "missing");
     }
 
     void reset_session_security() {
@@ -233,14 +225,14 @@ public:
     }
 
     void update_session_key_from_join_token() {
-        if (performer_join_options_.join_token.empty()) {
+        if (!join_session_.has_join_token()) {
             reset_session_security();
             return;
         }
 
         const auto derived =
             session_crypto::derive_key_from_join_token_string(
-                performer_join_options_.join_token);
+                join_session_.join_token());
         if (!derived.has_value()) {
             reset_session_security();
             spdlog::warn("Join token is not usable for secure audio key derivation");
@@ -370,7 +362,7 @@ public:
     }
 
     std::string get_room_id() const {
-        return performer_join_options_.room_id;
+        return join_session_.room_id();
     }
 
     unsigned short get_local_port() const {
@@ -1567,7 +1559,7 @@ public:
 private:
     bool should_secure_audio_packet(const unsigned char* data, std::size_t len) const {
         if (!session_key_.has_value() ||
-            !join_state_.server_supports(AUDIO_CAP_SECURE_AUDIO) ||
+            !join_session_.server_supports(AUDIO_CAP_SECURE_AUDIO) ||
             data == nullptr || len < sizeof(MsgHdr)) {
             return false;
         }
@@ -1698,7 +1690,7 @@ private:
     }
 
     void request_udp_path_rebind(std::string reason) {
-        if (!join_state_.is_join_confirmed()) {
+        if (!join_session_.is_join_confirmed()) {
             return;
         }
 
@@ -1773,7 +1765,7 @@ private:
         }
         log_udp_qos_result(target, qos);
 
-        join_state_.reset();
+        join_session_.reset();
         reset_server_clock_and_ping_state();
         audio_path_interval_received_.store(0, std::memory_order_relaxed);
         audio_path_interval_sequence_gaps_.store(0, std::memory_order_relaxed);
@@ -1789,7 +1781,7 @@ private:
             udp_path_rebind_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         spdlog::warn(
             "UDP path rebind #{} after '{}': local port {} -> {}; rejoining room '{}'",
-            rebind_count, reason, old_port, new_port, performer_join_options_.room_id);
+            rebind_count, reason, old_port, new_port, join_session_.room_id());
 
         do_receive();
         send_join();
@@ -1865,13 +1857,6 @@ private:
             reason, len, hdr.magic, parsed.header_size, payload_bytes, static_cast<int>(codec),
             sequence);
         return false;
-    }
-
-    template <size_t N>
-    static void write_fixed(Bytes<N>& target, const std::string& value) {
-        const size_t copy_bytes = std::min(value.size(), target.size() - 1);
-        std::copy_n(value.data(), copy_bytes, target.data());
-        target[copy_bytes] = '\0';
     }
 
     template <size_t N>
@@ -2129,7 +2114,7 @@ private:
 
             OpusSendFrame opus_frame;
             if (opus_send_queue_.try_dequeue(opus_frame)) {
-                if (!join_state_.can_send_audio()) {
+                if (!join_session_.can_send_audio()) {
                     continue;
                 }
                 observe_opus_send_queue_age(opus_frame.capture_time);
@@ -2182,7 +2167,7 @@ private:
 
     TxPacketBuffer* maybe_wrap_opus_packet_with_redundancy(
         const TxPacketBuffer& packet, TxPacketBuffer& redundant_out) {
-        if (!join_state_.server_supports(AUDIO_CAP_REDUNDANCY)) {
+        if (!join_session_.server_supports(AUDIO_CAP_REDUNDANCY)) {
             recent_opus_audio_packet_count_ = 0;
             return nullptr;
         }
@@ -2969,7 +2954,7 @@ private:
     }
 
     void alive_timer_callback() {
-        if (!join_state_.is_join_confirmed()) {
+        if (!join_session_.is_join_confirmed()) {
             send_join();
             log_audio_diagnostics();
             return;
@@ -2989,7 +2974,7 @@ private:
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        if (join_state_.should_send_join(now)) {
+        if (join_session_.should_send_join(now)) {
             send_join();
         }
     }
@@ -3303,14 +3288,14 @@ private:
                 break;
             }
             case CtrlHdr::Cmd::JOIN_ACK: {
-                const bool was_confirmed = join_state_.is_join_confirmed();
+                const bool was_confirmed = join_session_.is_join_confirmed();
                 uint32_t server_capabilities = 0;
                 if (bytes >= sizeof(JoinAckHdr)) {
                     JoinAckHdr ack{};
                     std::memcpy(&ack, recv_data, sizeof(JoinAckHdr));
                     server_capabilities = ack.capabilities;
                 }
-                join_state_.mark_join_ack(chdr.participant_id, server_capabilities);
+                join_session_.mark_join_ack(chdr.participant_id, server_capabilities);
                 if (!was_confirmed) {
                     reset_ping_path_feedback_to_current_sequence();
                     server_audio_replay_window_.reset();
@@ -3320,7 +3305,7 @@ private:
                 break;
             }
             case CtrlHdr::Cmd::JOIN_REQUIRED: {
-                join_state_.mark_join_required();
+                join_session_.mark_join_required();
                 OpusSendFrame discarded_opus;
                 while (opus_send_queue_.try_dequeue(discarded_opus)) {
                 }
@@ -3430,7 +3415,7 @@ private:
     }
 
     void observe_ping_path_timeout(uint32_t sent_sequence) {
-        if (!join_state_.is_join_confirmed()) {
+        if (!join_session_.is_join_confirmed()) {
             return;
         }
 
@@ -4425,7 +4410,7 @@ private:
 
         // Encode and send own audio (always send to maintain timing, even if silence)
         // Mix WAV with microphone input before encoding
-        if (client->audio_.is_stream_active() && client->join_state_.can_send_audio()) {
+        if (client->audio_.is_stream_active() && client->join_session_.can_send_audio()) {
             if (!client->audio_encoder_.is_initialized()) {
                 return 0;
             }
@@ -4468,10 +4453,9 @@ private:
     mutable std::mutex socket_mutex_;
     mutable std::mutex server_endpoint_mutex_;
     udp::endpoint      server_endpoint_;
-    PerformerJoinOptions performer_join_options_;
+    ClientJoinSession join_session_;
     std::filesystem::path audio_preferences_path_;
     std::string           selected_audio_api_filter_ = "All";
-    join_reliability::State join_state_{1s};
     std::optional<session_crypto::SessionKey> session_key_;
     session_crypto::ReplayWindow              server_audio_replay_window_;
     std::atomic<uint64_t>                     secure_audio_send_nonce_{1};

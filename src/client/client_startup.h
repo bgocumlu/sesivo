@@ -1,5 +1,6 @@
 #pragma once
 
+#include "client_join_session.h"
 #include "opus_network_clock.h"
 #include "protocol.h"
 
@@ -7,14 +8,6 @@
 #include <filesystem>
 #include <optional>
 #include <string>
-
-struct PerformerJoinOptions {
-    std::string room_id;
-    std::string room_handle;
-    std::string user_id;
-    std::string display_name;
-    std::string join_token;
-};
 
 struct ClientStartupOptions {
     std::string server_address = "127.0.0.1";

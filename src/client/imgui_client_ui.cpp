@@ -1,3 +1,20 @@
+#include "imgui_client_ui.h"
+
+#include "client_app_facade.h"
+#include "gui.h"
+#include "opus_defines.h"
+#include "opus_network_clock.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 // =============================================================================
 // Zynlab-Style Jam Client UI
 // =============================================================================

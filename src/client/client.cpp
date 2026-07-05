@@ -41,7 +41,6 @@
 #include <asio/ip/udp.hpp>
 #include <asio/socket_base.hpp>
 #include <concurrentqueue.h>
-#include <imgui.h>
 #include <opus.h>
 #include <spdlog/spdlog.h>
 
@@ -56,6 +55,7 @@
 #include "client_metronome.h"
 #include "client_startup.h"
 #include "gui.h"
+#include "imgui_client_ui.h"
 #include "jitter_policy.h"
 #include "logging_setup.h"
 #include "message_validator.h"
@@ -4578,8 +4578,6 @@ public:
 private:
     Client& client_;
 };
-
-#include "imgui_client_ui.inl"
 
 static bool apply_startup_latency_profile(Client& client,
                                           const ClientStartupOptions& startup_options) {

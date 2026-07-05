@@ -38,9 +38,15 @@ void JuceStatusBarComponent::refresh(
                   juce::String(static_cast<int>(startup_options.server_port))
             : juce::String(client.get_server_address()) + ":" +
                   juce::String(static_cast<int>(connected_port));
+    juce::String effective_connection_status = connection_status;
+    if (connected_port != 0 && client.is_join_confirmed()) {
+        effective_connection_status = "Joined";
+    } else if (connected_port != 0 && connection_status == "Join sent") {
+        effective_connection_status = "Waiting for join ack";
+    }
 
     status_label_.setText(
-        server_text + " | " + connection_status + " | Room " +
+        server_text + " | " + effective_connection_status + " | Room " +
             juce::String(client.get_room_id()) + " | RTT " +
             juce::String(client.get_rtt_ms(), 1) + " ms | Users " +
             juce::String(static_cast<int>(participants.size())) + " | RX " +

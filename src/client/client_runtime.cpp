@@ -12,6 +12,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -113,6 +114,26 @@ public:
 
     // Start connection to server (or switch to new server)
     void start_connection(const std::string& server_address, uint16_t server_port) {
+        if (io_context_.get_executor().running_in_this_thread()) {
+            start_connection_on_io_context(server_address, server_port);
+            return;
+        }
+
+        auto started = std::make_shared<std::promise<void>>();
+        auto future = started->get_future();
+        asio::post(io_context_, [this, server_address, server_port, started]() {
+            try {
+                start_connection_on_io_context(server_address, server_port);
+                started->set_value();
+            } catch (...) {
+                started->set_exception(std::current_exception());
+            }
+        });
+        future.get();
+    }
+
+    void start_connection_on_io_context(const std::string& server_address,
+                                        uint16_t server_port) {
         spdlog::info("Connecting to {}:{}...", server_address, server_port);
         receiving_enabled_.store(false, std::memory_order_release);
         outbound_enabled_.store(false, std::memory_order_release);
@@ -316,6 +337,10 @@ public:
 
     std::string get_room_id() const {
         return join_session_.room_id();
+    }
+
+    bool is_join_confirmed() const {
+        return join_session_.is_join_confirmed();
     }
 
     unsigned short get_local_port() const {
@@ -4139,6 +4164,10 @@ public:
 
     void start_connection(const std::string& server_address, uint16_t server_port) override {
         client_.start_connection(server_address, server_port);
+    }
+
+    bool is_join_confirmed() const override {
+        return client_.is_join_confirmed();
     }
 
     std::string get_server_address() const override {

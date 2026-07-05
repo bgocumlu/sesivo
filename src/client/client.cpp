@@ -51,6 +51,8 @@
 #include "client_audio_devices.h"
 #include "client_audio_state.h"
 #include "client_join_session.h"
+#include "client_media_state.h"
+#include "client_metronome.h"
 #include "client_startup.h"
 #include "gui.h"
 #include "jitter_policy.h"
@@ -65,9 +67,7 @@
 #include "participant_manager.h"
 #include "periodic_timer.h"
 #include "protocol.h"
-#include "recording_writer.h"
 #include "session_crypto.h"
-#include "wav_file_playback.h"
 #include "udp_port.h"
 #include "udp_socket_config.h"
 
@@ -983,26 +983,11 @@ public:
         return info;
     }
 
-    struct MetronomeState {
-        float    bpm;
-        bool     running;
-        uint32_t beat_number;
-        uint64_t sync_sent;
-        uint64_t sync_received;
-        bool     clock_ready;
-        double   clock_offset_ms;
-    };
+    using MetronomeState = ClientMetronomeState;
 
     MetronomeState get_metronome_state() const {
-        return MetronomeState{
-            static_cast<float>(metronome_bpm_milli_.load(std::memory_order_acquire)) / 1000.0F,
-            metronome_running_.load(std::memory_order_acquire),
-            metronome_beat_number_.load(std::memory_order_acquire),
-            metronome_sync_sent_.load(std::memory_order_relaxed),
-            metronome_sync_received_.load(std::memory_order_relaxed),
-            server_clock_ready_.load(std::memory_order_acquire),
-            static_cast<double>(server_clock_offset_ns_.load(std::memory_order_relaxed)) / 1e6,
-        };
+        return metronome_.state(server_clock_ready_.load(std::memory_order_acquire),
+                                server_clock_offset_ns_.load(std::memory_order_relaxed));
     }
 
     void set_metronome_bpm(float bpm, bool send_sync = true) {
@@ -1011,7 +996,7 @@ public:
         if (send_sync) {
             commit_metronome_bpm_milli(bpm_milli);
         } else {
-            metronome_bpm_milli_.store(bpm_milli, std::memory_order_release);
+            metronome_.set_bpm_milli_local(bpm_milli);
         }
     }
 
@@ -1022,70 +1007,31 @@ public:
     }
 
     void start_metronome() {
-        send_metronome_sync(metronome_bpm_milli_.load(std::memory_order_acquire), true, 0);
+        send_metronome_sync(metronome_.bpm_milli(), true, 0);
     }
 
     void stop_metronome() {
-        send_metronome_sync(metronome_bpm_milli_.load(std::memory_order_acquire), false,
-                            metronome_beat_number_.load(std::memory_order_acquire));
+        send_metronome_sync(metronome_.bpm_milli(), false, metronome_.beat_number());
     }
 
     void tap_metronome_tempo() {
-        const auto now = std::chrono::steady_clock::now();
-        if (tap_count_ > 0 && now - tap_times_[(tap_index_ + tap_times_.size() - 1) %
-                                               tap_times_.size()] > 2s) {
-            tap_count_ = 0;
-            tap_index_ = 0;
+        const auto bpm_milli = metronome_.tap_tempo_bpm_milli(std::chrono::steady_clock::now());
+        if (bpm_milli.has_value()) {
+            commit_metronome_bpm_milli(*bpm_milli);
         }
-
-        tap_times_[tap_index_] = now;
-        tap_index_ = (tap_index_ + 1) % tap_times_.size();
-        tap_count_ = std::min(tap_count_ + 1, tap_times_.size());
-
-        if (tap_count_ < 3) {
-            return;
-        }
-
-        double total_interval_ms = 0.0;
-        size_t interval_count = 0;
-        for (size_t i = 1; i < tap_count_; ++i) {
-            const size_t newer = (tap_index_ + tap_times_.size() - i) % tap_times_.size();
-            const size_t older = (tap_index_ + tap_times_.size() - i - 1) % tap_times_.size();
-            const auto interval = tap_times_[newer] - tap_times_[older];
-            total_interval_ms +=
-                std::chrono::duration<double, std::milli>(interval).count();
-            ++interval_count;
-        }
-
-        if (interval_count == 0 || total_interval_ms <= 0.0) {
-            return;
-        }
-
-        const double avg_interval_ms = total_interval_ms / static_cast<double>(interval_count);
-        commit_metronome_bpm(static_cast<float>(60000.0 / avg_interval_ms));
     }
 
-    struct RecordingState {
-        bool        active;
-        std::string folder;
-        size_t      queued_blocks;
-        uint64_t    dropped_blocks;
-    };
+    using RecordingState = ClientRecordingState;
 
     RecordingState get_recording_state() const {
-        return RecordingState{
-            recording_writer_.is_active(),
-            recording_writer_.folder(),
-            recording_writer_.queued_blocks(),
-            recording_writer_.dropped_blocks(),
-        };
+        return media_state_.recording_state();
     }
 
     bool start_recording() {
-        const bool started =
-            recording_writer_.start(static_cast<uint32_t>(current_audio_sample_rate()));
+        const bool started = media_state_.start_recording(
+            static_cast<uint32_t>(current_audio_sample_rate()));
         if (started) {
-            spdlog::info("Recording started: {}", recording_writer_.folder());
+            spdlog::info("Recording started: {}", media_state_.recording_state().folder);
         } else {
             spdlog::error("Recording failed to start");
         }
@@ -1093,69 +1039,50 @@ public:
     }
 
     void stop_recording() {
-        const bool was_active = recording_writer_.is_active();
-        const std::string folder = recording_writer_.folder();
-        recording_writer_.stop();
-        if (was_active && !folder.empty()) {
-            spdlog::info("Recording stopped: {}", folder);
+        const auto state = media_state_.recording_state();
+        media_state_.stop_recording();
+        if (state.active && !state.folder.empty()) {
+            spdlog::info("Recording stopped: {}", state.folder);
         }
     }
 
     // WAV file playback methods
     bool load_wav_file(const std::string& path) {
-        return wav_playback_.load_file(path);
+        return media_state_.load_wav_file(path);
     }
 
     void wav_play() {
-        wav_playback_.play();
+        media_state_.wav_play();
     }
 
     void wav_pause() {
-        wav_playback_.pause();
+        media_state_.wav_pause();
     }
 
     void wav_seek(int64_t frame_position) {
-        wav_playback_.seek(frame_position);
+        media_state_.wav_seek(frame_position);
     }
 
-    struct WavState {
-        bool    is_loaded;
-        bool    is_playing;
-        int64_t position;
-        int64_t total_frames;
-        int     sample_rate;
-        int     channels;
-        float   gain;
-        bool    muted_local;  // Muted locally (still sends over network)
-    };
+    using WavState = ClientWavState;
 
     void set_wav_gain(float gain) {
-        wav_gain_.store(std::max(0.0F, std::min(2.0F, gain)), std::memory_order_release);
+        media_state_.set_wav_gain(gain);
     }
 
     float get_wav_gain() const {
-        return wav_gain_.load(std::memory_order_acquire);
+        return media_state_.wav_gain();
     }
 
     void set_wav_muted_local(bool muted) {
-        wav_muted_local_.store(muted, std::memory_order_release);
+        media_state_.set_wav_muted_local(muted);
     }
 
     bool get_wav_muted_local() const {
-        return wav_muted_local_.load(std::memory_order_acquire);
+        return media_state_.wav_muted_local();
     }
 
     WavState get_wav_state() const {
-        WavState state{};
-        state.is_loaded    = wav_playback_.is_loaded();
-        state.is_playing   = wav_playback_.is_playing();
-        state.position     = wav_playback_.get_position();
-        state.total_frames = wav_playback_.get_total_frames();
-        state.sample_rate  = wav_playback_.get_sample_rate();
-        state.channels     = wav_playback_.get_channels();
-        state.gain         = wav_gain_.load(std::memory_order_acquire);
-        state.muted_local  = wav_muted_local_.load(std::memory_order_acquire);
-        return state;
+        return media_state_.wav_state();
     }
 
     // Device selection methods (removed - use AudioStream static methods directly)
@@ -1946,7 +1873,7 @@ private:
     }
 
     uint32_t next_metronome_boundary_beat() const {
-        return metronome_beat_number_.load(std::memory_order_acquire) + 1;
+        return metronome_.next_boundary_beat();
     }
 
     void send_metronome_sync(int bpm_milli, bool running, uint32_t beat_number) {
@@ -1961,22 +1888,14 @@ private:
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(MetronomeSyncHdr));
         std::memcpy(buf->data(), &sync, sizeof(MetronomeSyncHdr));
         send(buf->data(), buf->size(), buf);
-        metronome_sync_sent_.fetch_add(1, std::memory_order_relaxed);
+        metronome_.mark_sync_sent();
     }
 
     void commit_metronome_bpm_milli(int bpm_milli) {
-        const int current_bpm_milli = metronome_bpm_milli_.load(std::memory_order_acquire);
-        const int pending_bpm_milli =
-            metronome_pending_bpm_milli_.load(std::memory_order_acquire);
-        const uint32_t pending_sequence =
-            metronome_pending_sequence_.load(std::memory_order_acquire);
-        if (bpm_milli == current_bpm_milli &&
-            (pending_sequence == 0 || pending_bpm_milli == bpm_milli)) {
+        if (!metronome_.should_send_bpm_milli(bpm_milli)) {
             return;
         }
-        send_metronome_sync(bpm_milli,
-                            metronome_running_.load(std::memory_order_acquire),
-                            next_metronome_boundary_beat());
+        send_metronome_sync(bpm_milli, metronome_.running(), next_metronome_boundary_beat());
     }
 
     void start_audio_sender_thread() {
@@ -3221,8 +3140,8 @@ private:
                 const auto display_name = fixed_string(info.display_name);
                 participant_manager_.set_participant_metadata(info.participant_id, profile_id,
                                                               display_name);
-                recording_writer_.set_participant_metadata(info.participant_id, profile_id,
-                                                           display_name);
+                media_state_.set_participant_metadata(info.participant_id, profile_id,
+                                                      display_name);
                 spdlog::info("Participant {} metadata: user='{}' display='{}' capabilities=0x{:08x}",
                           info.participant_id, profile_id, display_name,
                           participant_capabilities);
@@ -3266,7 +3185,7 @@ private:
                 MetronomeSyncHdr sync{};
                 std::memcpy(&sync, recv_data, sizeof(MetronomeSyncHdr));
                 schedule_metronome_sync(sync);
-                metronome_sync_received_.fetch_add(1, std::memory_order_relaxed);
+                metronome_.mark_sync_received();
                 spdlog::info("Metronome sync: bpm={:.1f} running={} beat={} seq={} effective_ns={}",
                           static_cast<double>(sync.bpm_milli) / 1000.0,
                           (sync.flags & METRONOME_FLAG_RUNNING) != 0, sync.beat_number,
@@ -3699,160 +3618,32 @@ private:
     }
 
     void schedule_metronome_sync(const MetronomeSyncHdr& sync) {
-        const uint32_t current_sequence =
-            metronome_pending_sequence_.load(std::memory_order_acquire);
-        if (sync.sequence != 0 && sync.sequence <= current_sequence) {
-            return;
-        }
-        const int bpm_milli = std::clamp(static_cast<int>(sync.bpm_milli), 30000, 240000);
-        metronome_pending_bpm_milli_.store(bpm_milli, std::memory_order_relaxed);
-        metronome_pending_running_.store((sync.flags & METRONOME_FLAG_RUNNING) != 0,
-                                         std::memory_order_relaxed);
-        metronome_pending_beat_number_.store(sync.beat_number, std::memory_order_relaxed);
         const bool clock_ready = server_clock_ready_.load(std::memory_order_acquire);
         const int64_t effective_ns =
             sync.effective_server_time_ns > 0 && clock_ready
                 ? sync.effective_server_time_ns
                 : steady_now_ns() + server_clock_offset_ns_.load(std::memory_order_acquire) +
                       150'000'000LL;
-        metronome_pending_effective_server_time_ns_.store(effective_ns,
-                                                          std::memory_order_relaxed);
-        metronome_pending_sequence_.store(sync.sequence == 0 ? current_sequence + 1 : sync.sequence,
-                                          std::memory_order_release);
-    }
-
-    static int64_t ns_delta_to_samples(int64_t ns, size_t sample_rate) {
-        return static_cast<int64_t>((static_cast<long double>(ns) *
-                                     static_cast<long double>(sample_rate)) /
-                                    1'000'000'000.0L);
-    }
-
-    static int64_t beat_interval_samples(int bpm_milli, size_t sample_rate) {
-        return std::max<int64_t>(
-            1, static_cast<int64_t>((static_cast<long double>(sample_rate) *
-                                     60'000.0L) /
-                                    static_cast<long double>(std::max(1, bpm_milli))));
-    }
-
-    void prepare_metronome_schedule(int64_t local_time_ns, size_t sample_rate) {
-        const uint32_t pending_sequence =
-            metronome_pending_sequence_.load(std::memory_order_acquire);
-        if (pending_sequence == 0 || pending_sequence == metronome_prepared_sequence_) {
-            return;
-        }
-
-        const int64_t effective_ns =
-            metronome_pending_effective_server_time_ns_.load(std::memory_order_relaxed);
-        const int64_t offset_ns = server_clock_offset_ns_.load(std::memory_order_acquire);
-        const int64_t local_effective_ns = effective_ns - offset_ns;
-        const int64_t delta_samples =
-            ns_delta_to_samples(local_effective_ns - local_time_ns, sample_rate);
-        metronome_prepared_effective_sample_ =
-            metronome_audio_sample_cursor_ + delta_samples;
-        metronome_prepared_sequence_ = pending_sequence;
-    }
-
-    void apply_due_metronome_schedule(size_t sample_rate) {
-        if (metronome_prepared_sequence_ == 0 ||
-            metronome_prepared_sequence_ == metronome_applied_sequence_ ||
-            metronome_audio_sample_cursor_ < metronome_prepared_effective_sample_) {
-            return;
-        }
-
-        const int bpm_milli =
-            std::max(1, metronome_pending_bpm_milli_.load(std::memory_order_relaxed));
-        const bool running = metronome_pending_running_.load(std::memory_order_relaxed);
-        const uint32_t beat = metronome_pending_beat_number_.load(std::memory_order_relaxed);
-        const int64_t interval_samples = beat_interval_samples(bpm_milli, sample_rate);
-
-        metronome_bpm_milli_.store(bpm_milli, std::memory_order_release);
-        metronome_running_.store(running, std::memory_order_release);
-        metronome_beat_number_.store(beat, std::memory_order_release);
-        metronome_epoch_sample_ =
-            metronome_prepared_effective_sample_ - (static_cast<int64_t>(beat) * interval_samples);
-        metronome_timeline_ready_ = true;
-        metronome_applied_sequence_ = metronome_prepared_sequence_;
+        metronome_.schedule_sync(sync, effective_ns);
     }
 
     void mix_metronome_click(float* output_buffer, unsigned long frame_count, size_t out_channels) {
-        const int bpm_milli = std::max(1, metronome_bpm_milli_.load(std::memory_order_acquire));
-        const size_t sample_rate =
-            static_cast<size_t>(std::max(1, current_audio_sample_rate()));
-        const int64_t interval_samples = beat_interval_samples(bpm_milli, sample_rate);
-        const size_t click_samples = std::max<size_t>(1, sample_rate / 35);
-        prepare_metronome_schedule(steady_now_ns(), sample_rate);
-
-        constexpr double PI = 3.14159265358979323846;
-        for (unsigned long frame = 0; frame < frame_count; ++frame) {
-            apply_due_metronome_schedule(sample_rate);
-
-            if (!metronome_running_.load(std::memory_order_acquire) ||
-                !metronome_timeline_ready_) {
-                ++metronome_audio_sample_cursor_;
-                continue;
-            }
-
-            const int64_t elapsed_samples =
-                metronome_audio_sample_cursor_ - metronome_epoch_sample_;
-            if (elapsed_samples < 0) {
-                ++metronome_audio_sample_cursor_;
-                continue;
-            }
-
-            const uint32_t beat_number =
-                static_cast<uint32_t>(elapsed_samples / interval_samples) + 1;
-            const size_t click_sample =
-                static_cast<size_t>(elapsed_samples % interval_samples);
-            metronome_beat_number_.store(beat_number, std::memory_order_release);
-
-            if (click_sample < click_samples) {
-                const bool downbeat = ((beat_number - 1) % 4) == 0;
-                const double frequency = downbeat ? 1320.0 : 880.0;
-                const double t = static_cast<double>(click_sample) /
-                                 static_cast<double>(sample_rate);
-                const double envelope =
-                    std::exp(-7.0 * static_cast<double>(click_sample) /
-                             static_cast<double>(click_samples));
-                const float click =
-                    static_cast<float>(std::sin(2.0 * PI * frequency * t) * envelope * 0.22);
-                for (size_t channel = 0; channel < out_channels; ++channel) {
-                    const size_t index = (frame * out_channels) + channel;
-                    output_buffer[index] = std::clamp(output_buffer[index] + click, -1.0F, 1.0F);
-                }
-            }
-
-            ++metronome_audio_sample_cursor_;
-        }
+        metronome_.mix_click(output_buffer, frame_count, out_channels,
+                             current_audio_sample_rate(), steady_now_ns(),
+                             server_clock_offset_ns_.load(std::memory_order_acquire));
     }
 
     void record_mono_block(RecordingWriter::TrackKind kind, uint32_t participant_id,
                            const float* samples, size_t frame_count) {
-        recording_writer_.enqueue(kind, participant_id,
-                                  static_cast<uint32_t>(current_audio_sample_rate()), samples,
-                                  frame_count);
+        media_state_.record_mono_block(kind, participant_id,
+                                       static_cast<uint32_t>(current_audio_sample_rate()),
+                                       samples, frame_count);
     }
 
     void record_master_mix(const float* output_buffer, unsigned long frame_count,
                            size_t out_channels) {
-        if (!recording_writer_.is_active() || output_buffer == nullptr ||
-            frame_count > RecordingWriter::MAX_FRAMES_PER_BLOCK) {
-            return;
-        }
-
-        if (out_channels == 1) {
-            record_mono_block(RecordingWriter::TrackKind::Master, 0, output_buffer, frame_count);
-            return;
-        }
-
-        std::array<float, RecordingWriter::MAX_FRAMES_PER_BLOCK> mono{};
-        for (unsigned long frame = 0; frame < frame_count; ++frame) {
-            float sum = 0.0F;
-            for (size_t channel = 0; channel < out_channels; ++channel) {
-                sum += output_buffer[(frame * out_channels) + channel];
-            }
-            mono[frame] = sum / static_cast<float>(out_channels);
-        }
-        record_mono_block(RecordingWriter::TrackKind::Master, 0, mono.data(), frame_count);
+        media_state_.record_master_mix(static_cast<uint32_t>(current_audio_sample_rate()),
+                                       output_buffer, frame_count, out_channels);
     }
 
     static int audio_callback(const void* input, void* output, unsigned long frame_count,
@@ -4298,16 +4089,16 @@ private:
         int  wav_frames_read = 0;
         bool wav_active      = false;
 
-        if (client->wav_playback_.is_loaded() && client->wav_playback_.is_playing()) {
+        if (client->media_state_.wav_loaded_and_playing()) {
             wav_frames_read =
-                client->wav_playback_.read(wav_buffer.data(), static_cast<int>(frame_count),
-                                           runtime_sample_rate);
+                client->media_state_.read_wav(wav_buffer.data(), static_cast<int>(frame_count),
+                                              runtime_sample_rate);
             if (wav_frames_read > 0) {
                 wav_active = true;  // Only set active if we actually read frames (handles EOF case)
 
                 // Mix WAV into local output buffer only if not muted locally
-                if (!client->wav_muted_local_.load(std::memory_order_acquire)) {
-                    float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
+                if (!client->media_state_.wav_muted_local()) {
+                    float wav_gain = client->media_state_.wav_gain();
                     if (out_channels == 1) {
                         audio_analysis::mix_with_gain(output_buffer, wav_buffer.data(),
                                                       wav_frames_read, wav_gain);
@@ -4358,7 +4149,7 @@ private:
 
             std::array<float, 960> opus_input{};
             if (wav_active && wav_frames_read > 0) {
-                float wav_gain = client->wav_gain_.load(std::memory_order_acquire);
+                float wav_gain = client->media_state_.wav_gain();
                 for (int i = 0; i < wav_frames_read; ++i) {
                     opus_input[static_cast<size_t>(i)] = wav_buffer[static_cast<size_t>(i)] * wav_gain;
                 }
@@ -4396,6 +4187,8 @@ private:
     udp::endpoint      server_endpoint_;
     ClientJoinSession join_session_;
     ClientAudioState audio_state_;
+    ClientMediaState media_state_;
+    ClientMetronome metronome_;
     std::filesystem::path audio_preferences_path_;
     std::optional<session_crypto::SessionKey> session_key_;
     session_crypto::ReplayWindow              server_audio_replay_window_;
@@ -4460,32 +4253,6 @@ private:
     std::chrono::steady_clock::time_point     last_audio_packet_send_time_{};
 
     ParticipantManager participant_manager_;
-    WavFilePlayback    wav_playback_;
-    RecordingWriter    recording_writer_;
-
-    // WAV playback volume/gain (thread-safe with atomic)
-    std::atomic<float> wav_gain_{1.0F};          // Default to 100% volume
-    std::atomic<bool>  wav_muted_local_{false};  // Mute locally (still sends over network)
-
-    std::atomic<int>      metronome_bpm_milli_{120000};
-    std::atomic<bool>     metronome_running_{false};
-    std::atomic<uint32_t> metronome_beat_number_{0};
-    std::atomic<uint64_t> metronome_sync_sent_{0};
-    std::atomic<uint64_t> metronome_sync_received_{0};
-    std::atomic<int>      metronome_pending_bpm_milli_{120000};
-    std::atomic<bool>     metronome_pending_running_{false};
-    std::atomic<uint32_t> metronome_pending_beat_number_{0};
-    std::atomic<int64_t>  metronome_pending_effective_server_time_ns_{0};
-    std::atomic<uint32_t> metronome_pending_sequence_{0};
-    uint32_t              metronome_prepared_sequence_ = 0;
-    int64_t               metronome_prepared_effective_sample_ = 0;
-    uint32_t              metronome_applied_sequence_ = 0;
-    int64_t               metronome_epoch_sample_ = 0;
-    int64_t               metronome_audio_sample_cursor_ = 0;
-    bool                  metronome_timeline_ready_ = false;
-    std::array<std::chrono::steady_clock::time_point, 8> tap_times_{};
-    size_t                                             tap_count_ = 0;
-    size_t                                             tap_index_ = 0;
 
     // Microphone mute (thread-safe with atomic)
     std::atomic<bool> mic_muted_{false};  // Mute mic (doesn't send to server)

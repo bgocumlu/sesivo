@@ -91,6 +91,8 @@ add_executable(client
     ${JAM_CLIENT_DIR}/client_audio_devices.cpp
     ${JAM_CLIENT_DIR}/client_audio_state.cpp
     ${JAM_CLIENT_DIR}/client_join_session.cpp
+    ${JAM_CLIENT_DIR}/client_media_state.cpp
+    ${JAM_CLIENT_DIR}/client_metronome.cpp
     ${JAM_CLIENT_DIR}/client_startup.cpp
     ${JAM_CLIENT_DIR}/gui.cpp
     ${JAM_CLIENT_DIR}/audio_stream.cpp

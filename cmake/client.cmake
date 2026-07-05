@@ -93,6 +93,7 @@ add_executable(client
     ${JAM_CLIENT_DIR}/client_join_session.cpp
     ${JAM_CLIENT_DIR}/client_media_state.cpp
     ${JAM_CLIENT_DIR}/client_metronome.cpp
+    ${JAM_CLIENT_DIR}/client_runtime.cpp
     ${JAM_CLIENT_DIR}/client_startup.cpp
     ${JAM_CLIENT_DIR}/gui.cpp
     ${JAM_CLIENT_DIR}/imgui_client_ui.cpp

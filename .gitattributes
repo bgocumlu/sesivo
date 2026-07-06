@@ -1,2 +1,3 @@
 tools/*.sh text eol=lf
+packaging/macos/*.applescript text eol=lf
 packaging/macos/*.plist text eol=lf

@@ -43,6 +43,20 @@ endif()
 message(STATUS "JUCE ASIO support: ${JUCE_CLIENT_ENABLE_ASIO}")
 message(STATUS "JUCE JACK support: ${JUCE_CLIENT_ENABLE_JACK}")
 
+set(JAM_CLIENT_PLATFORM_SOURCES)
+if(APPLE)
+    set(JAM_CLIENT_ICON_ICNS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icons/sesivo.icns")
+    set_source_files_properties("${JAM_CLIENT_ICON_ICNS}" PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources"
+    )
+    list(APPEND JAM_CLIENT_PLATFORM_SOURCES "${JAM_CLIENT_ICON_ICNS}")
+endif()
+if(WIN32)
+    list(APPEND JAM_CLIENT_PLATFORM_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows/sesivo.rc"
+    )
+endif()
+
 add_executable(client
     ${JAM_CLIENT_DIR}/client.cpp
     ${JAM_CLIENT_DIR}/client_audio_devices.cpp
@@ -64,6 +78,7 @@ add_executable(client
     ${JAM_CLIENT_DIR}/juce_status_bar_component.cpp
     ${JAM_CLIENT_DIR}/juce_theme.cpp
     ${JAM_COMMON_DIR}/logging_setup.cpp
+    ${JAM_CLIENT_PLATFORM_SOURCES}
 )
 jam_add_project_includes(client)
 
@@ -77,9 +92,12 @@ if(APPLE)
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_client_info.plist.in"
         MACOSX_BUNDLE_BUNDLE_NAME "sesivo"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.sesivo.client"
+        MACOSX_BUNDLE_ICON_FILE "sesivo.icns"
         MACOSX_BUNDLE_INFO_STRING "sesivo"
+        MACOSX_BUNDLE_LONG_VERSION_STRING "0.1.0"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
         MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
+        MACOSX_BUNDLE_COPYRIGHT "Copyright 2026 sesivo"
     )
 endif()
 

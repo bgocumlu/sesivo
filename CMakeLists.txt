@@ -136,3 +136,5 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(audio_backend_policy_self_test)
     jam_add_executable_test(juce_audio_adapter_self_test)
 endif()
+
+include(cmake/packaging.cmake)

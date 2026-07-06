@@ -12,6 +12,11 @@ int run_juce_client_app(ClientAppFacade& client, const std::string& window_title
                         std::function<void()> close_callback) {
     juce::ScopedJuceInitialiser_GUI juce_runtime;
 
+#if JUCE_MAC
+    juce::Process::setDockIconVisible(true);
+    juce::Process::makeForegroundProcess();
+#endif
+
     JuceMainWindow window(
         juce::String(window_title), client, std::move(startup_options),
         [close_callback = std::move(close_callback)]() mutable {

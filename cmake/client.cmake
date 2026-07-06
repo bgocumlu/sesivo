@@ -67,6 +67,21 @@ add_executable(client
 )
 jam_add_project_includes(client)
 
+set_target_properties(client PROPERTIES
+    OUTPUT_NAME sesivo
+)
+
+if(APPLE)
+    set_target_properties(client PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_BUNDLE_NAME "sesivo"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.sesivo.client"
+        MACOSX_BUNDLE_INFO_STRING "sesivo"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
+    )
+endif()
+
 add_executable(ui_style_sandbox
     ${JAM_CLIENT_DIR}/ui_style_sandbox.cpp
 )

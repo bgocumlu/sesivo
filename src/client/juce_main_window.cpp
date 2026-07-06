@@ -13,11 +13,11 @@ JuceMainWindow::JuceMainWindow(const juce::String& title, ClientAppFacade& clien
       close_callback_(std::move(close_callback)) {
     juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
     setLookAndFeel(&look_and_feel_);
-    setUsingNativeTitleBar(true);
+    setUsingNativeTitleBar(false);
     setResizable(true, true);
-    setResizeLimits(1240, 700, 2400, 1600);
+    setResizeLimits(1024, 640, 2400, 1600);
     setContentOwned(new JuceRootComponent(client, std::move(startup_options)), true);
-    centreWithSize(1450, 820);
+    centreWithSize(1180, 720);
     setVisible(true);
 }
 

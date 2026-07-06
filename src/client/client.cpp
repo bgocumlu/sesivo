@@ -144,10 +144,7 @@ int main(int argc, char** argv) {
 
         std::thread io_thread([&io_context]() { io_context.run(); });
 
-        const std::string window_title =
-            startup_options.app_version.empty()
-                ? "Jam"
-                : "Jam " + startup_options.app_version;
+        const std::string window_title = "sesivo";
         JuceClientStartupOptions gui_startup_options;
         gui_startup_options.audio_preferences = audio_preferences;
         gui_startup_options.config_path = config_path;

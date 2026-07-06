@@ -1,9 +1,41 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function abs(relativePath) {
+  return path.resolve(repoRoot, relativePath);
+}
+
+function firstExisting(candidates) {
+  return candidates.find((candidate) => fs.existsSync(abs(candidate))) ?? candidates[0];
+}
+
+function defaultClientExe() {
+  if (process.platform === "win32") {
+    return firstExisting(["build/Debug/sesivo.exe", "build/Release/sesivo.exe"]);
+  }
+  if (process.platform === "darwin") {
+    return firstExisting([
+      "build/sesivo.app/Contents/MacOS/sesivo",
+      "build/Debug/sesivo.app/Contents/MacOS/sesivo",
+      "build/Release/sesivo.app/Contents/MacOS/sesivo",
+    ]);
+  }
+  return firstExisting(["build/sesivo", "build/Debug/sesivo", "build/Release/sesivo"]);
+}
+
+function defaultServerExe() {
+  if (process.platform === "win32") {
+    return firstExisting(["build/Debug/sesivo-server.exe", "build/Release/sesivo-server.exe"]);
+  }
+  return firstExisting(["build/sesivo-server", "build/Debug/sesivo-server", "build/Release/sesivo-server"]);
+}
 
 // Edit these defaults for your local dev loop.
 const DEV = {
@@ -16,8 +48,8 @@ const DEV = {
   ttlMs: 10 * 60 * 1000,
   roomInstance: "",
   accessEpoch: "0",
-  serverExe: "build/Debug/server.exe",
-  clientExe: "build/Debug/client.exe",
+  serverExe: process.env.JAM_SERVER_EXE ?? defaultServerExe(),
+  clientExe: process.env.JAM_CLIENT_EXE ?? defaultClientExe(),
   clients: {
     a: { room: "room-a", user: "user-a1", displayName: "User A1" },
     b: { room: "room-a", user: "user-a2", displayName: "User A2" },
@@ -25,10 +57,8 @@ const DEV = {
   },
 };
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-
-function abs(relativePath) {
-  return path.resolve(repoRoot, relativePath);
+function executablePath(value) {
+  return path.isAbsolute(value) ? value : abs(value);
 }
 
 function claimField(value) {
@@ -69,6 +99,11 @@ function tokenFor(client) {
 }
 
 function run(command, args) {
+  if (!fs.existsSync(command)) {
+    console.error(`missing executable: ${command}`);
+    console.error("build the target first, or set JAM_CLIENT_EXE / JAM_SERVER_EXE");
+    process.exit(2);
+  }
   console.log([command, ...args].join(" "));
   const child = spawn(command, args, {
     cwd: repoRoot,
@@ -91,6 +126,7 @@ function usage() {
       "  node tools/dev-jam.mjs client c",
       "",
       "defaults live at the top of tools/dev-jam.mjs",
+      "env overrides: JAM_CLIENT_EXE, JAM_SERVER_EXE, JAM_DEV_PORT",
       "default rooms: a+b in room-a, c in room-b",
     ].join("\n"),
   );
@@ -99,7 +135,7 @@ function usage() {
 const [command, id] = process.argv.slice(2);
 
 if (command === "server") {
-  run(abs(DEV.serverExe), [
+  run(executablePath(DEV.serverExe), [
     "--port",
     DEV.port,
     "--server-id",
@@ -115,7 +151,7 @@ if (command === "server") {
     process.exit(2);
   }
 
-  run(abs(DEV.clientExe), [
+  run(executablePath(DEV.clientExe), [
     "--server",
     DEV.serverHost,
     "--port",

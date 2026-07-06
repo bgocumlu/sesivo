@@ -174,8 +174,7 @@ public:
         udp::resolver               resolver(io_context_);
         udp::resolver::results_type endpoints =
             resolver.resolve(server_address, std::to_string(server_port));
-        const auto selected_endpoint =
-            udp_network::choose_endpoint_for_socket(socket_, endpoints);
+        const auto selected_endpoint = choose_client_endpoint(endpoints);
         if (!selected_endpoint.has_value()) {
             throw std::runtime_error("No compatible UDP endpoint resolved for " +
                                      server_address);
@@ -193,6 +192,7 @@ public:
         udp_network::QosResult qos;
         {
             std::lock_guard<std::mutex> lock(socket_mutex_);
+            reopen_socket_for_endpoint_locked(resolved_endpoint);
             qos = socket_qos_.ensure_flow(socket_, resolved_endpoint);
         }
         log_udp_qos_result(resolved_endpoint, qos);
@@ -1530,6 +1530,44 @@ private:
 
     void configure_udp_socket_locked() {
         configure_udp_socket(socket_);
+    }
+
+    static std::optional<udp::endpoint> choose_client_endpoint(
+        const udp::resolver::results_type& endpoints) {
+        std::optional<udp::endpoint> first_v6;
+        for (const auto& entry : endpoints) {
+            const auto endpoint = entry.endpoint();
+            if (endpoint.address().is_v4()) {
+                return endpoint;
+            }
+            if (!first_v6.has_value() && endpoint.address().is_v6()) {
+                first_v6 = endpoint;
+            }
+        }
+        return first_v6;
+    }
+
+    void reopen_socket_for_endpoint_locked(const udp::endpoint& endpoint) {
+        std::error_code ec;
+        const bool protocol_matches =
+            socket_.is_open() && socket_.local_endpoint(ec).protocol() == endpoint.protocol();
+        if (!ec && protocol_matches) {
+            return;
+        }
+
+        socket_qos_.reset();
+        std::error_code ignored;
+        socket_.close(ignored);
+        socket_.open(endpoint.protocol(), ec);
+        if (!ec) {
+            socket_.bind(udp::endpoint(endpoint.protocol(), 0), ec);
+        }
+        if (ec) {
+            throw std::runtime_error("Failed to bind UDP socket: " + ec.message());
+        }
+        configure_udp_socket_locked();
+        spdlog::info("Client local port: {} ({})", socket_.local_endpoint().port(),
+                     endpoint.protocol() == udp::v6() ? "IPv6" : "IPv4");
     }
 
     void clear_audio_path_queues() {

@@ -1,6 +1,33 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function abs(relativePath) {
+  return path.resolve(repoRoot, relativePath);
+}
+
+function firstExisting(candidates) {
+  return candidates.find((candidate) => fs.existsSync(abs(candidate))) ?? candidates[0];
+}
+
+function defaultClientPath() {
+  if (process.platform === "win32") {
+    return firstExisting(["./build/Debug/sesivo.exe", "./build/Release/sesivo.exe"]);
+  }
+  if (process.platform === "darwin") {
+    return firstExisting([
+      "./build/sesivo.app/Contents/MacOS/sesivo",
+      "./build/Debug/sesivo.app/Contents/MacOS/sesivo",
+      "./build/Release/sesivo.app/Contents/MacOS/sesivo",
+    ]);
+  }
+  return firstExisting(["./build/sesivo", "./build/Debug/sesivo", "./build/Release/sesivo"]);
+}
 
 const defaults = {
   server: "127.0.0.1",
@@ -11,7 +38,7 @@ const defaults = {
   ttlMs: "120000",
   roomInstance: "",
   accessEpoch: "0",
-  client: "./build/Debug/client.exe",
+  client: process.env.JAM_CLIENT_EXE ?? defaultClientPath(),
 };
 
 function parseArgs(argv) {
@@ -44,7 +71,8 @@ function usage() {
       "",
       "optional:",
       "  --server-id local-dev --server 127.0.0.1 --port 9999 --codec opus --frames 120 --ttl-ms 120000",
-      "  --room-instance <id> --access-epoch <n>",
+      "  --room-instance <id> --access-epoch <n> --client <path>",
+      "env override: JAM_CLIENT_EXE",
     ].join("\n"),
   );
 }

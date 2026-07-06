@@ -48,8 +48,13 @@ entitlements="packaging/macos/entitlements.plist"
 
 keychain="$(mktemp -u "/tmp/sesivo-signing.XXXXXX.keychain-db")"
 keychain_password="$(openssl rand -hex 24)"
+original_keychains="$(security list-keychains -d user | tr -d ' "')"
 
 cleanup() {
+    if [[ -n "$original_keychains" ]]; then
+        # shellcheck disable=SC2086
+        security list-keychains -d user -s $original_keychains >/dev/null 2>&1 || true
+    fi
     security delete-keychain "$keychain" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -60,6 +65,7 @@ cmake --build "$build_dir" --target client --config "$config"
 rm -f "$app_path/Contents/MacOS/sesivo-client.json"
 
 security create-keychain -p "$keychain_password" "$keychain"
+security list-keychains -d user -s "$keychain" $original_keychains
 security set-keychain-settings -lut 21600 "$keychain"
 security unlock-keychain -p "$keychain_password" "$keychain"
 security import "$CSC_LINK" -k "$keychain" -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign
@@ -67,7 +73,7 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: \
     -s -k "$keychain_password" "$keychain" >/dev/null
 
 identity="$(security find-identity -v -p codesigning "$keychain" |
-    awk -F '\"' '/Developer ID Application/ { print $2; exit }')"
+    awk '/Developer ID Application/ { print $2; exit }')"
 if [[ -z "$identity" ]]; then
     echo "no Developer ID Application identity found in temporary keychain" >&2
     exit 2

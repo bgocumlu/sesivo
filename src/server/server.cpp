@@ -437,13 +437,22 @@ private:
         packet_builder::write_fixed(response.server_id, options_.server_id);
         response.total_rooms = saturating_u16(rooms.size());
         response.active_participants = saturating_u16(client_manager_.count());
+        const size_t room_offset =
+            std::min<size_t>(request.room_offset, rooms.size());
+        const size_t room_limit =
+            request.room_limit == 0
+                ? MAX_ROOM_STATUS_SUMMARIES
+                : std::min<size_t>(request.room_limit, MAX_ROOM_STATUS_SUMMARIES);
+        const size_t remaining_rooms = rooms.size() - room_offset;
         response.room_count = static_cast<uint8_t>(
-            std::min<size_t>(rooms.size(), MAX_ROOM_STATUS_SUMMARIES));
-        response.truncated = rooms.size() > MAX_ROOM_STATUS_SUMMARIES ? 1 : 0;
+            std::min(remaining_rooms, room_limit));
+        response.room_offset = saturating_u16(room_offset);
+        response.truncated =
+            room_offset + response.room_count < rooms.size() ? 1 : 0;
         response.token_auth_available =
             !options_.join_secret.empty() || options_.allow_insecure_dev_joins ? 1 : 0;
         for (size_t index = 0; index < response.room_count; ++index) {
-            const auto& room = rooms[index];
+            const auto& room = rooms[room_offset + index];
             packet_builder::write_fixed(response.rooms[index].room_id, room.room_id);
             packet_builder::write_fixed(response.rooms[index].room_name, room.room_name);
             response.rooms[index].participant_count =

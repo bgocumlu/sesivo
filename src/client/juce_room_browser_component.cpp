@@ -33,6 +33,9 @@ constexpr int BROWSER_BOTTOM_HEIGHT = 78;
 constexpr int SERVER_RAIL_WIDTH = 315;
 constexpr int CONTENT_PAD = juce_theme::pad;
 constexpr int CONTENT_GAP = juce_theme::gap;
+constexpr int SERVER_ROW_HEIGHT = 70;
+constexpr int ROOM_ROW_HEIGHT = 66;
+constexpr int ROOM_STATUS_PAGE_LIMIT = 8;
 
 namespace ui {
 const juce::Colour background{0xff121315};
@@ -229,6 +232,43 @@ void draw_dropdown(juce::Graphics& g, juce::Rectangle<int> bounds,
     draw_label(g, bounds.removeFromLeft(bounds.getWidth() - 28), label, 14.0f,
                text);
     draw_icon(g, bounds.reduced(5), Icon::chevron);
+}
+
+void draw_scrollbar(juce::Graphics& g, juce::Rectangle<int> bounds,
+                    int content_height, int scroll_px) {
+    if (bounds.isEmpty() || content_height <= bounds.getHeight()) {
+        return;
+    }
+
+    auto track = bounds.withLeft(bounds.getRight() - 6).reduced(1, 5);
+    if (track.getHeight() <= 0) {
+        return;
+    }
+
+    const int max_scroll = content_height - bounds.getHeight();
+    const int thumb_height = juce::jlimit(
+        24, track.getHeight(),
+        static_cast<int>(std::round(
+            static_cast<double>(track.getHeight()) *
+            static_cast<double>(bounds.getHeight()) /
+            static_cast<double>(content_height))));
+    const int travel = track.getHeight() - thumb_height;
+    const int thumb_y =
+        track.getY() +
+        (max_scroll <= 0
+             ? 0
+             : static_cast<int>(std::round(
+                   static_cast<double>(travel) *
+                   static_cast<double>(juce::jlimit(0, max_scroll, scroll_px)) /
+                   static_cast<double>(max_scroll))));
+
+    g.setColour(border_soft.withAlpha(0.7f));
+    g.fillRoundedRectangle(track.toFloat(), 2.0f);
+    g.setColour(text_faint.withAlpha(0.75f));
+    g.fillRoundedRectangle(
+        juce::Rectangle<int>{track.getX(), thumb_y, track.getWidth(), thumb_height}
+            .toFloat(),
+        2.0f);
 }
 } // namespace ui
 
@@ -622,7 +662,11 @@ void JuceRoomBrowserComponent::configure_controls() {
                              juce::Colours::transparentBlack);
     search_editor_.setTextToShowWhenEmpty("Search rooms", ui::text_faint);
     search_editor_.setLookAndFeel(&search_editor_look_and_feel_);
-    search_editor_.onTextChange = [this]() { repaint(); };
+    search_editor_.onTextChange = [this]() {
+        room_scroll_px_ = 0;
+        clamp_scroll_offsets();
+        repaint();
+    };
     addAndMakeVisible(search_editor_);
 
     api_combo_.setTextWhenNothingSelected("API");
@@ -1073,43 +1117,64 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
     ui::draw_toolbar_button(g, edit_servers_button_bounds_, "Edit",
                             ui::Icon::settings);
 
-    for (int i = 0; i < static_cast<int>(servers_.size()); ++i) {
-        auto row_bounds = server_area.removeFromTop(70);
-        auto row_area = row_bounds.reduced(0, 4);
-        const bool selected = i == selected_server_index_;
-        const auto& server = servers_[static_cast<size_t>(i)];
-        if (selected) {
-            g.setColour(ui::row_selected);
-            g.fillRoundedRectangle(row_area.toFloat(), ui::radius);
-        }
-        g.setColour(ui::border_soft);
-        g.drawHorizontalLine(row_bounds.getBottom() - 1,
-                             static_cast<float>(row_bounds.getX() + 4),
-                             static_cast<float>(row_bounds.getRight() - 4));
-        auto row = row_area.reduced(6, 0);
-        ui::draw_icon(g, row.removeFromLeft(50).reduced(9),
-                      is_local_address(server.address) ? ui::Icon::network
-                                                       : ui::Icon::globe,
-                      ui::text_dim);
-        auto ping = row.removeFromRight(72);
-        const auto ping_colour_value =
-            ping_colour(server.status.round_trip_ms, server.status.ok);
-        auto ping_label = ping.removeFromTop(28).withTrimmedRight(14);
-        ui::draw_label(g, ping_label,
-                       server.status.ok ? format_ping(server.status.round_trip_ms)
-                                        : "offline",
-                       14.0f, ping_colour_value, false,
-                       juce::Justification::centredRight);
-        ui::draw_dot(g, {static_cast<float>(ping.getRight() - 4),
-                         static_cast<float>(ping.getY() + 12)},
-                     ping_colour_value, 4.0f);
-        ui::draw_label(g, row.removeFromTop(30), server.name, 16.0f,
-                       ui::text, true);
-        ui::draw_label(g, row, endpoint_label(server.address, server.port), 13.5f,
-                       ui::text_dim);
-    }
-
     add_server_bottom_bounds_ = left.reduced(12, 18).removeFromBottom(42);
+    server_list_area_ = server_area.withBottom(
+        juce::jmax(server_area.getY(), add_server_bottom_bounds_.getY() - 8));
+    clamp_scroll_offsets();
+
+    {
+        juce::Graphics::ScopedSaveState save_state(g);
+        g.reduceClipRegion(server_list_area_);
+        const int first_server =
+            juce::jmax(0, server_scroll_px_ / SERVER_ROW_HEIGHT);
+        int row_y = server_list_area_.getY() -
+                    (server_scroll_px_ % SERVER_ROW_HEIGHT);
+        for (int i = first_server;
+             i < static_cast<int>(servers_.size()) &&
+             row_y + SERVER_ROW_HEIGHT <= server_list_area_.getBottom();
+             ++i, row_y += SERVER_ROW_HEIGHT) {
+            auto row_bounds =
+                juce::Rectangle<int>{server_list_area_.getX(), row_y,
+                                     server_list_area_.getWidth(),
+                                     SERVER_ROW_HEIGHT};
+            auto row_area = row_bounds.reduced(0, 4);
+            const bool selected = i == selected_server_index_;
+            const auto& server = servers_[static_cast<size_t>(i)];
+            if (selected) {
+                g.setColour(ui::row_selected);
+                g.fillRoundedRectangle(row_area.toFloat(), ui::radius);
+            }
+            g.setColour(ui::border_soft);
+            g.drawHorizontalLine(row_bounds.getBottom() - 1,
+                                 static_cast<float>(row_bounds.getX() + 4),
+                                 static_cast<float>(row_bounds.getRight() - 4));
+            auto row = row_area.reduced(6, 0);
+            ui::draw_icon(g, row.removeFromLeft(50).reduced(9),
+                          is_local_address(server.address) ? ui::Icon::network
+                                                           : ui::Icon::globe,
+                          ui::text_dim);
+            auto ping = row.removeFromRight(72);
+            const auto ping_colour_value =
+                ping_colour(server.status.round_trip_ms, server.status.ok);
+            auto ping_label = ping.removeFromTop(28).withTrimmedRight(14);
+            ui::draw_label(g, ping_label,
+                           server.status.ok ? format_ping(server.status.round_trip_ms)
+                                            : "offline",
+                           14.0f, ping_colour_value, false,
+                           juce::Justification::centredRight);
+            ui::draw_dot(g, {static_cast<float>(ping.getRight() - 4),
+                             static_cast<float>(ping.getY() + 12)},
+                         ping_colour_value, 4.0f);
+            ui::draw_label(g, row.removeFromTop(30), server.name, 16.0f,
+                           ui::text, true);
+            ui::draw_label(g, row, endpoint_label(server.address, server.port),
+                           13.5f, ui::text_dim);
+        }
+    }
+    ui::draw_scrollbar(g, server_list_area_,
+                       static_cast<int>(servers_.size()) * SERVER_ROW_HEIGHT,
+                       server_scroll_px_);
+
     ui::fill_button(g, add_server_bottom_bounds_);
     auto add_label = add_server_bottom_bounds_;
     ui::draw_icon(g, add_label.removeFromLeft(44).reduced(10), ui::Icon::plus);
@@ -1118,7 +1183,7 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
     juce_theme::paint_panel(g, content);
     auto room_area = content.reduced(12, 10);
     auto top = room_area.removeFromTop(42);
-    ui::draw_label(g, top.removeFromLeft(160), "ROOMS", 15.0f, ui::text, true);
+    ui::draw_label(g, top.removeFromLeft(130), "ROOMS", 15.0f, ui::text, true);
     create_button_bounds_ = top.removeFromRight(110).reduced(0, 2);
     ui::fill_button(g, create_button_bounds_, true);
     ui::draw_label(g, create_button_bounds_, "Create", 14.5f, ui::text, true,
@@ -1127,6 +1192,13 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
     auto search_container = top.removeFromRight(285).reduced(0, 2);
     ui::fill_button(g, search_container);
     ui::draw_icon(g, search_container.withWidth(38).reduced(9), ui::Icon::search);
+    if (status.ok && status.truncated) {
+        ui::draw_label(
+            g, top.reduced(8, 0),
+            "Showing " + juce::String(static_cast<int>(status.rooms.size())) +
+                " of " + juce::String(status.total_rooms),
+            13.0f, ui::text_faint);
+    }
 
     room_area.removeFromTop(10);
     auto header = room_area.removeFromTop(42);
@@ -1148,72 +1220,86 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
 
     room_list_area_ = room_area;
     const auto visible = visible_room_indices();
+    clamp_scroll_offsets();
     if (!selected_status().ok) {
         ui::draw_label(g, room_area.reduced(20), status_text_, 16.0f, ui::text_dim,
                        false, juce::Justification::centred);
     } else if (visible.empty()) {
         ui::draw_label(g, room_area.reduced(20),
-                       selected_status().rooms.empty() ? "No rooms on this server"
-                                                       : "No matching rooms",
-                       16.0f, ui::text_dim, false, juce::Justification::centred);
+                        selected_status().rooms.empty() ? "No rooms on this server"
+                                                        : "No matching rooms",
+                        16.0f, ui::text_dim, false, juce::Justification::centred);
     }
 
-    for (int visible_position = 0;
-         visible_position < static_cast<int>(visible.size()) && room_area.getHeight() >= 66;
-         ++visible_position) {
-        const int room_index = visible[static_cast<size_t>(visible_position)];
-        const auto& room =
-            selected_status().rooms[static_cast<size_t>(room_index)];
-        auto bounds = room_area.removeFromTop(66);
-        auto row_bounds = bounds.reduced(0, 3);
-        const bool selected = room_index == selected_room_index_;
+    if (!visible.empty()) {
+        juce::Graphics::ScopedSaveState save_state(g);
+        g.reduceClipRegion(room_list_area_);
+        const int first_room = juce::jmax(0, room_scroll_px_ / ROOM_ROW_HEIGHT);
+        int row_y = room_list_area_.getY() - (room_scroll_px_ % ROOM_ROW_HEIGHT);
+        for (int visible_position = first_room;
+             visible_position < static_cast<int>(visible.size()) &&
+             row_y + ROOM_ROW_HEIGHT <= room_list_area_.getBottom();
+             ++visible_position, row_y += ROOM_ROW_HEIGHT) {
+            const int room_index = visible[static_cast<size_t>(visible_position)];
+            const auto& room =
+                selected_status().rooms[static_cast<size_t>(room_index)];
+            auto row_bounds =
+                juce::Rectangle<int>{room_list_area_.getX(), row_y,
+                                     room_list_area_.getWidth(),
+                                     ROOM_ROW_HEIGHT}
+                    .reduced(0, 3);
+            const bool selected = room_index == selected_room_index_;
 
-        auto row_float = row_bounds.toFloat();
-        g.setColour(selected ? ui::row_selected : ui::row);
-        g.fillRoundedRectangle(row_float, ui::radius);
-        g.setColour(ui::border_soft);
-        g.drawRoundedRectangle(row_float.reduced(0.5f), ui::radius, 1.0f);
+            auto row_float = row_bounds.toFloat();
+            g.setColour(selected ? ui::row_selected : ui::row);
+            g.fillRoundedRectangle(row_float, ui::radius);
+            g.setColour(ui::border_soft);
+            g.drawRoundedRectangle(row_float.reduced(0.5f), ui::radius, 1.0f);
 
-        auto row = row_bounds.reduced(20, 0);
-        const auto row_columns = room_columns(row.getWidth());
-        auto name = row.removeFromLeft(row_columns.name);
-        auto title = name.removeFromTop(30);
-        ui::draw_label(g, title,
-                       room.room_name.empty() ? room.room_id : room.room_name,
-                       17.0f, ui::text, true);
-        if (room.locked) {
-            ui::draw_icon(g, title.withTrimmedLeft(150).withWidth(22).reduced(3),
-                          ui::Icon::lock, ui::text_faint);
+            auto row = row_bounds.reduced(20, 0);
+            const auto row_columns = room_columns(row.getWidth());
+            auto name = row.removeFromLeft(row_columns.name);
+            auto title = name.removeFromTop(30);
+            ui::draw_label(g, title,
+                           room.room_name.empty() ? room.room_id : room.room_name,
+                           17.0f, ui::text, true);
+            if (room.locked) {
+                ui::draw_icon(g, title.withTrimmedLeft(150).withWidth(22).reduced(3),
+                              ui::Icon::lock, ui::text_faint);
+            }
+            auto tags = name.withHeight(22);
+            ui::draw_pill(g, tags.removeFromLeft(70), "Live");
+            tags.removeFromLeft(6);
+            ui::draw_pill(g, tags.removeFromLeft(room.locked ? 76 : 70),
+                          room.locked ? "Locked" : "Open");
+
+            auto players = row.removeFromLeft(row_columns.players);
+            ui::draw_icon(g, players.removeFromLeft(26).reduced(3), ui::Icon::users,
+                          ui::text_dim);
+            ui::draw_label(g, players, juce::String(room.participant_count), 14.5f,
+                           ui::text);
+            ui::draw_label(g, row.removeFromLeft(row_columns.access),
+                           room.locked ? "Password" : "Open", 14.0f,
+                           room.locked ? ui::amber : ui::green);
+
+            auto join = row.withWidth(row_columns.join);
+            const auto menu_width = 44;
+            const auto join_gap = 8;
+            const auto button_width =
+                juce::jlimit(82, 112, join.getWidth() - menu_width - join_gap);
+            auto button = join.removeFromLeft(button_width).reduced(0, 13);
+            ui::fill_button(g, button, true);
+            ui::draw_label(g, button, "Join", 14.5f, ui::text, true,
+                           juce::Justification::centred);
+            join.removeFromLeft(join_gap);
+            auto menu = join.removeFromLeft(menu_width).reduced(0, 13);
+            ui::fill_button(g, menu);
+            ui::draw_icon(g, menu.reduced(12), ui::Icon::chevron, ui::text_dim);
         }
-        auto tags = name.withHeight(22);
-        ui::draw_pill(g, tags.removeFromLeft(70), "Live");
-        tags.removeFromLeft(6);
-        ui::draw_pill(g, tags.removeFromLeft(room.locked ? 76 : 70),
-                      room.locked ? "Locked" : "Open");
-
-        auto players = row.removeFromLeft(row_columns.players);
-        ui::draw_icon(g, players.removeFromLeft(26).reduced(3), ui::Icon::users,
-                      ui::text_dim);
-        ui::draw_label(g, players, juce::String(room.participant_count), 14.5f,
-                       ui::text);
-        ui::draw_label(g, row.removeFromLeft(row_columns.access),
-                       room.locked ? "Password" : "Open", 14.0f,
-                       room.locked ? ui::amber : ui::green);
-
-        auto join = row.withWidth(row_columns.join);
-        const auto menu_width = 44;
-        const auto join_gap = 8;
-        const auto button_width =
-            juce::jlimit(82, 112, join.getWidth() - menu_width - join_gap);
-        auto button = join.removeFromLeft(button_width).reduced(0, 13);
-        ui::fill_button(g, button, true);
-        ui::draw_label(g, button, "Join", 14.5f, ui::text, true,
-                       juce::Justification::centred);
-        join.removeFromLeft(join_gap);
-        auto menu = join.removeFromLeft(menu_width).reduced(0, 13);
-        ui::fill_button(g, menu);
-        ui::draw_icon(g, menu.reduced(12), ui::Icon::chevron, ui::text_dim);
     }
+    ui::draw_scrollbar(g, room_list_area_,
+                       static_cast<int>(visible.size()) * ROOM_ROW_HEIGHT,
+                       room_scroll_px_);
 
     auto bottom_area = bottom;
     constexpr int gap = 8;
@@ -1262,17 +1348,26 @@ void JuceRoomBrowserComponent::resized() {
     content.removeFromTop(CONTENT_GAP);
     auto bottom = content.removeFromBottom(BROWSER_BOTTOM_HEIGHT);
     content.removeFromBottom(CONTENT_GAP);
-    content.removeFromLeft(SERVER_RAIL_WIDTH);
+    auto left = content.removeFromLeft(SERVER_RAIL_WIDTH);
     content.removeFromLeft(CONTENT_GAP);
+
+    auto server_area = left.reduced(12, 12);
+    server_area.removeFromTop(42);
+    add_server_bottom_bounds_ = left.reduced(12, 18).removeFromBottom(42);
+    server_list_area_ = server_area.withBottom(
+        juce::jmax(server_area.getY(), add_server_bottom_bounds_.getY() - 8));
 
     auto room_area = content.reduced(12, 10);
     auto top = room_area.removeFromTop(42);
-    top.removeFromLeft(160);
+    top.removeFromLeft(130);
     top.removeFromRight(110);
     top.removeFromRight(10);
     auto search_container = top.removeFromRight(285).reduced(0, 2);
     search_editor_.setBounds(
         search_container.withTrimmedLeft(40).withTrimmedRight(10).reduced(0, 1));
+    room_area.removeFromTop(10);
+    room_area.removeFromTop(42);
+    room_list_area_ = room_area;
 
     constexpr int gap = 8;
     const int audio_width =
@@ -1304,6 +1399,7 @@ void JuceRoomBrowserComponent::resized() {
     set_combo(api, api_combo_);
     set_combo(input, input_combo_);
     set_combo(output, output_combo_);
+    clamp_scroll_offsets();
 }
 
 void JuceRoomBrowserComponent::mouseDown(const juce::MouseEvent& event) {
@@ -1325,22 +1421,14 @@ void JuceRoomBrowserComponent::mouseDown(const juce::MouseEvent& event) {
         return;
     }
 
-    auto content = getLocalBounds().reduced(CONTENT_PAD);
-    content.removeFromTop(BROWSER_HEADER_HEIGHT);
-    content.removeFromTop(CONTENT_GAP);
-    content.removeFromBottom(BROWSER_BOTTOM_HEIGHT);
-    content.removeFromBottom(CONTENT_GAP);
-    auto left = content.removeFromLeft(SERVER_RAIL_WIDTH);
-    auto server_area = left.reduced(12, 12);
-    server_area.removeFromTop(42);
-    for (int i = 0; i < static_cast<int>(servers_.size()); ++i) {
-        if (server_area.removeFromTop(70).contains(position)) {
-            selected_server_index_ = i;
-            selected_room_index_ = -1;
-            start_status_refresh(true);
-            repaint();
-            return;
-        }
+    const int server_index = server_row_at(position);
+    if (server_index >= 0) {
+        selected_server_index_ = server_index;
+        selected_room_index_ = -1;
+        room_scroll_px_ = 0;
+        start_status_refresh(true);
+        repaint();
+        return;
     }
 
     const int room_index = room_row_at(position);
@@ -1357,6 +1445,25 @@ void JuceRoomBrowserComponent::mouseDoubleClick(const juce::MouseEvent& event) {
     const int room_index = room_row_at(event.getPosition());
     if (room_index >= 0) {
         start_join_flow(room_index);
+    }
+}
+
+void JuceRoomBrowserComponent::mouseWheelMove(
+    const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) {
+    if (std::abs(wheel.deltaY) < 0.001f) {
+        return;
+    }
+    const int scroll_rows = wheel.deltaY < 0.0f ? 3 : -3;
+    if (server_list_area_.contains(event.getPosition())) {
+        server_scroll_px_ += scroll_rows * SERVER_ROW_HEIGHT;
+        clamp_scroll_offsets();
+        repaint();
+        return;
+    }
+    if (room_list_area_.contains(event.getPosition())) {
+        room_scroll_px_ += scroll_rows * ROOM_ROW_HEIGHT;
+        clamp_scroll_offsets();
+        repaint();
     }
 }
 
@@ -1394,31 +1501,56 @@ void JuceRoomBrowserComponent::start_status_refresh(bool manual) {
         result.server_index = server_index;
         result.server_address = server.address;
         result.server_port = server.port;
-        ServerStatusRequestHdr request{};
-        request.magic = CTRL_MAGIC;
-        request.type = CtrlHdr::Cmd::SERVER_STATUS_REQUEST;
-        request.request_id = request_id;
 
         try {
-            double rtt = 0.0;
-            const auto response =
-                send_control_request<ServerStatusRequestHdr, ServerStatusResponseHdr>(
-                    server.address, server.port, request,
-                    CtrlHdr::Cmd::SERVER_STATUS_RESPONSE, request_id, rtt);
-            result.status.ok = true;
-            result.status.round_trip_ms = rtt;
-            result.status.server_id = fixed_string(response.server_id);
-            result.status.total_rooms = response.total_rooms;
-            result.status.active_participants = response.active_participants;
-            result.status.truncated = response.truncated != 0;
-            result.status.token_auth_available = response.token_auth_available != 0;
-            for (uint8_t i = 0; i < response.room_count; ++i) {
-                BrowserRoom room;
-                room.room_id = fixed_string(response.rooms[i].room_id);
-                room.room_name = fixed_string(response.rooms[i].room_name);
-                room.participant_count = response.rooms[i].participant_count;
-                room.locked = (response.rooms[i].flags & ROOM_FLAG_LOCKED) != 0;
-                result.status.rooms.push_back(std::move(room));
+            uint16_t room_offset = 0;
+            for (int page = 0; page < ROOM_STATUS_PAGE_LIMIT; ++page) {
+                ServerStatusRequestHdr request{};
+                request.magic = CTRL_MAGIC;
+                request.type = CtrlHdr::Cmd::SERVER_STATUS_REQUEST;
+                request.request_id = request_id;
+                request.room_offset = room_offset;
+                request.room_limit =
+                    static_cast<uint8_t>(MAX_ROOM_STATUS_SUMMARIES);
+
+                double rtt = 0.0;
+                const auto response =
+                    send_control_request<ServerStatusRequestHdr, ServerStatusResponseHdr>(
+                        server.address, server.port, request,
+                        CtrlHdr::Cmd::SERVER_STATUS_RESPONSE, request_id, rtt);
+                result.status.ok = true;
+                result.status.round_trip_ms = rtt;
+                result.status.server_id = fixed_string(response.server_id);
+                result.status.total_rooms = response.total_rooms;
+                result.status.active_participants = response.active_participants;
+                result.status.truncated = response.truncated != 0;
+                result.status.token_auth_available =
+                    response.token_auth_available != 0;
+
+                for (uint8_t i = 0; i < response.room_count; ++i) {
+                    BrowserRoom room;
+                    room.room_id = fixed_string(response.rooms[i].room_id);
+                    room.room_name = fixed_string(response.rooms[i].room_name);
+                    room.participant_count = response.rooms[i].participant_count;
+                    room.locked =
+                        (response.rooms[i].flags & ROOM_FLAG_LOCKED) != 0;
+                    result.status.rooms.push_back(std::move(room));
+                }
+
+                const size_t next_offset =
+                    static_cast<size_t>(response.room_offset) + response.room_count;
+                if (response.room_count == 0 || response.truncated == 0 ||
+                    next_offset >= response.total_rooms) {
+                    result.status.truncated = false;
+                    break;
+                }
+                if (page + 1 == ROOM_STATUS_PAGE_LIMIT) {
+                    result.status.truncated = true;
+                    break;
+                }
+                room_offset = static_cast<uint16_t>(
+                    std::min<size_t>(next_offset,
+                                     std::numeric_limits<uint16_t>::max()));
             }
         } catch (const std::exception& e) {
             result.status.ok = false;
@@ -1849,11 +1981,21 @@ void JuceRoomBrowserComponent::apply_status(BrowserJobResult result) {
         server.last_refresh = std::chrono::steady_clock::now();
     }
     if (selected_status().ok) {
-        status_text_ = selected_status().rooms.empty() ? "No rooms on this server"
-                                                       : "Ready";
+        status_text_ =
+            selected_status().rooms.empty()
+                ? "No rooms on this server"
+                : selected_status().truncated
+                      ? "Showing " +
+                            juce::String(static_cast<int>(
+                                selected_status().rooms.size())) +
+                            " of " +
+                            juce::String(selected_status().total_rooms) +
+                            " rooms"
+                      : "Ready";
     } else {
         status_text_ = result.message.empty() ? "Server offline" : result.message;
     }
+    clamp_scroll_offsets();
     repaint();
 }
 
@@ -1917,11 +2059,48 @@ std::vector<int> JuceRoomBrowserComponent::visible_room_indices() const {
     return indices;
 }
 
+void JuceRoomBrowserComponent::clamp_scroll_offsets() {
+    const int visible_server_rows =
+        std::max(1, server_list_area_.getHeight() / SERVER_ROW_HEIGHT);
+    const int server_max_scroll =
+        std::max(0, (static_cast<int>(servers_.size()) - visible_server_rows) *
+                        SERVER_ROW_HEIGHT);
+    server_scroll_px_ = juce::jlimit(0, server_max_scroll, server_scroll_px_);
+
+    const auto visible = visible_room_indices();
+    const int visible_room_rows =
+        std::max(1, room_list_area_.getHeight() / ROOM_ROW_HEIGHT);
+    const int room_max_scroll =
+        std::max(0, (static_cast<int>(visible.size()) - visible_room_rows) *
+                        ROOM_ROW_HEIGHT);
+    room_scroll_px_ = juce::jlimit(0, room_max_scroll, room_scroll_px_);
+}
+
+int JuceRoomBrowserComponent::server_row_at(juce::Point<int> position) const {
+    if (!server_list_area_.contains(position)) {
+        return -1;
+    }
+    const int visible_height =
+        (server_list_area_.getHeight() / SERVER_ROW_HEIGHT) * SERVER_ROW_HEIGHT;
+    const int local_y = position.y - server_list_area_.getY();
+    if (local_y < 0 || local_y >= visible_height) {
+        return -1;
+    }
+    const int index = (local_y + server_scroll_px_) / SERVER_ROW_HEIGHT;
+    return index >= 0 && index < static_cast<int>(servers_.size()) ? index : -1;
+}
+
 int JuceRoomBrowserComponent::room_row_at(juce::Point<int> position) const {
     if (!room_list_area_.contains(position)) {
         return -1;
     }
-    const int visible_position = (position.y - room_list_area_.getY()) / 66;
+    const int visible_height =
+        (room_list_area_.getHeight() / ROOM_ROW_HEIGHT) * ROOM_ROW_HEIGHT;
+    const int local_y = position.y - room_list_area_.getY();
+    if (local_y < 0 || local_y >= visible_height) {
+        return -1;
+    }
+    const int visible_position = (local_y + room_scroll_px_) / ROOM_ROW_HEIGHT;
     const auto visible = visible_room_indices();
     if (visible_position < 0 ||
         visible_position >= static_cast<int>(visible.size())) {
@@ -1934,14 +2113,22 @@ bool JuceRoomBrowserComponent::join_button_at(juce::Point<int> position) const {
     if (!room_list_area_.contains(position)) {
         return false;
     }
-    const int visible_position = (position.y - room_list_area_.getY()) / 66;
+    const int visible_height =
+        (room_list_area_.getHeight() / ROOM_ROW_HEIGHT) * ROOM_ROW_HEIGHT;
+    const int local_y = position.y - room_list_area_.getY();
+    if (local_y < 0 || local_y >= visible_height) {
+        return false;
+    }
+    const int visible_position = (local_y + room_scroll_px_) / ROOM_ROW_HEIGHT;
     const auto visible = visible_room_indices();
     if (visible_position < 0 ||
         visible_position >= static_cast<int>(visible.size())) {
         return false;
     }
-    auto row = room_list_area_.withY(room_list_area_.getY() + visible_position * 66)
-                   .withHeight(66)
+    auto row = room_list_area_.withY(
+                       room_list_area_.getY() +
+                       visible_position * ROOM_ROW_HEIGHT - room_scroll_px_)
+                   .withHeight(ROOM_ROW_HEIGHT)
                    .reduced(0, 3)
                    .reduced(20, 0);
     const auto columns = room_columns(row.getWidth());

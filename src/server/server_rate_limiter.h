@@ -60,7 +60,7 @@ public:
     }
 
     bool allow_status(const endpoint& ep, time_point now) {
-        return status_[ep].allow(now, 0.1, 2.0);
+        return status_[ep].allow(now, 0.8, 8.0);
     }
 
     bool allow_room_control(const endpoint& ep, time_point now) {

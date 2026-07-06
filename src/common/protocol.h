@@ -181,6 +181,9 @@ struct RoomSummaryWire {
 
 struct ServerStatusRequestHdr : CtrlHdr {
     uint32_t request_id = 0;
+    uint16_t room_offset = 0;
+    uint8_t  room_limit = static_cast<uint8_t>(MAX_ROOM_STATUS_SUMMARIES);
+    uint8_t  reserved = 0;
 };
 
 struct ServerStatusResponseHdr : CtrlHdr {
@@ -188,6 +191,7 @@ struct ServerStatusResponseHdr : CtrlHdr {
     Bytes<64> server_id;
     uint16_t total_rooms = 0;
     uint16_t active_participants = 0;
+    uint16_t room_offset = 0;
     uint8_t  room_count = 0;
     uint8_t  truncated = 0;
     uint8_t  token_auth_available = 0;

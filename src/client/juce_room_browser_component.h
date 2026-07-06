@@ -34,6 +34,8 @@ public:
     void resized() override;
     void mouseDown(const juce::MouseEvent& event) override;
     void mouseDoubleClick(const juce::MouseEvent& event) override;
+    void mouseWheelMove(const juce::MouseEvent& event,
+                        const juce::MouseWheelDetails& wheel) override;
 
 private:
     class MonitorToggleButton final : public juce::Button {
@@ -144,6 +146,8 @@ private:
     BrowserServer selected_server() const;
     const ServerStatus& selected_status() const;
     std::vector<int> visible_room_indices() const;
+    void clamp_scroll_offsets();
+    int server_row_at(juce::Point<int> position) const;
     int room_row_at(juce::Point<int> position) const;
     bool join_button_at(juce::Point<int> position) const;
     void select_room(int room_index);
@@ -182,7 +186,10 @@ private:
     juce::Rectangle<int> edit_servers_button_bounds_;
     juce::Rectangle<int> add_server_bottom_bounds_;
     juce::Rectangle<int> create_button_bounds_;
+    juce::Rectangle<int> server_list_area_;
     juce::Rectangle<int> room_list_area_;
+    int server_scroll_px_ = 0;
+    int room_scroll_px_ = 0;
     std::unique_ptr<juce::AlertWindow> active_dialog_;
 
     std::mutex job_mutex_;

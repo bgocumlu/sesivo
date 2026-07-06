@@ -28,9 +28,11 @@ constexpr int row_height = 28;
 
 juce::Font font(float size, bool bold = false);
 void paint_panel(juce::Graphics& g, juce::Rectangle<int> bounds);
+void draw_wordmark(juce::Graphics& g, juce::Rectangle<int> bounds,
+                   float size = 27.0F);
 void style_label(juce::Label& label, juce::Colour text_colour, float size,
                  bool bold = false);
-void style_editor(juce::TextEditor& editor);
+void style_editor(juce::TextEditor& editor, float size = 13.0F);
 
 class LookAndFeel final : public juce::LookAndFeel_V4 {
 public:

@@ -88,6 +88,7 @@ struct CtrlHdr : MsgHdr {
         ROOM_JOIN_TOKEN_RESPONSE = 16,
         ROOM_ADMIN_REQUEST = 17, // Change password, kick participant, close room
         ROOM_ADMIN_RESPONSE = 18,
+        ROOM_REMOVED = 19, // Server tells this client it was removed from the room
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };

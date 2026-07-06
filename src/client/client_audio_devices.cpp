@@ -6,6 +6,7 @@
 #include <fstream>
 #include <system_error>
 
+#include <juce_core/juce_core.h>
 #include <spdlog/spdlog.h>
 
 namespace {
@@ -27,49 +28,83 @@ bool matches_audio_api(const AudioStream::DeviceInfo& device, const std::string&
     return api_name.empty() || api_name == "All" || device.api_name == api_name;
 }
 
+juce::var empty_config_object() {
+    return juce::var(new juce::DynamicObject());
+}
+
+juce::var read_config_root(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return empty_config_object();
+    }
+
+    const juce::File file{path.string()};
+    if (!file.existsAsFile()) {
+        return empty_config_object();
+    }
+
+    auto root = juce::JSON::parse(file);
+    return root.isObject() ? root : empty_config_object();
+}
+
+juce::DynamicObject* root_object(juce::var& root) {
+    if (!root.isObject()) {
+        root = empty_config_object();
+    }
+    return root.getDynamicObject();
+}
+
+std::string string_property(juce::DynamicObject& object, const char* key) {
+    return object.getProperty(key).toString().toStdString();
+}
+
+bool write_config_root(const std::filesystem::path& path, const juce::var& root) {
+    if (path.empty()) {
+        return false;
+    }
+
+    std::error_code create_error;
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), create_error);
+    }
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        spdlog::warn("Could not write client config: {}", path.string());
+        return false;
+    }
+
+    output << juce::JSON::toString(root, false).toStdString() << '\n';
+    return true;
+}
+
 }  // namespace
 
 AudioDevicePreferences load_audio_device_preferences(const std::filesystem::path& path) {
     AudioDevicePreferences preferences;
-    std::ifstream input(path);
-    if (!input) {
+    auto root = read_config_root(path);
+    const auto* root_obj = root.getDynamicObject();
+    if (root_obj == nullptr) {
         return preferences;
     }
 
-    preferences.loaded = true;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (line.size() > 4096 || line.find('\0') != std::string::npos) {
-            continue;
-        }
-        line = trim_copy(line);
-        if (line.empty() || line.front() == '#' || line.front() == ';') {
-            continue;
-        }
-        const auto equals = line.find('=');
-        if (equals == std::string::npos) {
-            continue;
-        }
-        const std::string key = trim_copy(line.substr(0, equals));
-        const std::string value = trim_copy(line.substr(equals + 1));
-        if (key == "audio_api") {
-            preferences.audio_api = value.empty() ? "All" : value;
-        } else if (key == "input_device") {
-            preferences.input_device = value;
-        } else if (key == "input_api") {
-            preferences.input_api = value;
-        } else if (key == "input_channel") {
-            try {
-                preferences.input_channel_index = std::max(0, std::stoi(value));
-            } catch (const std::exception&) {
-                preferences.input_channel_index.reset();
-            }
-        } else if (key == "output_device") {
-            preferences.output_device = value;
-        } else if (key == "output_api") {
-            preferences.output_api = value;
-        }
+    const auto audio_value = root_obj->getProperty("audio");
+    auto* audio = audio_value.getDynamicObject();
+    if (audio == nullptr) {
+        return preferences;
     }
+    preferences.loaded = true;
+    preferences.audio_api = string_property(*audio, "api");
+    if (preferences.audio_api.empty()) {
+        preferences.audio_api = "All";
+    }
+    preferences.input_device = string_property(*audio, "inputDevice");
+    preferences.input_api = string_property(*audio, "inputApi");
+    const auto input_channel = audio->getProperty("inputChannel");
+    if (!input_channel.isVoid()) {
+        preferences.input_channel_index = std::max(0, static_cast<int>(input_channel));
+    }
+    preferences.output_device = string_property(*audio, "outputDevice");
+    preferences.output_api = string_property(*audio, "outputApi");
     return preferences;
 }
 
@@ -83,34 +118,90 @@ bool save_audio_device_preferences(const std::filesystem::path& path,
     }
 
     const auto* input_info = AudioStream::get_device_info(input_device);
-    if (input_info == nullptr) {
+    if (input_info == nullptr || input_info->max_input_channels <= 0) {
         return false;
     }
 
     const auto* output_info = AudioStream::get_device_info(output_device);
-    if (output_info == nullptr) {
+    if (output_info == nullptr || output_info->max_output_channels <= 0) {
         return false;
     }
 
-    std::error_code create_error;
-    if (path.has_parent_path()) {
-        std::filesystem::create_directories(path.parent_path(), create_error);
+    auto root = read_config_root(path);
+    auto* object = root_object(root);
+
+    auto* audio = new juce::DynamicObject();
+    audio->setProperty("api", juce::String(audio_api.empty() ? "All" : audio_api));
+    audio->setProperty("inputDevice", juce::String(input_info->name));
+    audio->setProperty("inputApi", juce::String(input_info->api_name));
+    audio->setProperty("inputChannel", input_channel_index);
+    audio->setProperty("outputDevice", juce::String(output_info->name));
+    audio->setProperty("outputApi", juce::String(output_info->api_name));
+    object->setProperty("audio", juce::var(audio));
+
+    const bool saved = write_config_root(path, root);
+    if (saved) {
+        spdlog::info("Saved audio device preferences: {}", path.string());
+    }
+    return saved;
+}
+
+std::vector<SavedRoomServer> load_saved_room_servers(const std::filesystem::path& path) {
+    std::vector<SavedRoomServer> result;
+    auto root = read_config_root(path);
+    const auto* root_obj = root.getDynamicObject();
+    if (root_obj == nullptr) {
+        return result;
     }
 
-    std::ofstream output(path, std::ios::trunc);
-    if (!output) {
-        spdlog::warn("Could not write audio device preferences: {}", path.string());
-        return false;
+    const auto servers_value = root_obj->getProperty("servers");
+    const auto* servers = servers_value.getArray();
+    if (servers == nullptr) {
+        return result;
     }
 
-    output << "audio_api=" << (audio_api.empty() ? "All" : audio_api) << '\n'
-           << "input_device=" << input_info->name << '\n'
-           << "input_api=" << input_info->api_name << '\n'
-           << "input_channel=" << input_channel_index << '\n'
-           << "output_device=" << output_info->name << '\n'
-           << "output_api=" << output_info->api_name << '\n';
-    spdlog::info("Saved audio device preferences: {}", path.string());
-    return true;
+    for (const auto& server_value: *servers) {
+        auto* server_object = server_value.getDynamicObject();
+        if (server_object == nullptr) {
+            continue;
+        }
+        SavedRoomServer server;
+        server.name = trim_copy(string_property(*server_object, "name"));
+        server.address = trim_copy(string_property(*server_object, "address"));
+        const int port = static_cast<int>(server_object->getProperty("port"));
+        if (server.address.empty() || port <= 0 || port > 65535) {
+            continue;
+        }
+        server.port = static_cast<uint16_t>(port);
+        result.push_back(std::move(server));
+    }
+    return result;
+}
+
+bool save_saved_room_servers(const std::filesystem::path& path,
+                             const std::vector<SavedRoomServer>& servers) {
+    auto root = read_config_root(path);
+    auto* object = root_object(root);
+
+    juce::Array<juce::var> server_values;
+    for (const auto& server: servers) {
+        const auto address = trim_copy(server.address);
+        if (address.empty() || server.port == 0) {
+            continue;
+        }
+        auto* server_object = new juce::DynamicObject();
+        server_object->setProperty("name", juce::String(trim_copy(server.name)));
+        server_object->setProperty("address", juce::String(address));
+        server_object->setProperty("port", static_cast<int>(server.port));
+        server_values.add(juce::var(server_object));
+    }
+    object->setProperty("servers", juce::var(server_values));
+
+    const bool saved = write_config_root(path, root);
+    if (saved) {
+        spdlog::info("Saved room browser servers: {}", path.string());
+    }
+    return saved;
 }
 
 AudioStream::DeviceIndex find_preferred_audio_device(

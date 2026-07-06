@@ -26,6 +26,7 @@ public:
     const std::string& join_token() const;
     bool has_join_token() const;
 
+    void configure(PerformerJoinOptions options);
     JoinHdr make_join_header() const;
 
     void reset();

@@ -76,7 +76,13 @@ public:
     virtual void reset_audio_path() = 0;
 
     virtual void start_connection(const std::string& server_address, uint16_t server_port) = 0;
+    virtual void stop_connection() = 0;
+    virtual void join_room(const std::string& server_address, uint16_t server_port,
+                           const std::string& room_id, const std::string& profile_id,
+                           const std::string& display_name,
+                           const std::string& join_token) = 0;
     virtual bool is_join_confirmed() const = 0;
+    virtual bool consume_room_removed_by_server() = 0;
     virtual std::string get_server_address() const = 0;
     virtual unsigned short get_server_port() const = 0;
     virtual std::string get_room_id() const = 0;

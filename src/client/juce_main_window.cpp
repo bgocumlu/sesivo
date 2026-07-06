@@ -1,7 +1,7 @@
 #include "juce_main_window.h"
 
 #include "client_app_facade.h"
-#include "juce_mixer_component.h"
+#include "juce_root_component.h"
 
 #include <utility>
 
@@ -16,7 +16,7 @@ JuceMainWindow::JuceMainWindow(const juce::String& title, ClientAppFacade& clien
     setUsingNativeTitleBar(true);
     setResizable(true, true);
     setResizeLimits(1240, 700, 2400, 1600);
-    setContentOwned(new JuceMixerComponent(client, std::move(startup_options)), true);
+    setContentOwned(new JuceRootComponent(client, std::move(startup_options)), true);
     centreWithSize(1450, 820);
     setVisible(true);
 }

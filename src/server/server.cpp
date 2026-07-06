@@ -686,6 +686,7 @@ private:
             return false;
         }
 
+        send_room_removed(removed->first, removed->second.client_id);
         release_token_nonce_for_client(removed->second);
         rate_limiter_.erase(removed->first);
         broadcast_participant_leave(removed->second.client_id);
@@ -697,6 +698,7 @@ private:
                                       std::chrono::steady_clock::time_point now) {
         const auto removed = client_manager_.remove_room_clients_with_info(room_id);
         for (const auto& [endpoint, info]: removed) {
+            send_room_removed(endpoint, info.client_id);
             release_token_nonce_for_client(info);
             rate_limiter_.erase(endpoint);
             broadcast_participant_leave(info.client_id);
@@ -1264,6 +1266,16 @@ private:
         required.magic = CTRL_MAGIC;
         required.type = CtrlHdr::Cmd::JOIN_REQUIRED;
         std::memcpy(buf->data(), &required, sizeof(CtrlHdr));
+        send(buf->data(), buf->size(), endpoint, buf);
+    }
+
+    void send_room_removed(const udp::endpoint& endpoint, uint32_t participant_id) {
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(CtrlHdr));
+        CtrlHdr removed{};
+        removed.magic = CTRL_MAGIC;
+        removed.type = CtrlHdr::Cmd::ROOM_REMOVED;
+        removed.participant_id = participant_id;
+        std::memcpy(buf->data(), &removed, sizeof(CtrlHdr));
         send(buf->data(), buf->size(), endpoint, buf);
     }
 

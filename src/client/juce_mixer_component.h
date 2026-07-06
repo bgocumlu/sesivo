@@ -8,7 +8,9 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -18,7 +20,8 @@
 class JuceMixerComponent final : public juce::Component, private juce::Timer {
 public:
     JuceMixerComponent(ClientAppFacade& client,
-                       JuceClientStartupOptions startup_options);
+                       JuceClientStartupOptions startup_options,
+                       std::function<void()> leave_callback = {});
     ~JuceMixerComponent() override;
 
     void paint(juce::Graphics& g) override;
@@ -42,6 +45,15 @@ private:
     struct ConnectionResult {
         juce::String status;
         bool started = false;
+    };
+    struct RoomAdminResult {
+        juce::String status;
+        bool ok = false;
+        bool closed = false;
+    };
+    struct AdminParticipantChoice {
+        uint32_t id = 0;
+        juce::String label;
     };
 
     void timerCallback() override;
@@ -69,19 +81,36 @@ private:
     void commit_metronome_bpm();
     void load_wav_file();
     void load_wav_path(const juce::File& file);
+    void refresh_room_admin_controls(const std::vector<ParticipantInfo>& participants);
+    void request_room_password_change(bool clear_password);
+    void request_room_kick();
+    void request_room_close();
+    void start_room_admin_job(uint8_t command, uint32_t target_participant_id,
+                              std::string password_hash, bool closes_room);
+    RoomAdminResult run_room_admin_command(uint8_t command,
+                                           uint32_t target_participant_id,
+                                           const std::string& password_hash,
+                                           bool closes_room);
+    void poll_room_admin_job();
+    void apply_room_admin_result(RoomAdminResult result);
     void apply_selected_api_to_pending_devices(int old_api_index);
+    void leave_room();
 
     juce::String selected_api_name() const;
     int api_index_for_name(const std::string& api_name) const;
     int max_input_channels_for(AudioStream::DeviceIndex device_index) const;
     AudioStream::DeviceIndex selected_input_device() const;
     AudioStream::DeviceIndex selected_output_device() const;
+    bool has_room_admin() const;
+    std::string password_hash(const std::string& password) const;
     bool has_pending_audio_changes() const;
     bool pending_stream_restart_needed() const;
     void set_device_status(const juce::String& text);
+    void set_room_admin_status(const juce::String& text);
 
     ClientAppFacade& client_;
     JuceClientStartupOptions startup_options_;
+    std::function<void()> leave_callback_;
     bool updating_from_client_ = false;
     bool device_controls_loaded_ = false;
     bool startup_device_refresh_started_ = false;
@@ -90,22 +119,30 @@ private:
     bool startup_connection_started_ = false;
     bool connection_job_running_ = false;
     bool connection_job_finished_ = false;
+    bool room_admin_job_running_ = false;
+    bool room_admin_job_finished_ = false;
     int device_load_delay_ticks_ = 2;
     int connection_delay_ticks_ = 1;
     double last_participant_refresh_ms_ = 0.0;
     juce::String connection_status_ = "Connection will start after the window opens...";
+    juce::String room_admin_status_ = "Creator controls";
+    std::atomic<uint32_t> room_admin_request_id_{1};
     std::mutex device_job_mutex_;
     std::thread device_job_thread_;
     std::optional<AudioDeviceRefreshResult> device_job_result_;
     std::mutex connection_job_mutex_;
     std::thread connection_job_thread_;
     std::optional<ConnectionResult> connection_job_result_;
+    std::mutex room_admin_job_mutex_;
+    std::thread room_admin_job_thread_;
+    std::optional<RoomAdminResult> room_admin_job_result_;
     std::unique_ptr<juce::FileChooser> wav_file_chooser_;
     juce::File last_wav_file_;
 
     std::vector<AudioStream::DeviceInfo> input_devices_;
     std::vector<AudioStream::DeviceInfo> output_devices_;
     std::vector<AudioStream::ApiInfo> available_apis_;
+    std::vector<AdminParticipantChoice> admin_participant_choices_;
 
     int selected_api_index_ = -1;
     AudioStream::DeviceIndex pending_input_ = AudioStream::NO_DEVICE;
@@ -122,6 +159,8 @@ private:
     juce::Label metronome_label_;
     juce::Label recording_label_;
     juce::Label wav_label_;
+    juce::Label room_admin_label_;
+    juce::Label room_admin_status_label_;
     juce::Label input_gain_label_;
     juce::Label packet_label_;
     juce::Label jitter_label_;
@@ -133,6 +172,13 @@ private:
 
     JuceStatusBarComponent status_bar_;
     JuceParticipantListComponent participants_component_;
+    juce::TextButton leave_button_;
+    juce::TextEditor room_password_editor_;
+    juce::TextButton room_set_password_button_;
+    juce::TextButton room_open_button_;
+    juce::ComboBox room_kick_combo_;
+    juce::TextButton room_kick_button_;
+    juce::TextButton room_close_button_;
 
     juce::TextButton mic_mute_button_;
     juce::ToggleButton monitor_toggle_;

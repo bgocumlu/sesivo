@@ -132,6 +132,32 @@ public:
         future.get();
     }
 
+    void join_room(const std::string& server_address, uint16_t server_port,
+                   const std::string& room_id, const std::string& profile_id,
+                   const std::string& display_name, const std::string& join_token) {
+        PerformerJoinOptions options;
+        options.room_id = room_id;
+        options.room_handle = room_id;
+        options.user_id = profile_id;
+        options.display_name = display_name;
+        options.join_token = join_token;
+
+        auto started = std::make_shared<std::promise<void>>();
+        auto future = started->get_future();
+        asio::post(io_context_, [this, server_address, server_port,
+                                 options = std::move(options), started]() mutable {
+            try {
+                join_session_.configure(std::move(options));
+                participant_manager_.clear();
+                start_connection_on_io_context(server_address, server_port);
+                started->set_value();
+            } catch (...) {
+                started->set_exception(std::current_exception());
+            }
+        });
+        future.get();
+    }
+
     void start_connection_on_io_context(const std::string& server_address,
                                         uint16_t server_port) {
         spdlog::info("Connecting to {}:{}...", server_address, server_port);
@@ -224,32 +250,50 @@ public:
         session_key_ = *derived;
     }
 
-    // Stop connection (stops sending/receiving UDP packets)
-    void stop_connection() {
-        const auto target = current_server_endpoint();
-        if (target.port() == 0) {
-            spdlog::info("Disconnect skipped; no server connection was started");
-            return;
+    void clear_room_session_state() {
+        join_session_.configure({});
+        participant_manager_.clear();
+        reset_session_security();
+        reset_server_clock_and_ping_state();
+        audio_path_interval_received_.store(0, std::memory_order_relaxed);
+        audio_path_interval_sequence_gaps_.store(0, std::memory_order_relaxed);
+        audio_path_interval_gaps_.store(0, std::memory_order_relaxed);
+        request_recent_opus_audio_packets_reset();
+        OpusSendFrame discarded_opus;
+        while (opus_send_queue_.try_dequeue(discarded_opus)) {
         }
+        opus_tx_accumulator_reset_requested_.store(true, std::memory_order_release);
+    }
 
-        spdlog::info("Disconnecting from server...");
+    void clear_server_endpoint() {
+        std::lock_guard<std::mutex> lock(server_endpoint_mutex_);
+        server_endpoint_ = {};
+        outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
+    }
 
-        // Stop receive scheduling before touching the socket from the caller thread.
+    void disconnect_from_server(bool notify_server) {
+        const auto target = current_server_endpoint();
+        spdlog::info(target.port() == 0 ? "Clearing disconnected room state..."
+                                        : "Disconnecting from server...");
+
         receiving_enabled_.store(false, std::memory_order_release);
         receive_generation_.fetch_add(1, std::memory_order_acq_rel);
         outbound_enabled_.store(false, std::memory_order_release);
         outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
 
-        // Send LEAVE message
-        CtrlHdr chdr{};
-        chdr.magic = CTRL_MAGIC;
-        chdr.type  = CtrlHdr::Cmd::LEAVE;
         std::error_code leave_error;
         std::error_code cancel_error;
         {
             std::lock_guard<std::mutex> lock(socket_mutex_);
-            socket_.send_to(asio::buffer(&chdr, sizeof(CtrlHdr)), target, 0, leave_error);
+            if (notify_server && target.port() != 0) {
+                CtrlHdr chdr{};
+                chdr.magic = CTRL_MAGIC;
+                chdr.type  = CtrlHdr::Cmd::LEAVE;
+                socket_.send_to(asio::buffer(&chdr, sizeof(CtrlHdr)), target, 0,
+                                leave_error);
+            }
             socket_.cancel(cancel_error);
+            socket_qos_.reset();
         }
         if (leave_error) {
             spdlog::warn("LEAVE send failed: {}", leave_error.message());
@@ -258,7 +302,19 @@ public:
             spdlog::warn("socket cancel failed: {}", cancel_error.message());
         }
 
-        spdlog::info("Disconnected (no longer sending/receiving)");
+        clear_server_endpoint();
+        clear_room_session_state();
+
+        spdlog::info("Disconnected (room session cleared)");
+    }
+
+    // Stop connection (stops sending/receiving UDP packets)
+    void stop_connection() {
+        disconnect_from_server(true);
+    }
+
+    bool consume_room_removed_by_server() {
+        return room_removed_by_server_.exchange(false, std::memory_order_acq_rel);
     }
 
     bool start_audio_stream(AudioStream::DeviceIndex input_device,
@@ -1071,37 +1127,31 @@ public:
     }
 
     bool set_input_device(AudioStream::DeviceIndex device_index) {
-        if (!AudioStream::is_device_valid(device_index)) {
+        const auto* input_info = AudioStream::get_device_info(device_index);
+        if (input_info == nullptr || input_info->max_input_channels <= 0) {
             spdlog::error("Invalid input device index: {}", device_index);
             return false;
         }
         audio_state_.set_selected_input_device(device_index);
 
-        // Update device info for UI display
-        const auto* input_info = AudioStream::get_device_info(device_index);
-        if (input_info != nullptr) {
-            auto config = get_audio_config();
-            const int input_channel_count = std::max(input_info->max_input_channels, 1);
-            config.input_channel_index =
-                std::clamp(config.input_channel_index, 0, input_channel_count - 1);
-            publish_audio_config(config);
-            audio_state_.set_input_device_info(*input_info, config.input_channel_index);
-        }
+        auto config = get_audio_config();
+        const int input_channel_count = std::max(input_info->max_input_channels, 1);
+        config.input_channel_index =
+            std::clamp(config.input_channel_index, 0, input_channel_count - 1);
+        publish_audio_config(config);
+        audio_state_.set_input_device_info(*input_info, config.input_channel_index);
         return true;
     }
 
     bool set_output_device(AudioStream::DeviceIndex device_index) {
-        if (!AudioStream::is_device_valid(device_index)) {
+        const auto* output_info = AudioStream::get_device_info(device_index);
+        if (output_info == nullptr || output_info->max_output_channels <= 0) {
             spdlog::error("Invalid output device index: {}", device_index);
             return false;
         }
         audio_state_.set_selected_output_device(device_index);
 
-        // Update device info for UI display
-        const auto* output_info = AudioStream::get_device_info(device_index);
-        if (output_info != nullptr) {
-            audio_state_.set_output_device_info(*output_info);
-        }
+        audio_state_.set_output_device_info(*output_info);
         return true;
     }
 
@@ -1115,9 +1165,9 @@ public:
             stop_audio_stream();
         }
 
-        // Update selected devices
-        audio_state_.set_selected_input_device(input_device);
-        audio_state_.set_selected_output_device(output_device);
+        if (!set_input_device(input_device) || !set_output_device(output_device)) {
+            return false;
+        }
 
         // Start new stream if it was active before
         if (was_active) {
@@ -2732,6 +2782,11 @@ private:
     }
 
     void ping_timer_callback() {
+        if (!outbound_enabled_.load(std::memory_order_acquire) ||
+            current_server_endpoint().port() == 0 ||
+            !join_session_.is_join_confirmed()) {
+            return;
+        }
         SyncHdr         shdr{};
         shdr.magic = PING_MAGIC;
         shdr.seq   = ping_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
@@ -2745,6 +2800,10 @@ private:
     }
 
     void alive_timer_callback() {
+        if (!outbound_enabled_.load(std::memory_order_acquire) ||
+            current_server_endpoint().port() == 0) {
+            return;
+        }
         if (!join_session_.is_join_confirmed()) {
             send_join();
             log_audio_diagnostics();
@@ -2761,7 +2820,8 @@ private:
     }
 
     void join_retry_timer_callback() {
-        if (current_server_endpoint().port() == 0) {
+        if (!outbound_enabled_.load(std::memory_order_acquire) ||
+            current_server_endpoint().port() == 0) {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -2987,6 +3047,13 @@ private:
                 request_recent_opus_audio_packets_reset();
                 spdlog::warn("Server requested JOIN refresh; resending JOIN");
                 send_join();
+                break;
+            }
+            case CtrlHdr::Cmd::ROOM_REMOVED: {
+                spdlog::warn("Server removed this client from room '{}'",
+                             join_session_.room_id());
+                room_removed_by_server_.store(true, std::memory_order_release);
+                disconnect_from_server(false);
                 break;
             }
             case CtrlHdr::Cmd::AUDIO_PATH_STATS: {
@@ -3944,6 +4011,15 @@ private:
             }
         }
 
+        if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
+            const float input_gain = client->audio_state_.input_gain();
+            const float rms =
+                audio_analysis::calculate_rms(input_buffer, frame_count) * input_gain;
+            client->own_audio_level_.store(std::clamp(rms, 0.0F, 1.0F));
+        } else if (!client->join_session_.can_send_audio()) {
+            client->own_audio_level_.store(0.0F);
+        }
+
         if (client->self_monitor_enabled_.load(std::memory_order_acquire) &&
             input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
             const float input_gain = client->audio_state_.input_gain();
@@ -4049,6 +4125,7 @@ private:
     std::atomic<uint64_t>                     receive_generation_{0};
     std::atomic<bool>                         outbound_enabled_{false};
     std::atomic<uint64_t>                     outbound_generation_{0};
+    std::atomic<bool>                         room_removed_by_server_{false};
     std::atomic<int64_t>                      opus_send_queue_age_last_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_avg_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_max_ns_{0};
@@ -4166,8 +4243,24 @@ public:
         client_.start_connection(server_address, server_port);
     }
 
+    void stop_connection() override {
+        client_.stop_connection();
+    }
+
+    void join_room(const std::string& server_address, uint16_t server_port,
+                   const std::string& room_id, const std::string& profile_id,
+                   const std::string& display_name,
+                   const std::string& join_token) override {
+        client_.join_room(server_address, server_port, room_id, profile_id,
+                          display_name, join_token);
+    }
+
     bool is_join_confirmed() const override {
         return client_.is_join_confirmed();
+    }
+
+    bool consume_room_removed_by_server() override {
+        return client_.consume_room_removed_by_server();
     }
 
     std::string get_server_address() const override {

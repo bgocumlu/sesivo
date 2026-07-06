@@ -78,13 +78,13 @@ int main(int argc, char** argv) {
             return result;
         }
         asio::io_context io_context;
-        const auto audio_preferences_path =
+        const auto config_path =
             client_config_path(argv[0], startup_options.config_dir);
         const auto audio_preferences =
-            load_audio_device_preferences(audio_preferences_path);
+            load_audio_device_preferences(config_path);
 
         ClientRuntime client_runtime(io_context, startup_options.performer_join,
-                                     audio_preferences_path, audio_preferences);
+                                     config_path, audio_preferences);
         ClientAppFacade& client_app = client_runtime.app_facade();
 
         if (startup_options.requested_frames > 0) {
@@ -150,11 +150,15 @@ int main(int argc, char** argv) {
                 : "Jam " + startup_options.app_version;
         JuceClientStartupOptions gui_startup_options;
         gui_startup_options.audio_preferences = audio_preferences;
+        gui_startup_options.config_path = config_path;
         gui_startup_options.required_audio_api = startup_options.required_audio_api;
         gui_startup_options.startup_input_channel_index =
             startup_options.startup_input_channel_index;
         gui_startup_options.server_address = startup_options.server_address;
         gui_startup_options.server_port = startup_options.server_port;
+        gui_startup_options.auto_connect =
+            !startup_options.performer_join.room_id.empty() &&
+            !startup_options.performer_join.user_id.empty();
         run_juce_client_app(client_app, window_title, std::move(gui_startup_options),
                             [&io_context]() { io_context.stop(); });
 

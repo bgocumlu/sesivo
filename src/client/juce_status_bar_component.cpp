@@ -37,13 +37,6 @@ void draw_metric(juce::Graphics& g, juce::Rectangle<int> bounds,
     g.drawFittedText(value, text, juce::Justification::centredLeft, 1);
 }
 
-void draw_status_dot(juce::Graphics& g, juce::Point<float> centre,
-                     juce::Colour colour) {
-    g.setColour(colour.withAlpha(0.22F));
-    g.fillEllipse(centre.x - 6.0F, centre.y - 6.0F, 12.0F, 12.0F);
-    g.setColour(colour);
-    g.fillEllipse(centre.x - 3.5F, centre.y - 3.5F, 7.0F, 7.0F);
-}
 }  // namespace
 
 JuceStatusBarComponent::JuceStatusBarComponent() { setOpaque(false); }
@@ -52,7 +45,6 @@ void JuceStatusBarComponent::refresh(
     const ClientAppFacade& client, const JuceClientStartupOptions& startup_options,
     const juce::String& connection_status) {
     const auto participants = client.get_participant_info();
-    const auto device_info = client.get_device_info();
     const auto connected_port = client.get_server_port();
     const juce::String server_text =
         connected_port == 0
@@ -77,12 +69,6 @@ void JuceStatusBarComponent::refresh(
     rx_text_ = format_bytes(client.get_total_bytes_rx());
     tx_text_ = format_bytes(client.get_total_bytes_tx());
     joined_ = joined;
-    audio_running_ = client.is_audio_stream_active();
-    audio_text_ = audio_running_ ? "Audio running" : "Audio stopped";
-    device_text_ = juce::String(device_info.input_api) + "  In " +
-                   juce::String(device_info.input_device_name) + " ch " +
-                   juce::String(device_info.input_channel_index + 1) + "  Out " +
-                   juce::String(device_info.output_device_name);
 
     repaint();
 }
@@ -93,12 +79,7 @@ void JuceStatusBarComponent::paint(juce::Graphics& g) {
 
     auto area = bounds.reduced(18, 0);
     auto brand = area.removeFromLeft(126);
-    juce::AttributedString logo;
-    logo.setJustification(juce::Justification::centredLeft);
-    const auto logo_font = juce_theme::font(27.0F, true);
-    logo.append("ses", logo_font, juce_theme::colour::text());
-    logo.append("ivo", logo_font, juce_theme::colour::accent_hi());
-    logo.draw(g, brand.reduced(0, 12).toFloat());
+    juce_theme::draw_wordmark(g, brand.reduced(0, 12), 27.0F);
 
     draw_metric(g, area.removeFromLeft(170), "Room", room_text_);
     draw_metric(g, area.removeFromLeft(174), "State", state_text_,
@@ -109,21 +90,6 @@ void JuceStatusBarComponent::paint(juce::Graphics& g) {
     draw_metric(g, area.removeFromLeft(112), "RTT", rtt_text_);
     draw_metric(g, area.removeFromLeft(116), "RX", rx_text_);
     draw_metric(g, area.removeFromLeft(116), "TX", tx_text_);
-
-    auto device_area = area.reduced(18, 8);
-    draw_status_dot(g, {static_cast<float>(device_area.getX() + 5),
-                        static_cast<float>(device_area.getY() + 12)},
-                    audio_running_ ? juce_theme::colour::success()
-                                   : juce_theme::colour::text_faint());
-    device_area.removeFromLeft(18);
-    g.setFont(juce_theme::font(13.0F, true));
-    g.setColour(audio_running_ ? juce_theme::colour::text()
-                               : juce_theme::colour::text_dim());
-    g.drawFittedText(audio_text_, device_area.removeFromTop(18),
-                     juce::Justification::centredLeft, 1);
-    g.setFont(juce_theme::font(12.0F));
-    g.setColour(juce_theme::colour::text_faint());
-    g.drawFittedText(device_text_, device_area, juce::Justification::centredLeft, 1);
 }
 
 void JuceStatusBarComponent::resized() {}

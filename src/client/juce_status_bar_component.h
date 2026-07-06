@@ -23,8 +23,5 @@ private:
     juce::String rtt_text_;
     juce::String rx_text_;
     juce::String tx_text_;
-    juce::String audio_text_;
-    juce::String device_text_;
     bool joined_ = false;
-    bool audio_running_ = false;
 };

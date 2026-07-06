@@ -59,6 +59,8 @@ add_executable(client
     ${JAM_CLIENT_DIR}/juce_participant_list_component.cpp
     ${JAM_CLIENT_DIR}/juce_main_window.cpp
     ${JAM_CLIENT_DIR}/juce_mixer_component.cpp
+    ${JAM_CLIENT_DIR}/juce_room_browser_component.cpp
+    ${JAM_CLIENT_DIR}/juce_root_component.cpp
     ${JAM_CLIENT_DIR}/juce_status_bar_component.cpp
     ${JAM_CLIENT_DIR}/juce_theme.cpp
     ${JAM_COMMON_DIR}/logging_setup.cpp

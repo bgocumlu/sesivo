@@ -51,17 +51,33 @@ void paint_panel(juce::Graphics& g, juce::Rectangle<int> bounds) {
     g.drawRect(area, 1.0f);
 }
 
+void draw_wordmark(juce::Graphics& g, juce::Rectangle<int> bounds, float size) {
+    juce::AttributedString logo;
+    logo.setJustification(juce::Justification::centredLeft);
+    const auto logo_font = font(size, true);
+    logo.append("ses", logo_font, colour::text());
+    logo.append("ivo", logo_font, colour::accent_hi());
+    logo.draw(g, bounds.toFloat());
+}
+
 void style_label(juce::Label& label, juce::Colour text_colour, float size, bool bold) {
     label.setFont(font(size, bold));
     label.setColour(juce::Label::textColourId, text_colour);
     label.setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
 }
 
-void style_editor(juce::TextEditor& editor) {
-    editor.setFont(font(13.0f));
+void style_editor(juce::TextEditor& editor, float size) {
+    editor.setFont(font(size));
+    editor.setMultiLine(false);
+    editor.setReturnKeyStartsNewLine(false);
+    editor.setScrollbarsShown(false);
+    editor.setBorder(juce::BorderSize<int>(0));
+    editor.setIndents(8, size >= 14.0F ? 5 : 4);
+    editor.setJustification(juce::Justification::centredLeft);
     editor.setColour(juce::TextEditor::textColourId, colour::text());
-    editor.setColour(juce::TextEditor::highlightColourId, colour::accent().withAlpha(0.45f));
-    editor.setColour(juce::TextEditor::highlightedTextColourId, colour::text());
+    editor.setColour(juce::CaretComponent::caretColourId, colour::accent_hi());
+    editor.setColour(juce::TextEditor::highlightColourId, colour::accent_hi().withAlpha(0.82f));
+    editor.setColour(juce::TextEditor::highlightedTextColourId, colour::background());
     editor.setColour(juce::TextEditor::backgroundColourId,
                      juce::Colours::transparentBlack);
     editor.setColour(juce::TextEditor::outlineColourId, colour::border());
@@ -92,9 +108,12 @@ LookAndFeel::LookAndFeel()
     setColour(juce::Slider::textBoxOutlineColourId, colour::border());
     setColour(juce::Slider::textBoxHighlightColourId, colour::accent().withAlpha(0.45f));
     setColour(juce::TextEditor::textColourId, colour::text());
+    setColour(juce::CaretComponent::caretColourId, colour::accent_hi());
     setColour(juce::TextEditor::backgroundColourId, colour::row());
     setColour(juce::TextEditor::outlineColourId, colour::border());
     setColour(juce::TextEditor::focusedOutlineColourId, colour::accent());
+    setColour(juce::TextEditor::highlightColourId, colour::accent_hi().withAlpha(0.82f));
+    setColour(juce::TextEditor::highlightedTextColourId, colour::background());
     setColour(juce::ScrollBar::thumbColourId, colour::text_faint().withAlpha(0.45f));
 }
 

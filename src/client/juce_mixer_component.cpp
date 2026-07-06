@@ -2,15 +2,30 @@
 
 #include "juce_theme.h"
 #include "opus_network_clock.h"
+#include "packet_builder.h"
+#include "performer_join_token.h"
 #include "protocol.h"
 
+#include <asio/error.hpp>
+#include <asio/io_context.hpp>
+#include <asio/ip/udp.hpp>
+
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
+
+using asio::ip::udp;
+using namespace std::chrono_literals;
 
 namespace {
 constexpr int PAD = juce_theme::pad;
@@ -130,6 +145,98 @@ void add_all(juce::Component& parent, std::initializer_list<juce::Component*> ch
     }
 }
 
+template <size_t N>
+std::string fixed_string(const Bytes<N>& bytes) {
+    const auto end = std::find(bytes.begin(), bytes.end(), '\0');
+    return std::string(bytes.begin(), end);
+}
+
+template <size_t N>
+void write_fixed(Bytes<N>& target, const std::string& value) {
+    packet_builder::write_fixed(target, value);
+}
+
+template <typename Request, typename Response>
+Response send_control_request(const std::string& address, uint16_t port,
+                              const Request& request, CtrlHdr::Cmd expected_type,
+                              uint32_t request_id) {
+    asio::io_context context;
+    udp::resolver resolver(context);
+    auto endpoints = resolver.resolve(address, std::to_string(port));
+    if (endpoints.empty()) {
+        throw std::runtime_error("server address did not resolve");
+    }
+
+    udp::endpoint endpoint = *endpoints.begin();
+    udp::socket socket(context);
+    socket.open(endpoint.protocol());
+    socket.non_blocking(true);
+    socket.send_to(asio::buffer(&request, sizeof(request)), endpoint);
+
+    std::array<unsigned char, 2048> buffer{};
+    udp::endpoint sender;
+    const auto deadline = std::chrono::steady_clock::now() + 1100ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::error_code ec;
+        const size_t bytes = socket.receive_from(asio::buffer(buffer), sender, 0, ec);
+        if (!ec) {
+            if (bytes < sizeof(Response)) {
+                continue;
+            }
+            CtrlHdr ctrl{};
+            std::memcpy(&ctrl, buffer.data(), sizeof(ctrl));
+            if (ctrl.magic != CTRL_MAGIC || ctrl.type != expected_type) {
+                continue;
+            }
+            Response response{};
+            std::memcpy(&response, buffer.data(), sizeof(response));
+            if (response.request_id != request_id) {
+                continue;
+            }
+            return response;
+        }
+        if (ec != asio::error::would_block && ec != asio::error::try_again) {
+            throw std::runtime_error(ec.message());
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    throw std::runtime_error("server did not respond");
+}
+
+juce::String room_admin_status_text(uint8_t status, const std::string& reason) {
+    if (!reason.empty() && reason != "ok") {
+        return reason;
+    }
+    switch (status) {
+        case ROOM_STATUS_OK:
+            return "Done";
+        case ROOM_STATUS_BAD_REQUEST:
+            return "Bad request";
+        case ROOM_STATUS_NOT_FOUND:
+            return "Not found";
+        case ROOM_STATUS_FORBIDDEN:
+            return "Not allowed";
+        case ROOM_STATUS_CONFLICT:
+            return "Conflict";
+        case ROOM_STATUS_SERVER_ERROR:
+            return "Server error";
+        default:
+            return "Request failed";
+    }
+}
+
+juce::String admin_participant_label(const ParticipantInfo& participant) {
+    juce::String name;
+    if (!participant.display_name.empty()) {
+        name = participant.display_name;
+    } else if (!participant.profile_id.empty()) {
+        name = participant.profile_id;
+    } else {
+        name = "User";
+    }
+    return name + " #" + juce::String(static_cast<int>(participant.id));
+}
+
 bool matches_api(const AudioStream::DeviceInfo& device, const std::string& api_name) {
     return api_name.empty() || api_name == "All" || device.api_name == api_name;
 }
@@ -175,6 +282,15 @@ AudioStream::DeviceIndex first_device_for_api(
     return it == devices.end() ? AudioStream::NO_DEVICE : it->index;
 }
 
+AudioStream::DeviceIndex device_id_for_api(
+    const std::vector<AudioStream::DeviceInfo>& devices,
+    AudioStream::DeviceIndex id, const std::string& api_name) {
+    const auto it = std::find_if(devices.begin(), devices.end(), [&](const auto& device) {
+        return device.index == id && matches_api(device, api_name);
+    });
+    return it == devices.end() ? AudioStream::NO_DEVICE : it->index;
+}
+
 AudioStream::DeviceIndex default_device_for_api(
     const std::vector<AudioStream::DeviceInfo>& devices,
     const std::vector<AudioStream::ApiInfo>& apis, int api_index, bool input) {
@@ -204,9 +320,11 @@ AudioStream::DeviceIndex default_device_for_api(
 }  // namespace
 
 JuceMixerComponent::JuceMixerComponent(
-    ClientAppFacade& client, JuceClientStartupOptions startup_options)
+    ClientAppFacade& client, JuceClientStartupOptions startup_options,
+    std::function<void()> leave_callback)
     : client_(client),
       startup_options_(std::move(startup_options)),
+      leave_callback_(std::move(leave_callback)),
       participants_component_(client) {
     configure_controls();
     configure_device_controls();
@@ -220,6 +338,9 @@ JuceMixerComponent::~JuceMixerComponent() {
     }
     if (device_job_thread_.joinable()) {
         device_job_thread_.join();
+    }
+    if (room_admin_job_thread_.joinable()) {
+        room_admin_job_thread_.join();
     }
 }
 
@@ -242,6 +363,7 @@ void JuceMixerComponent::configure_controls() {
     configure_section(metronome_label_, "Metronome");
     configure_section(recording_label_, "Record");
     configure_section(wav_label_, "WAV");
+    configure_section(room_admin_label_, "Room Admin");
     configure_caption(input_gain_label_, "Input");
     configure_caption(packet_label_, "Packet");
     configure_caption(jitter_label_, "Jitter");
@@ -250,7 +372,11 @@ void JuceMixerComponent::configure_controls() {
     configure_caption(redundancy_label_, "Redundancy");
     configure_caption(wav_position_label_, "0:00 / 0:00");
     configure_caption(wav_gain_label_, "Gain 1.00x");
+    room_admin_status_label_.setText(room_admin_status_, juce::dontSendNotification);
+    juce_theme::style_label(room_admin_status_label_, juce_theme::colour::text_dim(),
+                            12.0F);
 
+    leave_button_.setButtonText("Leave");
     mic_mute_button_.setButtonText("Mute mic");
     mic_mute_button_.setClickingTogglesState(true);
     monitor_toggle_.setButtonText("Monitor");
@@ -278,13 +404,25 @@ void JuceMixerComponent::configure_controls() {
     configure_linear_slider(wav_gain_slider_, 0.0, 2.0, 0.01, "x");
     wav_gain_slider_.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     wav_mute_toggle_.setButtonText("Local mute");
+    room_password_editor_.setTextToShowWhenEmpty(
+        "Password", juce_theme::colour::text_faint());
+    juce_theme::style_editor(room_password_editor_, 14.0F);
+    room_set_password_button_.setButtonText("Set password");
+    room_open_button_.setButtonText("Clear password");
+    room_kick_combo_.setTextWhenNothingSelected("Participant");
+    room_kick_button_.setButtonText("Kick");
+    room_close_button_.setButtonText("Close room");
 
-    add_all(*this, {&status_bar_, &diagnostics_label_, &participants_component_,
+    add_all(*this, {&status_bar_, &leave_button_, &diagnostics_label_, &participants_component_,
                     &local_audio_label_, &network_label_, &redundancy_section_label_,
                     &metronome_label_, &recording_label_, &wav_label_,
+                    &room_admin_label_, &room_admin_status_label_,
                     &input_gain_label_, &packet_label_, &jitter_label_,
                     &queue_label_, &age_limit_label_, &redundancy_label_,
                     &wav_position_label_, &wav_gain_label_,
+                    &room_password_editor_, &room_set_password_button_,
+                    &room_open_button_, &room_kick_combo_, &room_kick_button_,
+                    &room_close_button_,
                     &mic_mute_button_, &monitor_toggle_, &input_gain_slider_,
                     &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
                     &auto_jitter_toggle_, &redundancy_combo_, &bpm_editor_,
@@ -293,6 +431,11 @@ void JuceMixerComponent::configure_controls() {
                     &wav_play_button_, &wav_position_slider_, &wav_gain_slider_,
                     &wav_mute_toggle_});
 
+    leave_button_.onClick = [this]() { leave_room(); };
+    room_set_password_button_.onClick = [this]() { request_room_password_change(false); };
+    room_open_button_.onClick = [this]() { request_room_password_change(true); };
+    room_kick_button_.onClick = [this]() { request_room_kick(); };
+    room_close_button_.onClick = [this]() { request_room_close(); };
     mic_mute_button_.onClick = [this]() {
         if (!updating_from_client_) {
             client_.set_mic_muted(mic_mute_button_.getToggleState());
@@ -495,6 +638,7 @@ void JuceMixerComponent::resized() {
     auto area = getLocalBounds().reduced(PAD);
     auto top = area.removeFromTop(STATUS_HEIGHT);
     status_bar_.setBounds(top);
+    leave_button_.setBounds(top.removeFromRight(92).reduced(14, 18));
     area.removeFromTop(GAP);
 
     auto bottom_panel_area = area.removeFromBottom(BOTTOM_HEIGHT);
@@ -594,12 +738,56 @@ void JuceMixerComponent::resized() {
     wav_gain_label_.setBounds(wav_gain.removeFromLeft(82).reduced(2));
     wav_gain_slider_.setBounds(wav_gain.reduced(2, 6));
 
-    participants_component_.setBounds(area.reduced(12, 10));
+    const bool admin_visible = has_room_admin();
+    for (auto* component: {static_cast<juce::Component*>(&room_admin_label_),
+                           static_cast<juce::Component*>(&room_admin_status_label_),
+                           static_cast<juce::Component*>(&room_password_editor_),
+                           static_cast<juce::Component*>(&room_set_password_button_),
+                           static_cast<juce::Component*>(&room_open_button_),
+                           static_cast<juce::Component*>(&room_kick_combo_),
+                           static_cast<juce::Component*>(&room_kick_button_),
+                           static_cast<juce::Component*>(&room_close_button_)}) {
+        component->setVisible(admin_visible);
+    }
+
+    auto participants_area = area.reduced(12, 10);
+    if (admin_visible) {
+        auto admin = participants_area.removeFromTop(34);
+        participants_area.removeFromTop(8);
+
+        room_admin_label_.setBounds(admin.removeFromLeft(96));
+        admin.removeFromLeft(control_gap);
+        room_password_editor_.setBounds(admin.removeFromLeft(180).reduced(2));
+        admin.removeFromLeft(control_gap);
+        room_set_password_button_.setBounds(admin.removeFromLeft(104).reduced(2));
+        admin.removeFromLeft(control_gap);
+        room_open_button_.setBounds(admin.removeFromLeft(116).reduced(2));
+        admin.removeFromLeft(control_gap + 8);
+        room_kick_combo_.setBounds(admin.removeFromLeft(176).reduced(2));
+        admin.removeFromLeft(control_gap);
+        room_kick_button_.setBounds(admin.removeFromLeft(60).reduced(2));
+        admin.removeFromLeft(control_gap + 8);
+        room_close_button_.setBounds(admin.removeFromLeft(92).reduced(2));
+        admin.removeFromLeft(control_gap);
+        room_admin_status_label_.setBounds(admin.reduced(2));
+    }
+
+    participants_component_.setBounds(participants_area);
 }
 
 void JuceMixerComponent::timerCallback() {
     poll_connection_start();
     poll_audio_device_refresh();
+    poll_room_admin_job();
+    if (client_.consume_room_removed_by_server()) {
+        if (leave_callback_) {
+            auto callback = leave_callback_;
+            juce::MessageManager::callAsync([callback = std::move(callback)]() mutable {
+                callback();
+            });
+        }
+        return;
+    }
     if (!startup_connection_started_ && startup_options_.auto_connect) {
         --connection_delay_ticks_;
         if (connection_delay_ticks_ <= 0) {
@@ -705,6 +893,7 @@ void JuceMixerComponent::refresh_live_state() {
     const double now_ms = juce::Time::getMillisecondCounterHiRes();
     if (now_ms - last_participant_refresh_ms_ > 30.0) {
         last_participant_refresh_ms_ = now_ms;
+        refresh_room_admin_controls(client_.get_participant_info());
         participants_component_.refresh();
     }
 }
@@ -757,7 +946,10 @@ JuceMixerComponent::AudioDeviceRefreshResult JuceMixerComponent::load_audio_devi
         const bool has_required_api =
             !startup_options_.required_audio_api.empty();
         std::string target_api = has_required_api ? startup_options_.required_audio_api
-                                                  : preferences.audio_api;
+                                                  : client_.get_audio_api_filter();
+        if (target_api.empty()) {
+            target_api = preferences.audio_api;
+        }
         if (target_api.empty()) {
             target_api = "All";
         }
@@ -781,13 +973,24 @@ JuceMixerComponent::AudioDeviceRefreshResult JuceMixerComponent::load_audio_devi
             }
         }
 
+        if (!has_required_api) {
+            result.pending_input = device_id_for_api(
+                result.input_devices, client_.get_selected_input_device(), target_api);
+            result.pending_output = device_id_for_api(
+                result.output_devices, client_.get_selected_output_device(), target_api);
+        }
+
         if (preferences.loaded && !has_required_api) {
-            result.pending_input = find_preferred_audio_device(
-                result.input_devices, preferences.input_device, preferences.input_api,
-                preferences.audio_api);
-            result.pending_output = find_preferred_audio_device(
-                result.output_devices, preferences.output_device, preferences.output_api,
-                preferences.audio_api);
+            if (result.pending_input == AudioStream::NO_DEVICE) {
+                result.pending_input = find_preferred_audio_device(
+                    result.input_devices, preferences.input_device, preferences.input_api,
+                    preferences.audio_api);
+            }
+            if (result.pending_output == AudioStream::NO_DEVICE) {
+                result.pending_output = find_preferred_audio_device(
+                    result.output_devices, preferences.output_device, preferences.output_api,
+                    preferences.audio_api);
+            }
         }
 
         if (result.pending_input == AudioStream::NO_DEVICE) {
@@ -813,6 +1016,9 @@ JuceMixerComponent::AudioDeviceRefreshResult JuceMixerComponent::load_audio_devi
         if (input_applied) {
             client_.set_input_channel_index(result.pending_input_channel);
             result.pending_input_channel = client_.get_input_channel_index();
+        }
+        if (input_applied && output_applied) {
+            client_.save_audio_device_preferences();
         }
 
         if (auto_start_audio && input_applied && output_applied) {
@@ -1070,12 +1276,19 @@ void JuceMixerComponent::populate_redundancy_combo() {
 void JuceMixerComponent::apply_audio_settings() {
     const bool restart_needed = pending_stream_restart_needed();
     client_.set_audio_api_filter(selected_api_name().toStdString());
-    client_.set_input_device(pending_input_);
-    client_.set_input_channel_index(pending_input_channel_);
-    client_.set_output_device(pending_output_);
+    const bool input_ok = client_.set_input_device(pending_input_);
+    if (input_ok) {
+        client_.set_input_channel_index(pending_input_channel_);
+    }
+    const bool output_ok = client_.set_output_device(pending_output_);
     client_.set_requested_frames_per_buffer(pending_buffer_frames_);
     client_.set_opus_network_frame_count(pending_opus_frames_per_packet_);
-    client_.save_audio_device_preferences();
+    if (input_ok && output_ok) {
+        client_.save_audio_device_preferences();
+    } else {
+        set_device_status("Choose valid input and output devices");
+        return;
+    }
 
     if (client_.is_audio_stream_active() && restart_needed) {
         client_.swap_audio_devices(pending_input_, pending_output_);
@@ -1139,6 +1352,251 @@ void JuceMixerComponent::load_wav_path(const juce::File& file) {
         set_device_status("Loaded WAV: " + file.getFileName());
     } else {
         set_device_status("Could not load WAV: " + file.getFileName());
+    }
+}
+
+void JuceMixerComponent::refresh_room_admin_controls(
+    const std::vector<ParticipantInfo>& participants) {
+    const bool admin = has_room_admin();
+    bool running = false;
+    {
+        std::lock_guard<std::mutex> lock(room_admin_job_mutex_);
+        running = room_admin_job_running_;
+    }
+
+    room_password_editor_.setEnabled(admin && !running);
+    room_set_password_button_.setEnabled(admin && !running);
+    room_open_button_.setEnabled(admin && !running);
+    room_close_button_.setEnabled(admin && !running);
+
+    uint32_t selected_participant_id = 0;
+    const int selected_combo_id = room_kick_combo_.getSelectedId();
+    if (selected_combo_id > 0 &&
+        selected_combo_id <= static_cast<int>(admin_participant_choices_.size())) {
+        selected_participant_id =
+            admin_participant_choices_[static_cast<size_t>(selected_combo_id - 1)].id;
+    }
+
+    std::vector<AdminParticipantChoice> choices;
+    choices.reserve(participants.size());
+    for (const auto& participant: participants) {
+        choices.push_back({participant.id, admin_participant_label(participant)});
+    }
+
+    bool changed = choices.size() != admin_participant_choices_.size();
+    if (!changed) {
+        for (size_t i = 0; i < choices.size(); ++i) {
+            if (choices[i].id != admin_participant_choices_[i].id ||
+                choices[i].label != admin_participant_choices_[i].label) {
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    if (changed) {
+        admin_participant_choices_ = std::move(choices);
+        room_kick_combo_.clear(juce::dontSendNotification);
+        int item_id = 1;
+        int selected_item_id = 0;
+        for (const auto& choice: admin_participant_choices_) {
+            room_kick_combo_.addItem(choice.label, item_id);
+            if (choice.id == selected_participant_id) {
+                selected_item_id = item_id;
+            }
+            ++item_id;
+        }
+        room_kick_combo_.setSelectedId(selected_item_id, juce::dontSendNotification);
+    }
+
+    const bool can_kick = admin && !running && !admin_participant_choices_.empty();
+    room_kick_combo_.setEnabled(can_kick);
+    room_kick_button_.setEnabled(can_kick && room_kick_combo_.getSelectedId() > 0);
+}
+
+void JuceMixerComponent::request_room_password_change(bool clear_password) {
+    if (!has_room_admin()) {
+        set_room_admin_status("Only the room creator can change this room");
+        return;
+    }
+
+    std::string hash;
+    if (!clear_password) {
+        const auto password = room_password_editor_.getText().trim().toStdString();
+        if (password.empty()) {
+            set_room_admin_status("Enter a password or clear password");
+            return;
+        }
+        hash = password_hash(password);
+    }
+
+    set_room_admin_status(clear_password ? "Clearing password..." : "Setting password...");
+    start_room_admin_job(ROOM_ADMIN_CHANGE_PASSWORD, 0, std::move(hash), false);
+    if (clear_password) {
+        room_password_editor_.clear();
+    }
+}
+
+void JuceMixerComponent::request_room_kick() {
+    if (!has_room_admin()) {
+        set_room_admin_status("Only the room creator can kick");
+        return;
+    }
+    const int selected = room_kick_combo_.getSelectedId();
+    if (selected <= 0 || selected > static_cast<int>(admin_participant_choices_.size())) {
+        set_room_admin_status("Choose a participant to kick");
+        return;
+    }
+
+    const uint32_t participant_id =
+        admin_participant_choices_[static_cast<size_t>(selected - 1)].id;
+    set_room_admin_status("Kicking participant...");
+    start_room_admin_job(ROOM_ADMIN_KICK_PARTICIPANT, participant_id, {}, false);
+}
+
+void JuceMixerComponent::request_room_close() {
+    if (!has_room_admin()) {
+        set_room_admin_status("Only the room creator can close this room");
+        return;
+    }
+    set_room_admin_status("Closing room...");
+    start_room_admin_job(ROOM_ADMIN_CLOSE_ROOM, 0, {}, true);
+}
+
+void JuceMixerComponent::start_room_admin_job(uint8_t command,
+                                              uint32_t target_participant_id,
+                                              std::string hash,
+                                              bool closes_room) {
+    {
+        std::lock_guard<std::mutex> lock(room_admin_job_mutex_);
+        if (room_admin_job_running_) {
+            set_room_admin_status("Room admin request is already running");
+            return;
+        }
+        room_admin_job_running_ = true;
+        room_admin_job_finished_ = false;
+        room_admin_job_result_.reset();
+    }
+
+    if (room_admin_job_thread_.joinable()) {
+        room_admin_job_thread_.join();
+    }
+
+    room_admin_job_thread_ =
+        std::thread([this, command, target_participant_id,
+                     hash = std::move(hash), closes_room]() {
+            auto result =
+                run_room_admin_command(command, target_participant_id, hash, closes_room);
+            std::lock_guard<std::mutex> lock(room_admin_job_mutex_);
+            room_admin_job_result_ = std::move(result);
+            room_admin_job_finished_ = true;
+        });
+}
+
+JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
+    uint8_t command, uint32_t target_participant_id,
+    const std::string& hash, bool closes_room) {
+    RoomAdminResult result;
+
+    const auto connected_port = client_.get_server_port();
+    const std::string address =
+        client_.get_server_address().empty() ? startup_options_.server_address
+                                             : client_.get_server_address();
+    const uint16_t port =
+        connected_port == 0 ? startup_options_.server_port : connected_port;
+    const std::string room_id = client_.get_room_id();
+    if (address.empty() || port == 0 || room_id.empty()) {
+        result.status = "Not connected to a room";
+        return result;
+    }
+
+    RoomAdminRequestHdr request{};
+    request.magic = CTRL_MAGIC;
+    request.type = CtrlHdr::Cmd::ROOM_ADMIN_REQUEST;
+    request.request_id = room_admin_request_id_.fetch_add(1, std::memory_order_relaxed);
+    request.command = command;
+    request.target_participant_id = target_participant_id;
+    write_fixed(request.room_id, room_id);
+    write_fixed(request.admin_token, startup_options_.room_admin_token);
+    write_fixed(request.password_hash, hash);
+
+    try {
+        const auto response =
+            send_control_request<RoomAdminRequestHdr, RoomAdminResponseHdr>(
+                address, port, request, CtrlHdr::Cmd::ROOM_ADMIN_RESPONSE,
+                request.request_id);
+        const auto reason = fixed_string(response.reason);
+        result.ok = response.status == ROOM_STATUS_OK;
+        result.closed = result.ok && closes_room;
+        if (!result.ok) {
+            result.status = room_admin_status_text(response.status, reason);
+            return result;
+        }
+
+        switch (command) {
+            case ROOM_ADMIN_CHANGE_PASSWORD:
+                result.status = hash.empty() ? "Password cleared" : "Password set";
+                break;
+            case ROOM_ADMIN_KICK_PARTICIPANT:
+                result.status = "Participant kicked";
+                break;
+            case ROOM_ADMIN_CLOSE_ROOM:
+                result.status = "Room closed";
+                break;
+            default:
+                result.status = "Done";
+                break;
+        }
+    } catch (const std::exception& e) {
+        result.status = e.what();
+    }
+
+    return result;
+}
+
+void JuceMixerComponent::poll_room_admin_job() {
+    std::optional<RoomAdminResult> result;
+    {
+        std::lock_guard<std::mutex> lock(room_admin_job_mutex_);
+        if (!room_admin_job_finished_) {
+            return;
+        }
+        result = std::move(room_admin_job_result_);
+        room_admin_job_result_.reset();
+        room_admin_job_finished_ = false;
+        room_admin_job_running_ = false;
+    }
+    if (room_admin_job_thread_.joinable()) {
+        room_admin_job_thread_.join();
+    }
+    if (result.has_value()) {
+        apply_room_admin_result(std::move(*result));
+    }
+}
+
+void JuceMixerComponent::apply_room_admin_result(RoomAdminResult result) {
+    set_room_admin_status(result.status);
+    if (!result.ok) {
+        return;
+    }
+    if (result.closed) {
+        client_.stop_connection();
+        if (leave_callback_) {
+            auto callback = leave_callback_;
+            juce::MessageManager::callAsync([callback = std::move(callback)]() mutable {
+                callback();
+            });
+        }
+    }
+}
+
+void JuceMixerComponent::leave_room() {
+    client_.stop_connection();
+    auto callback = leave_callback_;
+    if (callback) {
+        juce::MessageManager::callAsync([callback = std::move(callback)]() mutable {
+            callback();
+        });
     }
 }
 
@@ -1232,6 +1690,18 @@ AudioStream::DeviceIndex JuceMixerComponent::selected_output_device() const {
     return AudioStream::NO_DEVICE;
 }
 
+bool JuceMixerComponent::has_room_admin() const {
+    return !startup_options_.room_admin_token.empty();
+}
+
+std::string JuceMixerComponent::password_hash(const std::string& password) const {
+    if (password.empty()) {
+        return {};
+    }
+    const std::vector<unsigned char> bytes(password.begin(), password.end());
+    return performer_join_token::hex(performer_join_token::sha256(bytes));
+}
+
 bool JuceMixerComponent::has_pending_audio_changes() const {
     return pending_stream_restart_needed() ||
            pending_opus_frames_per_packet_ != client_.get_opus_network_frame_count() ||
@@ -1247,4 +1717,9 @@ bool JuceMixerComponent::pending_stream_restart_needed() const {
 
 void JuceMixerComponent::set_device_status(const juce::String& text) {
     device_status_label_.setText(text, juce::dontSendNotification);
+}
+
+void JuceMixerComponent::set_room_admin_status(const juce::String& text) {
+    room_admin_status_ = text;
+    room_admin_status_label_.setText(room_admin_status_, juce::dontSendNotification);
 }

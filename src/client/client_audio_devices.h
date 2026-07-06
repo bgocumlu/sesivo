@@ -2,6 +2,7 @@
 
 #include "audio_stream.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -17,12 +18,21 @@ struct AudioDevicePreferences {
     std::string output_api;
 };
 
+struct SavedRoomServer {
+    std::string name;
+    std::string address;
+    uint16_t port = 0;
+};
+
 AudioDevicePreferences load_audio_device_preferences(const std::filesystem::path& path);
 bool save_audio_device_preferences(const std::filesystem::path& path,
                                    const std::string& audio_api,
                                    AudioStream::DeviceIndex input_device,
                                    AudioStream::DeviceIndex output_device,
                                    int input_channel_index);
+std::vector<SavedRoomServer> load_saved_room_servers(const std::filesystem::path& path);
+bool save_saved_room_servers(const std::filesystem::path& path,
+                             const std::vector<SavedRoomServer>& servers);
 
 AudioStream::DeviceIndex find_preferred_audio_device(
     const std::vector<AudioStream::DeviceInfo>& devices,

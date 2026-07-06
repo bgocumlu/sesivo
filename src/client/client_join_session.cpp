@@ -26,6 +26,11 @@ bool ClientJoinSession::has_join_token() const {
     return !options_.join_token.empty();
 }
 
+void ClientJoinSession::configure(PerformerJoinOptions options) {
+    options_ = std::move(options);
+    state_.reset();
+}
+
 JoinHdr ClientJoinSession::make_join_header() const {
     JoinHdr join{};
     join.magic = CTRL_MAGIC;

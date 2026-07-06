@@ -77,7 +77,7 @@ const char* runtime_arch_name() {
 std::filesystem::path client_config_path(const char* executable_path,
                                          const std::string& config_dir) {
     if (!config_dir.empty()) {
-        return std::filesystem::path(config_dir) / "jam_client.ini";
+        return std::filesystem::path(config_dir) / "sesivo-client.json";
     }
 
     std::error_code ec;
@@ -90,7 +90,7 @@ std::filesystem::path client_config_path(const char* executable_path,
     }
     const std::filesystem::path folder =
         exe.has_parent_path() ? exe.parent_path() : std::filesystem::current_path();
-    return folder / "jam_client.ini";
+    return folder / "sesivo-client.json";
 }
 
 ClientStartupOptions parse_startup_options(int argc, char** argv) {

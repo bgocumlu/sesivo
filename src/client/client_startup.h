@@ -5,7 +5,6 @@
 #include "protocol.h"
 
 #include <cstdint>
-#include <filesystem>
 #include <optional>
 #include <string>
 
@@ -45,9 +44,6 @@ struct StartupLatencyProfile {
 
 const char* runtime_platform_name();
 const char* runtime_arch_name();
-
-std::filesystem::path client_config_path(const char* executable_path,
-                                         const std::string& config_dir);
 
 ClientStartupOptions parse_startup_options(int argc, char** argv);
 StartupLatencyProfile resolve_startup_latency_profile(

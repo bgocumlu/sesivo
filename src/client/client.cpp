@@ -10,6 +10,7 @@
 
 #include "client_app_facade.h"
 #include "client_audio_devices.h"
+#include "client_config_path.h"
 #include "client_runtime.h"
 #include "client_startup.h"
 #include "juce_app.h"
@@ -78,8 +79,7 @@ int main(int argc, char** argv) {
             return result;
         }
         asio::io_context io_context;
-        const auto config_path =
-            client_config_path(argv[0], startup_options.config_dir);
+        const auto config_path = client_config_path(startup_options.config_dir);
         const auto audio_preferences =
             load_audio_device_preferences(config_path);
 

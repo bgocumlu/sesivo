@@ -74,25 +74,6 @@ const char* runtime_arch_name() {
 #endif
 }
 
-std::filesystem::path client_config_path(const char* executable_path,
-                                         const std::string& config_dir) {
-    if (!config_dir.empty()) {
-        return std::filesystem::path(config_dir) / "sesivo-client.json";
-    }
-
-    std::error_code ec;
-    std::filesystem::path exe =
-        executable_path != nullptr && executable_path[0] != '\0'
-            ? std::filesystem::absolute(std::filesystem::path(executable_path), ec)
-            : std::filesystem::current_path(ec);
-    if (ec) {
-        exe = std::filesystem::current_path();
-    }
-    const std::filesystem::path folder =
-        exe.has_parent_path() ? exe.parent_path() : std::filesystem::current_path();
-    return folder / "sesivo-client.json";
-}
-
 ClientStartupOptions parse_startup_options(int argc, char** argv) {
     ClientStartupOptions options;
     for (int i = 1; i < argc; ++i) {

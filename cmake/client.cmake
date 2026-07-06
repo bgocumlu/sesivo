@@ -61,6 +61,7 @@ add_executable(client
     ${JAM_CLIENT_DIR}/client.cpp
     ${JAM_CLIENT_DIR}/client_audio_devices.cpp
     ${JAM_CLIENT_DIR}/client_audio_state.cpp
+    ${JAM_CLIENT_DIR}/client_config_path.cpp
     ${JAM_CLIENT_DIR}/client_join_session.cpp
     ${JAM_CLIENT_DIR}/client_media_state.cpp
     ${JAM_CLIENT_DIR}/client_metronome.cpp

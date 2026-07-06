@@ -104,6 +104,7 @@ xcrun notarytool submit "$dmg_path" \
 
 xcrun stapler staple "$dmg_path"
 xcrun stapler validate "$dmg_path"
-spctl -a -vv -t open "$dmg_path"
+spctl -a -vv -t install "$dmg_path"
+spctl -a -vv --type execute "$app_path"
 
 echo "Released $dmg_path"

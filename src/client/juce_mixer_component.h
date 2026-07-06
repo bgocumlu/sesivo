@@ -68,6 +68,7 @@ private:
     void reset_audio_path();
     void commit_metronome_bpm();
     void load_wav_file();
+    void load_wav_path(const juce::File& file);
     void apply_selected_api_to_pending_devices(int old_api_index);
 
     juce::String selected_api_name() const;
@@ -99,6 +100,8 @@ private:
     std::mutex connection_job_mutex_;
     std::thread connection_job_thread_;
     std::optional<ConnectionResult> connection_job_result_;
+    std::unique_ptr<juce::FileChooser> wav_file_chooser_;
+    juce::File last_wav_file_;
 
     std::vector<AudioStream::DeviceInfo> input_devices_;
     std::vector<AudioStream::DeviceInfo> output_devices_;
@@ -113,6 +116,20 @@ private:
 
     juce::Label diagnostics_label_;
     juce::Label device_status_label_;
+    juce::Label local_audio_label_;
+    juce::Label network_label_;
+    juce::Label redundancy_section_label_;
+    juce::Label metronome_label_;
+    juce::Label recording_label_;
+    juce::Label wav_label_;
+    juce::Label input_gain_label_;
+    juce::Label packet_label_;
+    juce::Label jitter_label_;
+    juce::Label queue_label_;
+    juce::Label age_limit_label_;
+    juce::Label redundancy_label_;
+    juce::Label wav_position_label_;
+    juce::Label wav_gain_label_;
 
     JuceStatusBarComponent status_bar_;
     JuceParticipantListComponent participants_component_;

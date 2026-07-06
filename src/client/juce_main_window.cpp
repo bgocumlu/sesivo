@@ -8,15 +8,22 @@
 JuceMainWindow::JuceMainWindow(const juce::String& title, ClientAppFacade& client,
                                JuceClientStartupOptions startup_options,
                                std::function<void()> close_callback)
-    : DocumentWindow(title, juce::Colour(0xff111418),
+    : DocumentWindow(title, juce_theme::colour::background(),
                      juce::DocumentWindow::allButtons),
       close_callback_(std::move(close_callback)) {
+    juce::LookAndFeel::setDefaultLookAndFeel(&look_and_feel_);
+    setLookAndFeel(&look_and_feel_);
     setUsingNativeTitleBar(true);
     setResizable(true, true);
-    setResizeLimits(900, 600, 2400, 1600);
+    setResizeLimits(1240, 700, 2400, 1600);
     setContentOwned(new JuceMixerComponent(client, std::move(startup_options)), true);
-    centreWithSize(1080, 720);
+    centreWithSize(1450, 820);
     setVisible(true);
+}
+
+JuceMainWindow::~JuceMainWindow() {
+    setLookAndFeel(nullptr);
+    juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
 }
 
 void JuceMainWindow::closeButtonPressed() {

@@ -20,9 +20,11 @@ void require(bool condition, const char* message) {
 performer_join_token::Claims make_claims(const std::string& nonce) {
     performer_join_token::Claims claims;
     claims.expires_at_ms = performer_join_token::now_ms() + 120000;
-    claims.server_id = "local-dev";
-    claims.room_id = "secure-room";
-    claims.profile_id = "secure-user";
+    claims.server_id = "local.dev";
+    claims.room_id = "secure.room";
+    claims.profile_id = "secure.user";
+    claims.room_instance_id = "room.instance.a";
+    claims.access_epoch = 3;
     claims.nonce = nonce;
     return claims;
 }
@@ -30,7 +32,8 @@ performer_join_token::Claims make_claims(const std::string& nonce) {
 session_crypto::SessionKey validated_key_for(const std::string& token,
                                              const std::string& secret) {
     const auto validated = performer_join_token::validate_with_claims(
-        token, secret, "local-dev", "secure-room", "secure-user");
+        token, secret, "local.dev", "secure.room", "secure.user",
+        "room.instance.a", 3);
     require(validated.ok, "token should validate");
     return session_crypto::derive_key_from_join_token(validated);
 }

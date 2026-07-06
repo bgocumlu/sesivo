@@ -157,6 +157,8 @@ inline void write_header(unsigned char* out, uint64_t nonce, uint16_t ciphertext
 inline std::string nonce_replay_key(const performer_join_token::Claims& claims) {
     return std::to_string(claims.server_id.size()) + ":" + claims.server_id + "|" +
            std::to_string(claims.room_id.size()) + ":" + claims.room_id + "|" +
+           std::to_string(claims.room_instance_id.size()) + ":" +
+           claims.room_instance_id + "|" + std::to_string(claims.access_epoch) + "|" +
            std::to_string(claims.profile_id.size()) + ":" + claims.profile_id + "|" +
            std::to_string(claims.nonce.size()) + ":" + claims.nonce;
 }
@@ -175,25 +177,12 @@ inline SessionKey derive_key_from_join_token(
 
 inline std::optional<SessionKey> derive_key_from_join_token_string(
     const std::string& token) {
-    const auto parts = performer_join_token::split(token, '.');
-    if (parts.size() != 7 || parts[0] != "v1") {
+    std::string reason;
+    auto parsed = performer_join_token::parse_unverified(token, reason);
+    if (!parsed.has_value()) {
         return std::nullopt;
     }
-
-    performer_join_token::ValidatedToken parsed;
-    try {
-        parsed.claims.expires_at_ms = std::stoll(parts[1]);
-    } catch (...) {
-        return std::nullopt;
-    }
-    parsed.claims.server_id = parts[2];
-    parsed.claims.room_id = parts[3];
-    parsed.claims.profile_id = parts[4];
-    parsed.claims.nonce = parts[5];
-    parsed.signature_hex = parts[6];
-    parsed.signing_input = performer_join_token::signing_message(parsed.claims);
-    parsed.ok = true;
-    return derive_key_from_join_token(parsed);
+    return derive_key_from_join_token(*parsed);
 }
 
 inline bool seal_audio_packet(const SessionKey& key, uint64_t nonce,

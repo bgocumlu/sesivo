@@ -80,6 +80,14 @@ struct CtrlHdr : MsgHdr {
         JOIN_ACK          = 8,  // Server confirms that this endpoint is registered
         JOIN_REQUIRED     = 9,  // Server asks an unknown endpoint to re-send JOIN
         AUDIO_PATH_STATS  = 10, // Server reports sender-to-server audio ingress health
+        SERVER_STATUS_REQUEST = 11, // Browser asks for server/room summaries
+        SERVER_STATUS_RESPONSE = 12,
+        ROOM_CREATE_REQUEST = 13, // Create in-memory room and receive join/admin tickets
+        ROOM_CREATE_RESPONSE = 14,
+        ROOM_JOIN_TOKEN_REQUEST = 15, // Request short-lived room join ticket
+        ROOM_JOIN_TOKEN_RESPONSE = 16,
+        ROOM_ADMIN_REQUEST = 17, // Change password, kick participant, close room
+        ROOM_ADMIN_RESPONSE = 18,
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
@@ -147,6 +155,109 @@ struct AudioPathStatsHdr : CtrlHdr {
     uint32_t total_unrecovered_sequence_gaps = 0;
     uint16_t observed_frame_count = 0;
     uint16_t reserved = 0;
+};
+
+constexpr uint8_t ROOM_FLAG_LOCKED = 1 << 0;
+constexpr uint8_t ROOM_FLAG_CREATED = 1 << 1;
+constexpr uint8_t ROOM_STATUS_OK = 0;
+constexpr uint8_t ROOM_STATUS_BAD_REQUEST = 1;
+constexpr uint8_t ROOM_STATUS_NOT_FOUND = 2;
+constexpr uint8_t ROOM_STATUS_FORBIDDEN = 3;
+constexpr uint8_t ROOM_STATUS_CONFLICT = 4;
+constexpr uint8_t ROOM_STATUS_SERVER_ERROR = 5;
+constexpr uint8_t ROOM_ADMIN_CHANGE_PASSWORD = 1;
+constexpr uint8_t ROOM_ADMIN_KICK_PARTICIPANT = 2;
+constexpr uint8_t ROOM_ADMIN_CLOSE_ROOM = 3;
+constexpr size_t MAX_ROOM_STATUS_SUMMARIES = 8;
+
+struct RoomSummaryWire {
+    Bytes<64> room_id;
+    Bytes<64> room_name;
+    uint16_t participant_count = 0;
+    uint8_t  flags = 0;
+    uint8_t  reserved = 0;
+};
+
+struct ServerStatusRequestHdr : CtrlHdr {
+    uint32_t request_id = 0;
+};
+
+struct ServerStatusResponseHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    Bytes<64> server_id;
+    uint16_t total_rooms = 0;
+    uint16_t active_participants = 0;
+    uint8_t  room_count = 0;
+    uint8_t  truncated = 0;
+    uint8_t  token_auth_available = 0;
+    uint8_t  reserved = 0;
+    RoomSummaryWire rooms[MAX_ROOM_STATUS_SUMMARIES];
+};
+
+struct RoomCreateRequestHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    Bytes<64> room_id;
+    Bytes<64> room_name;
+    Bytes<64> profile_id;
+    Bytes<64> display_name;
+    Bytes<128> password_hash;
+};
+
+struct RoomCreateResponseHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint8_t  status = ROOM_STATUS_OK;
+    uint8_t  flags = 0;
+    uint16_t reserved = 0;
+    uint32_t access_epoch = 0;
+    Bytes<64> room_id;
+    Bytes<64> room_name;
+    Bytes<64> room_instance_id;
+    Bytes<128> admin_token;
+    Bytes<512> join_token;
+    Bytes<128> reason;
+};
+
+struct RoomJoinTokenRequestHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    Bytes<64> room_id;
+    Bytes<64> profile_id;
+    Bytes<64> display_name;
+    Bytes<128> password_hash;
+};
+
+struct RoomJoinTokenResponseHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint8_t  status = ROOM_STATUS_OK;
+    uint8_t  flags = 0;
+    uint16_t reserved = 0;
+    uint32_t access_epoch = 0;
+    Bytes<64> room_id;
+    Bytes<64> room_name;
+    Bytes<64> room_instance_id;
+    Bytes<512> join_token;
+    Bytes<128> reason;
+};
+
+struct RoomAdminRequestHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint8_t  command = 0;
+    uint8_t  reserved8 = 0;
+    uint16_t reserved16 = 0;
+    uint32_t target_participant_id = 0;
+    Bytes<64> room_id;
+    Bytes<128> admin_token;
+    Bytes<128> password_hash;
+};
+
+struct RoomAdminResponseHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint8_t  status = ROOM_STATUS_OK;
+    uint8_t  flags = 0;
+    uint16_t reserved = 0;
+    uint32_t access_epoch = 0;
+    uint32_t target_participant_id = 0;
+    Bytes<64> room_id;
+    Bytes<128> reason;
 };
 
 #pragma pack(pop)

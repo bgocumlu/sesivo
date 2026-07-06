@@ -35,6 +35,7 @@
 #include "packet_builder.h"
 #include "periodic_timer.h"
 #include "protocol.h"
+#include "room_registry.h"
 #include "sequence_tracker.h"
 #include "server_rate_limiter.h"
 #include "server_config.h"
@@ -318,14 +319,35 @@ private:
         std::memcpy(&chdr, recv_buf_.data(), sizeof(CtrlHdr));
 
         auto now = std::chrono::steady_clock::now();
-        if (chdr.type != CtrlHdr::Cmd::JOIN && client_manager_.exists(remote_endpoint_) &&
-            !rate_limiter_.allow_control(remote_endpoint_, now)) {
-            return;
+        const bool known_endpoint = client_manager_.exists(remote_endpoint_);
+        if (chdr.type == CtrlHdr::Cmd::SERVER_STATUS_REQUEST) {
+            if (!rate_limiter_.allow_status(remote_endpoint_, now)) {
+                return;
+            }
+        } else if (chdr.type != CtrlHdr::Cmd::JOIN) {
+            const bool allowed =
+                known_endpoint ? rate_limiter_.allow_control(remote_endpoint_, now)
+                               : rate_limiter_.allow_room_control(remote_endpoint_, now);
+            if (!allowed) {
+                return;
+            }
         }
 
         switch (chdr.type) {
             case CtrlHdr::Cmd::JOIN:
                 handle_join(bytes, now);
+                break;
+            case CtrlHdr::Cmd::SERVER_STATUS_REQUEST:
+                handle_server_status_request(bytes);
+                break;
+            case CtrlHdr::Cmd::ROOM_CREATE_REQUEST:
+                handle_room_create_request(bytes, now);
+                break;
+            case CtrlHdr::Cmd::ROOM_JOIN_TOKEN_REQUEST:
+                handle_room_join_token_request(bytes, now);
+                break;
+            case CtrlHdr::Cmd::ROOM_ADMIN_REQUEST:
+                handle_room_admin_request(bytes, now);
                 break;
             case CtrlHdr::Cmd::LEAVE: {
                 spdlog::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
@@ -334,6 +356,7 @@ private:
                 if (leaving_client.has_value()) {
                     release_token_nonce_for_client(*leaving_client);
                     broadcast_participant_leave(leaving_client->client_id);
+                    cleanup_empty_rooms(now);
                 }
                 break;
             }
@@ -357,6 +380,328 @@ private:
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
                 break;
         }
+    }
+
+    static uint8_t room_flags(const room_registry::RoomSnapshot& room) {
+        return room.locked ? ROOM_FLAG_LOCKED : 0;
+    }
+
+    static uint16_t saturating_u16(size_t value) {
+        return static_cast<uint16_t>(
+            std::min<size_t>(value, std::numeric_limits<uint16_t>::max()));
+    }
+
+    bool can_issue_room_join_ticket() const {
+        return options_.allow_insecure_dev_joins || !options_.join_secret.empty();
+    }
+
+    std::optional<std::string> create_join_ticket(
+        const room_registry::RoomSnapshot& room, const std::string& profile_id) const {
+        if (options_.allow_insecure_dev_joins) {
+            return std::string{};
+        }
+        if (options_.join_secret.empty()) {
+            return std::nullopt;
+        }
+
+        performer_join_token::Claims claims;
+        claims.expires_at_ms = performer_join_token::now_ms() + 120000;
+        claims.server_id = options_.server_id;
+        claims.room_id = room.room_id;
+        claims.profile_id = profile_id;
+        claims.room_instance_id = room.room_instance_id;
+        claims.access_epoch = room.access_epoch;
+        claims.nonce = performer_join_token::random_nonce();
+        return performer_join_token::create(claims, options_.join_secret);
+    }
+
+    void cleanup_empty_rooms(std::chrono::steady_clock::time_point now) {
+        room_registry_.remove_empty_rooms(client_manager_.room_counts(), now);
+    }
+
+    void handle_server_status_request(std::size_t bytes) {
+        if (bytes < sizeof(ServerStatusRequestHdr)) {
+            return;
+        }
+        ServerStatusRequestHdr request{};
+        std::memcpy(&request, recv_buf_.data(), sizeof(ServerStatusRequestHdr));
+
+        cleanup_empty_rooms(std::chrono::steady_clock::now());
+        const auto counts = client_manager_.room_counts();
+        const auto rooms = room_registry_.list_rooms(counts);
+
+        ServerStatusResponseHdr response{};
+        response.magic = CTRL_MAGIC;
+        response.type = CtrlHdr::Cmd::SERVER_STATUS_RESPONSE;
+        response.request_id = request.request_id;
+        packet_builder::write_fixed(response.server_id, options_.server_id);
+        response.total_rooms = saturating_u16(rooms.size());
+        response.active_participants = saturating_u16(client_manager_.count());
+        response.room_count = static_cast<uint8_t>(
+            std::min<size_t>(rooms.size(), MAX_ROOM_STATUS_SUMMARIES));
+        response.truncated = rooms.size() > MAX_ROOM_STATUS_SUMMARIES ? 1 : 0;
+        response.token_auth_available =
+            !options_.join_secret.empty() || options_.allow_insecure_dev_joins ? 1 : 0;
+        for (size_t index = 0; index < response.room_count; ++index) {
+            const auto& room = rooms[index];
+            packet_builder::write_fixed(response.rooms[index].room_id, room.room_id);
+            packet_builder::write_fixed(response.rooms[index].room_name, room.room_name);
+            response.rooms[index].participant_count =
+                saturating_u16(room.participant_count);
+            response.rooms[index].flags = room_flags(room);
+        }
+
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(response));
+        std::memcpy(buf->data(), &response, sizeof(response));
+        send(buf->data(), buf->size(), remote_endpoint_, buf);
+    }
+
+    void send_room_create_response(const RoomCreateResponseHdr& response) {
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(response));
+        std::memcpy(buf->data(), &response, sizeof(response));
+        send(buf->data(), buf->size(), remote_endpoint_, buf);
+    }
+
+    void handle_room_create_request(std::size_t bytes,
+                                    std::chrono::steady_clock::time_point now) {
+        if (bytes < sizeof(RoomCreateRequestHdr)) {
+            return;
+        }
+        RoomCreateRequestHdr request{};
+        std::memcpy(&request, recv_buf_.data(), sizeof(RoomCreateRequestHdr));
+        const std::string room_id = fixed_string(request.room_id);
+        const std::string room_name = fixed_string(request.room_name);
+        const std::string profile_id = fixed_string(request.profile_id);
+        const std::string password_hash = fixed_string(request.password_hash);
+
+        RoomCreateResponseHdr response{};
+        response.magic = CTRL_MAGIC;
+        response.type = CtrlHdr::Cmd::ROOM_CREATE_RESPONSE;
+        response.request_id = request.request_id;
+
+        if (profile_id.empty()) {
+            response.status = ROOM_STATUS_BAD_REQUEST;
+            packet_builder::write_fixed(response.reason, "missing profile id");
+            send_room_create_response(response);
+            return;
+        }
+        if (!can_issue_room_join_ticket()) {
+            response.status = ROOM_STATUS_SERVER_ERROR;
+            packet_builder::write_fixed(response.reason, "join secret not configured");
+            send_room_create_response(response);
+            return;
+        }
+
+        auto result =
+            room_registry_.create_room(room_id, room_name, password_hash, now);
+        if (!result.ok) {
+            response.status = result.reason == "room already exists"
+                                  ? ROOM_STATUS_CONFLICT
+                                  : ROOM_STATUS_BAD_REQUEST;
+            response.flags = room_flags(result.room);
+            response.access_epoch = result.room.access_epoch;
+            packet_builder::write_fixed(response.room_id, result.room.room_id);
+            packet_builder::write_fixed(response.room_name, result.room.room_name);
+            packet_builder::write_fixed(response.room_instance_id,
+                                        result.room.room_instance_id);
+            packet_builder::write_fixed(response.reason, result.reason);
+            send_room_create_response(response);
+            return;
+        }
+
+        const auto ticket = create_join_ticket(result.room, profile_id);
+        if (!ticket.has_value()) {
+            response.status = ROOM_STATUS_SERVER_ERROR;
+            packet_builder::write_fixed(response.reason, "could not issue join token");
+            send_room_create_response(response);
+            return;
+        }
+
+        response.status = ROOM_STATUS_OK;
+        response.flags = room_flags(result.room) | ROOM_FLAG_CREATED;
+        response.access_epoch = result.room.access_epoch;
+        packet_builder::write_fixed(response.room_id, result.room.room_id);
+        packet_builder::write_fixed(response.room_name, result.room.room_name);
+        packet_builder::write_fixed(response.room_instance_id, result.room.room_instance_id);
+        packet_builder::write_fixed(response.admin_token, result.admin_token);
+        packet_builder::write_fixed(response.join_token, *ticket);
+        send_room_create_response(response);
+    }
+
+    void send_room_join_token_response(const RoomJoinTokenResponseHdr& response) {
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(response));
+        std::memcpy(buf->data(), &response, sizeof(response));
+        send(buf->data(), buf->size(), remote_endpoint_, buf);
+    }
+
+    void handle_room_join_token_request(std::size_t bytes,
+                                        std::chrono::steady_clock::time_point now) {
+        if (bytes < sizeof(RoomJoinTokenRequestHdr)) {
+            return;
+        }
+        RoomJoinTokenRequestHdr request{};
+        std::memcpy(&request, recv_buf_.data(), sizeof(RoomJoinTokenRequestHdr));
+        const std::string room_id = fixed_string(request.room_id);
+        const std::string profile_id = fixed_string(request.profile_id);
+        const std::string password_hash = fixed_string(request.password_hash);
+
+        RoomJoinTokenResponseHdr response{};
+        response.magic = CTRL_MAGIC;
+        response.type = CtrlHdr::Cmd::ROOM_JOIN_TOKEN_RESPONSE;
+        response.request_id = request.request_id;
+
+        if (profile_id.empty()) {
+            response.status = ROOM_STATUS_BAD_REQUEST;
+            packet_builder::write_fixed(response.reason, "missing profile id");
+            send_room_join_token_response(response);
+            return;
+        }
+        if (!can_issue_room_join_ticket()) {
+            response.status = ROOM_STATUS_SERVER_ERROR;
+            packet_builder::write_fixed(response.reason, "join secret not configured");
+            send_room_join_token_response(response);
+            return;
+        }
+
+        const auto authorized =
+            room_registry_.authorize_join(room_id, password_hash, now);
+        if (!authorized.ok) {
+            response.status = authorized.reason == "room not found"
+                                  ? ROOM_STATUS_NOT_FOUND
+                                  : ROOM_STATUS_FORBIDDEN;
+            packet_builder::write_fixed(response.reason, authorized.reason);
+            send_room_join_token_response(response);
+            return;
+        }
+
+        const auto ticket = create_join_ticket(authorized.room, profile_id);
+        if (!ticket.has_value()) {
+            response.status = ROOM_STATUS_SERVER_ERROR;
+            packet_builder::write_fixed(response.reason, "could not issue join token");
+            send_room_join_token_response(response);
+            return;
+        }
+
+        response.status = ROOM_STATUS_OK;
+        response.flags = room_flags(authorized.room);
+        response.access_epoch = authorized.room.access_epoch;
+        packet_builder::write_fixed(response.room_id, authorized.room.room_id);
+        packet_builder::write_fixed(response.room_name, authorized.room.room_name);
+        packet_builder::write_fixed(response.room_instance_id,
+                                    authorized.room.room_instance_id);
+        packet_builder::write_fixed(response.join_token, *ticket);
+        send_room_join_token_response(response);
+    }
+
+    void send_room_admin_response(const RoomAdminResponseHdr& response) {
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(response));
+        std::memcpy(buf->data(), &response, sizeof(response));
+        send(buf->data(), buf->size(), remote_endpoint_, buf);
+    }
+
+    void handle_room_admin_request(std::size_t bytes,
+                                   std::chrono::steady_clock::time_point now) {
+        if (bytes < sizeof(RoomAdminRequestHdr)) {
+            return;
+        }
+        RoomAdminRequestHdr request{};
+        std::memcpy(&request, recv_buf_.data(), sizeof(RoomAdminRequestHdr));
+        const std::string room_id = fixed_string(request.room_id);
+        const std::string admin_token = fixed_string(request.admin_token);
+        const std::string password_hash = fixed_string(request.password_hash);
+
+        RoomAdminResponseHdr response{};
+        response.magic = CTRL_MAGIC;
+        response.type = CtrlHdr::Cmd::ROOM_ADMIN_RESPONSE;
+        response.request_id = request.request_id;
+        response.target_participant_id = request.target_participant_id;
+        packet_builder::write_fixed(response.room_id, room_id);
+
+        room_registry::AuthorizeResult authorized;
+        switch (request.command) {
+            case ROOM_ADMIN_CHANGE_PASSWORD:
+                authorized =
+                    room_registry_.change_password(room_id, admin_token, password_hash, now);
+                break;
+            case ROOM_ADMIN_KICK_PARTICIPANT:
+                authorized = room_registry_.authorize_admin(room_id, admin_token, now);
+                if (authorized.ok) {
+                    if (kick_room_participant(room_id, request.target_participant_id, now,
+                                              &response)) {
+                        authorized =
+                            room_registry_.rotate_access_epoch(room_id, admin_token, now);
+                    }
+                }
+                break;
+            case ROOM_ADMIN_CLOSE_ROOM:
+                authorized = room_registry_.close_room(room_id, admin_token, now);
+                if (authorized.ok) {
+                    remove_all_room_participants(room_id, now);
+                }
+                break;
+            default:
+                response.status = ROOM_STATUS_BAD_REQUEST;
+                packet_builder::write_fixed(response.reason, "unknown admin command");
+                send_room_admin_response(response);
+                return;
+        }
+
+        if (!authorized.ok) {
+            response.status = authorized.reason == "room not found" ? ROOM_STATUS_NOT_FOUND
+                                                                    : ROOM_STATUS_FORBIDDEN;
+            packet_builder::write_fixed(response.reason, authorized.reason);
+            send_room_admin_response(response);
+            return;
+        }
+        if (response.status != ROOM_STATUS_OK) {
+            send_room_admin_response(response);
+            return;
+        }
+
+        response.status = ROOM_STATUS_OK;
+        response.flags = room_flags(authorized.room);
+        response.access_epoch = authorized.room.access_epoch;
+        packet_builder::write_fixed(response.reason, "ok");
+        send_room_admin_response(response);
+    }
+
+    bool kick_room_participant(const std::string& room_id, uint32_t participant_id,
+                               std::chrono::steady_clock::time_point now,
+                               RoomAdminResponseHdr* response) {
+        if (participant_id == 0) {
+            if (response != nullptr) {
+                response->status = ROOM_STATUS_BAD_REQUEST;
+                packet_builder::write_fixed(response->reason, "missing participant id");
+            }
+            return false;
+        }
+
+        const auto removed =
+            client_manager_.remove_room_client_with_info(room_id, participant_id);
+        if (!removed.has_value()) {
+            if (response != nullptr) {
+                response->status = ROOM_STATUS_NOT_FOUND;
+                packet_builder::write_fixed(response->reason, "participant not found");
+            }
+            return false;
+        }
+
+        release_token_nonce_for_client(removed->second);
+        rate_limiter_.erase(removed->first);
+        broadcast_participant_leave(removed->second.client_id);
+        cleanup_empty_rooms(now);
+        return true;
+    }
+
+    void remove_all_room_participants(const std::string& room_id,
+                                      std::chrono::steady_clock::time_point now) {
+        const auto removed = client_manager_.remove_room_clients_with_info(room_id);
+        for (const auto& [endpoint, info]: removed) {
+            release_token_nonce_for_client(info);
+            rate_limiter_.erase(endpoint);
+            broadcast_participant_leave(info.client_id);
+        }
+        cleanup_empty_rooms(now);
     }
 
     void cleanup_used_token_nonces() {
@@ -422,7 +767,7 @@ private:
                       remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id);
             return;
         }
-        std::optional<ClientManager::ClientSecurityConfig> security;
+        std::optional<performer_join_token::ValidatedToken> validated_token;
         if (!token.empty() && !options_.allow_insecure_dev_joins) {
             const auto result = performer_join_token::validate_with_claims(
                 token, options_.join_secret, options_.server_id, room_id, profile_id);
@@ -432,14 +777,36 @@ private:
                           result.reason);
                 return;
             }
-            if (!reserve_token_nonce(result, remote_endpoint_)) {
+            validated_token = result;
+        }
+
+        room_registry::RoomSnapshot room_snapshot;
+        if (validated_token.has_value() &&
+            !validated_token->claims.room_instance_id.empty()) {
+            const auto room_check = room_registry_.validate_claims(
+                room_id, validated_token->claims.room_instance_id,
+                validated_token->claims.access_epoch, now);
+            if (!room_check.ok) {
+                spdlog::warn("Rejecting JOIN from {}:{} room '{}': {}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                          room_id, room_check.reason);
+                return;
+            }
+            room_snapshot = room_check.room;
+        } else {
+            room_snapshot = room_registry_.ensure_open_room(room_id, now);
+        }
+
+        std::optional<ClientManager::ClientSecurityConfig> security;
+        if (validated_token.has_value()) {
+            if (!reserve_token_nonce(*validated_token, remote_endpoint_)) {
                 spdlog::warn("Rejecting JOIN from {}:{} room '{}': token nonce replay",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(), room_id);
                 return;
             }
             ClientManager::ClientSecurityConfig config;
-            config.session_key = session_crypto::derive_key_from_join_token(result);
-            config.token_nonce_key = session_crypto::nonce_replay_key(result.claims);
+            config.session_key = session_crypto::derive_key_from_join_token(*validated_token);
+            config.token_nonce_key = session_crypto::nonce_replay_key(validated_token->claims);
             security = config;
         }
 
@@ -460,6 +827,7 @@ private:
         }
 
         uint32_t client_id = registration.client_id;
+        room_registry_.mark_joined(room_snapshot.room_id, now);
         spdlog::info(
                   "JOIN: {}:{} room='{}' user='{}' display='{}' "
                   "(ID: {}, {}, capabilities=0x{:08x})",
@@ -859,6 +1227,7 @@ private:
             spdlog::info("Client timed out (ID: {})", timed_out_id);
             broadcast_participant_leave(timed_out_id);
         }
+        cleanup_empty_rooms(now);
 
         export_metrics_snapshot();
         log_audio_forward_summary();
@@ -1397,6 +1766,7 @@ private:
     std::chrono::steady_clock::time_point started_at_;
 
     ClientManager client_manager_;
+    room_registry::RoomRegistry room_registry_;
     std::unordered_map<udp::endpoint, UnknownEndpointInfo, endpoint_hash> unknown_endpoints_;
     std::unordered_map<std::string, UsedTokenNonce> used_token_nonces_;
     std::unordered_map<uint32_t, AudioIngressStats> audio_ingress_stats_;

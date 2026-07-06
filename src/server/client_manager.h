@@ -110,6 +110,34 @@ public:
         return info;
     }
 
+    std::optional<std::pair<endpoint, ClientInfo>> remove_room_client_with_info(
+        const std::string& room_id, uint32_t client_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = clients_.begin(); it != clients_.end(); ++it) {
+            if (it->second.room_id == room_id && it->second.client_id == client_id) {
+                auto removed = std::make_pair(it->first, it->second);
+                clients_.erase(it);
+                return removed;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::vector<std::pair<endpoint, ClientInfo>> remove_room_clients_with_info(
+        const std::string& room_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::pair<endpoint, ClientInfo>> removed;
+        for (auto it = clients_.begin(); it != clients_.end();) {
+            if (it->second.room_id == room_id) {
+                removed.emplace_back(it->first, it->second);
+                it = clients_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return removed;
+    }
+
     // Check if client exists
     bool exists(const endpoint& ep) const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -186,6 +214,15 @@ public:
             endpoints.push_back(ep);
         }
         return endpoints;
+    }
+
+    std::unordered_map<std::string, size_t> room_counts() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::unordered_map<std::string, size_t> counts;
+        for (const auto& [_, info]: clients_) {
+            ++counts[info.room_id];
+        }
+        return counts;
     }
 
     std::vector<endpoint> get_room_endpoints_except(const endpoint& exclude) const {

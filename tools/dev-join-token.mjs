@@ -9,6 +9,8 @@ const defaults = {
   codec: "opus",
   frames: "120",
   ttlMs: "120000",
+  roomInstance: "",
+  accessEpoch: "0",
   client: "./build/Debug/client.exe",
 };
 
@@ -27,6 +29,8 @@ function parseArgs(argv) {
     else if (arg === "--codec" && next) options.codec = argv[++i];
     else if (arg === "--frames" && next) options.frames = argv[++i];
     else if (arg === "--ttl-ms" && next) options.ttlMs = argv[++i];
+    else if (arg === "--room-instance" && next) options.roomInstance = argv[++i];
+    else if (arg === "--access-epoch" && next) options.accessEpoch = argv[++i];
     else if (arg === "--client" && next) options.client = argv[++i];
   }
   return options;
@@ -40,6 +44,7 @@ function usage() {
       "",
       "optional:",
       "  --server-id local-dev --server 127.0.0.1 --port 9999 --codec opus --frames 120 --ttl-ms 120000",
+      "  --room-instance <id> --access-epoch <n>",
     ].join("\n"),
   );
 }
@@ -47,6 +52,23 @@ function usage() {
 function shellQuote(value) {
   if (/^[A-Za-z0-9_./:=+-]+$/.test(value)) return value;
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function claimField(value) {
+  const text = String(value);
+  return `${Buffer.byteLength(text, "utf8")}:${text}`;
+}
+
+function tokenPayload(fields) {
+  return fields.map(claimField).join("");
+}
+
+function base64Url(value) {
+  return Buffer.from(value, "utf8")
+    .toString("base64")
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
 }
 
 const options = parseArgs(process.argv.slice(2));
@@ -59,23 +81,20 @@ const displayName = options.displayName ?? options.user;
 const expiresAtMs = Date.now() + Number.parseInt(options.ttlMs, 10);
 const nonce = crypto.randomBytes(16).toString("hex");
 const payload = [
-  "v1",
   expiresAtMs,
   options.serverId,
   options.room,
   options.user,
+  options.roomInstance,
+  options.accessEpoch,
   nonce,
-].join("|");
-const signature = crypto.createHmac("sha256", options.secret).update(payload).digest("hex");
-const token = [
-  "v1",
-  expiresAtMs,
-  options.serverId,
-  options.room,
-  options.user,
-  nonce,
-  signature,
-].join(".");
+];
+const encodedPayload = tokenPayload(payload);
+const signature = crypto
+  .createHmac("sha256", options.secret)
+  .update(`v2|${encodedPayload}`)
+  .digest("hex");
+const token = ["v2", base64Url(encodedPayload), signature].join(".");
 
 const command = [
   options.client,

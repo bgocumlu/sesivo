@@ -59,6 +59,14 @@ public:
         return control_[ep].allow(now, 120.0, 240.0);
     }
 
+    bool allow_status(const endpoint& ep, time_point now) {
+        return status_[ep].allow(now, 0.1, 2.0);
+    }
+
+    bool allow_room_control(const endpoint& ep, time_point now) {
+        return room_control_[ep].allow(now, 2.0, 8.0);
+    }
+
     bool allow_authenticated_audio(const endpoint& ep, uint32_t sample_rate,
                                    uint16_t frame_count, time_point now) {
         if (sample_rate == 0 || frame_count == 0) {
@@ -75,6 +83,8 @@ public:
         unknown_.erase(ep);
         strict_.erase(ep);
         control_.erase(ep);
+        status_.erase(ep);
+        room_control_.erase(ep);
         audio_.erase(ep);
     }
 
@@ -82,6 +92,8 @@ private:
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> unknown_;
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> strict_;
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> control_;
+    std::unordered_map<endpoint, TokenBucket, endpoint_hash> status_;
+    std::unordered_map<endpoint, TokenBucket, endpoint_hash> room_control_;
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> audio_;
 };
 

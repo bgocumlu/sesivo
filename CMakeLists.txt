@@ -52,6 +52,9 @@ if(JAM_BUILD_TESTS)
     jam_add_self_test(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)
     target_link_libraries(server_rate_limiter_self_test PRIVATE asio)
 
+    jam_add_self_test(room_registry_self_test room_registry_self_test.cpp)
+    target_link_libraries(room_registry_self_test PRIVATE token_crypto)
+
     jam_add_self_test(server_metrics_self_test server_metrics_self_test.cpp)
 
     jam_add_self_test(periodic_timer_self_test periodic_timer_self_test.cpp)
@@ -113,6 +116,7 @@ if(JAM_BUILD_TESTS)
 
     jam_add_executable_test(client_manager_self_test)
     jam_add_executable_test(server_rate_limiter_self_test)
+    jam_add_executable_test(room_registry_self_test)
     jam_add_executable_test(server_metrics_self_test)
     jam_add_executable_test(periodic_timer_self_test)
     jam_add_executable_test(crash_reporter_self_test)

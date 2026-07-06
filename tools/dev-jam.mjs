@@ -14,6 +14,8 @@ const DEV = {
   codec: "opus",
   frames: "120",
   ttlMs: 10 * 60 * 1000,
+  roomInstance: "",
+  accessEpoch: "0",
   serverExe: "build/Debug/server.exe",
   clientExe: "build/Debug/client.exe",
   clients: {
@@ -29,21 +31,41 @@ function abs(relativePath) {
   return path.resolve(repoRoot, relativePath);
 }
 
+function claimField(value) {
+  const text = String(value);
+  return `${Buffer.byteLength(text, "utf8")}:${text}`;
+}
+
+function tokenPayload(fields) {
+  return fields.map(claimField).join("");
+}
+
+function base64Url(value) {
+  return Buffer.from(value, "utf8")
+    .toString("base64")
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
 function tokenFor(client) {
   const expiresAtMs = Date.now() + DEV.ttlMs;
   const nonce = crypto.randomBytes(16).toString("hex");
   const payload = [
-    "v1",
     expiresAtMs,
     DEV.serverId,
     client.room,
     client.user,
+    DEV.roomInstance,
+    DEV.accessEpoch,
     nonce,
-  ].join("|");
-  const signature = crypto.createHmac("sha256", DEV.secret).update(payload).digest("hex");
-  return ["v1", expiresAtMs, DEV.serverId, client.room, client.user, nonce, signature].join(
-    ".",
-  );
+  ];
+  const encodedPayload = tokenPayload(payload);
+  const signature = crypto
+    .createHmac("sha256", DEV.secret)
+    .update(`v2|${encodedPayload}`)
+    .digest("hex");
+  return ["v2", base64Url(encodedPayload), signature].join(".");
 }
 
 function run(command, args) {

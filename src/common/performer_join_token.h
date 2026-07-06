@@ -4,9 +4,11 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <picosha2.h>
@@ -18,6 +20,8 @@ struct Claims {
     std::string server_id;
     std::string room_id;
     std::string profile_id;
+    std::string room_instance_id;
+    uint32_t    access_epoch = 0;
     std::string nonce;
 };
 
@@ -50,6 +54,60 @@ inline std::string hex(const std::vector<unsigned char>& bytes) {
     return out;
 }
 
+inline std::string base64url_encode(const std::string& input) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string output;
+    output.reserve((input.size() * 4 + 2) / 3);
+
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (unsigned char byte: input) {
+        buffer = (buffer << 8) | byte;
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            output.push_back(alphabet[(buffer >> bits) & 0x3F]);
+        }
+    }
+    if (bits > 0) {
+        output.push_back(alphabet[(buffer << (6 - bits)) & 0x3F]);
+    }
+    return output;
+}
+
+inline std::optional<std::string> base64url_decode(const std::string& input) {
+    std::array<int, 256> values{};
+    values.fill(-1);
+    for (int i = 0; i < 26; ++i) {
+        values[static_cast<unsigned char>('A' + i)] = i;
+        values[static_cast<unsigned char>('a' + i)] = 26 + i;
+    }
+    for (int i = 0; i < 10; ++i) {
+        values[static_cast<unsigned char>('0' + i)] = 52 + i;
+    }
+    values[static_cast<unsigned char>('-')] = 62;
+    values[static_cast<unsigned char>('_')] = 63;
+
+    std::string output;
+    output.reserve((input.size() * 3) / 4);
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (unsigned char c: input) {
+        const int value = values[c];
+        if (value < 0) {
+            return std::nullopt;
+        }
+        buffer = (buffer << 6) | static_cast<uint32_t>(value);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            output.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+        }
+    }
+    return output;
+}
+
 inline std::vector<unsigned char> sha256(const std::vector<unsigned char>& bytes) {
     std::vector<unsigned char> digest(picosha2::k_digest_size);
     picosha2::hash256(bytes.begin(), bytes.end(), digest.begin(), digest.end());
@@ -80,9 +138,95 @@ inline std::string hmac_sha256_hex(const std::string& secret, const std::string&
     return hex(sha256(outer));
 }
 
+inline void append_claim_field(std::string& payload, const std::string& value) {
+    payload += std::to_string(value.size());
+    payload.push_back(':');
+    payload += value;
+}
+
+inline std::string claims_payload(const Claims& claims) {
+    std::string payload;
+    append_claim_field(payload, std::to_string(claims.expires_at_ms));
+    append_claim_field(payload, claims.server_id);
+    append_claim_field(payload, claims.room_id);
+    append_claim_field(payload, claims.profile_id);
+    append_claim_field(payload, claims.room_instance_id);
+    append_claim_field(payload, std::to_string(claims.access_epoch));
+    append_claim_field(payload, claims.nonce);
+    return payload;
+}
+
+inline bool read_claim_field(const std::string& payload, size_t& offset,
+                             std::string& value) {
+    const size_t colon = payload.find(':', offset);
+    if (colon == std::string::npos || colon == offset) {
+        return false;
+    }
+    for (size_t i = offset; i < colon; ++i) {
+        if (payload[i] < '0' || payload[i] > '9') {
+            return false;
+        }
+    }
+
+    size_t length = 0;
+    try {
+        length = static_cast<size_t>(std::stoull(payload.substr(offset, colon - offset)));
+    } catch (...) {
+        return false;
+    }
+
+    const size_t value_offset = colon + 1;
+    if (length > payload.size() - value_offset) {
+        return false;
+    }
+    value = payload.substr(value_offset, length);
+    offset = value_offset + length;
+    return true;
+}
+
+inline std::optional<Claims> claims_from_payload(const std::string& payload,
+                                                 std::string& reason) {
+    std::array<std::string, 7> fields;
+    size_t offset = 0;
+    for (auto& field: fields) {
+        if (!read_claim_field(payload, offset, field)) {
+            reason = "malformed token payload";
+            return std::nullopt;
+        }
+    }
+    if (offset != payload.size()) {
+        reason = "malformed token payload";
+        return std::nullopt;
+    }
+
+    Claims claims;
+    try {
+        claims.expires_at_ms = std::stoll(fields[0]);
+    } catch (...) {
+        reason = "malformed expiry";
+        return std::nullopt;
+    }
+    claims.server_id = fields[1];
+    claims.room_id = fields[2];
+    claims.profile_id = fields[3];
+    claims.room_instance_id = fields[4];
+    try {
+        const unsigned long epoch = std::stoul(fields[5]);
+        if (epoch > UINT32_MAX) {
+            reason = "malformed access epoch";
+            return std::nullopt;
+        }
+        claims.access_epoch = static_cast<uint32_t>(epoch);
+    } catch (...) {
+        reason = "malformed access epoch";
+        return std::nullopt;
+    }
+    claims.nonce = fields[6];
+    return claims;
+}
+
 inline std::string signing_message(const Claims& claims) {
-    return "v1|" + std::to_string(claims.expires_at_ms) + "|" + claims.server_id + "|" +
-           claims.room_id + "|" + claims.profile_id + "|" + claims.nonce;
+    return "v2|" + claims_payload(claims);
 }
 
 inline std::string random_nonce() {
@@ -102,9 +246,7 @@ inline std::string sign(const Claims& claims, const std::string& secret) {
 }
 
 inline std::string create(const Claims& claims, const std::string& secret) {
-    return "v1." + std::to_string(claims.expires_at_ms) + "." + claims.server_id + "." +
-           claims.room_id + "." + claims.profile_id + "." + claims.nonce + "." +
-           sign(claims, secret);
+    return "v2." + base64url_encode(claims_payload(claims)) + "." + sign(claims, secret);
 }
 
 inline std::vector<std::string> split(const std::string& value, char delimiter) {
@@ -128,10 +270,39 @@ inline bool constant_time_equal(const std::string& left, const std::string& righ
     return diff == 0;
 }
 
+inline std::optional<ValidatedToken> parse_unverified(const std::string& token,
+                                                      std::string& reason) {
+    const auto parts = split(token, '.');
+    if (parts.size() != 3 || parts[0] != "v2") {
+        reason = "malformed token";
+        return std::nullopt;
+    }
+
+    const auto payload = base64url_decode(parts[1]);
+    if (!payload.has_value()) {
+        reason = "malformed token payload";
+        return std::nullopt;
+    }
+
+    auto claims = claims_from_payload(*payload, reason);
+    if (!claims.has_value()) {
+        return std::nullopt;
+    }
+
+    ValidatedToken parsed;
+    parsed.claims = std::move(*claims);
+    parsed.signature_hex = parts[2];
+    parsed.signing_input = signing_message(parsed.claims);
+    parsed.ok = true;
+    return parsed;
+}
+
 inline ValidatedToken validate_with_claims(const std::string& token, const std::string& secret,
                                            const std::string& expected_server_id,
                                            const std::string& expected_room_id,
-                                           const std::string& expected_profile_id) {
+                                           const std::string& expected_profile_id,
+                                           const std::string& expected_room_instance_id = {},
+                                           uint32_t expected_access_epoch = 0) {
     ValidatedToken detailed;
 
     if (secret.empty()) {
@@ -139,26 +310,17 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
         return detailed;
     }
 
-    const auto parts = split(token, '.');
-    if (parts.size() != 7 || parts[0] != "v1") {
-        detailed.reason = "malformed token";
+    std::string parse_reason;
+    auto parsed = parse_unverified(token, parse_reason);
+    if (!parsed.has_value()) {
+        detailed.reason = parse_reason;
         return detailed;
     }
 
-    Claims claims;
-    try {
-        claims.expires_at_ms = std::stoll(parts[1]);
-    } catch (...) {
-        detailed.reason = "malformed expiry";
-        return detailed;
-    }
-    claims.server_id  = parts[2];
-    claims.room_id    = parts[3];
-    claims.profile_id = parts[4];
-    claims.nonce      = parts[5];
+    Claims claims = parsed->claims;
     detailed.claims = claims;
-    detailed.signature_hex = parts[6];
-    detailed.signing_input = signing_message(claims);
+    detailed.signature_hex = parsed->signature_hex;
+    detailed.signing_input = parsed->signing_input;
 
     if (claims.expires_at_ms < now_ms()) {
         detailed.reason = "expired token";
@@ -176,8 +338,17 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
         detailed.reason = "wrong profile id";
         return detailed;
     }
+    if (!expected_room_instance_id.empty() &&
+        claims.room_instance_id != expected_room_instance_id) {
+        detailed.reason = "wrong room instance";
+        return detailed;
+    }
+    if (expected_access_epoch != 0 && claims.access_epoch != expected_access_epoch) {
+        detailed.reason = "wrong room access epoch";
+        return detailed;
+    }
     const std::string expected_signature = sign(claims, secret);
-    if (!constant_time_equal(expected_signature, parts[6])) {
+    if (!constant_time_equal(expected_signature, parsed->signature_hex)) {
         detailed.reason = "invalid signature";
         return detailed;
     }
@@ -189,9 +360,13 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
 inline ValidationResult validate(const std::string& token, const std::string& secret,
                                  const std::string& expected_server_id,
                                  const std::string& expected_room_id,
-                                 const std::string& expected_profile_id) {
+                                 const std::string& expected_profile_id,
+                                 const std::string& expected_room_instance_id = {},
+                                 uint32_t expected_access_epoch = 0) {
     const auto detailed = validate_with_claims(token, secret, expected_server_id,
-                                               expected_room_id, expected_profile_id);
+                                               expected_room_id, expected_profile_id,
+                                               expected_room_instance_id,
+                                               expected_access_epoch);
     return {detailed.ok, detailed.reason};
 }
 

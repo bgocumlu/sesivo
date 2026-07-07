@@ -730,7 +730,6 @@ void JuceMixerComponent::configure_controls() {
     configure_section(recording_label_, "Record");
     configure_section(wav_label_, "WAV");
     configure_section(room_admin_label_, "Room Admin");
-    configure_caption(input_gain_label_, "Input");
     configure_caption(packet_label_, "Packet");
     configure_caption(jitter_label_, "Jitter");
     configure_caption(queue_label_, "Queue");
@@ -746,7 +745,7 @@ void JuceMixerComponent::configure_controls() {
     mic_mute_button_.setButtonText("Mute mic");
     mic_mute_button_.setClickingTogglesState(true);
     monitor_toggle_.setButtonText("Monitor");
-    configure_linear_slider(input_gain_slider_, 0.0, 2.0, 0.01, "x");
+    monitor_toggle_.setClickingTogglesState(true);
     configure_linear_slider(jitter_ms_slider_, 0.0, 200.0, 1.0, " ms");
     configure_linear_slider(queue_limit_slider_, 1.0, MAX_OPUS_QUEUE_LIMIT_PACKETS, 1.0,
                             " pkt");
@@ -779,13 +778,13 @@ void JuceMixerComponent::configure_controls() {
                     &local_audio_label_, &network_label_, &redundancy_section_label_,
                     &metronome_label_, &recording_label_, &wav_label_,
                     &room_admin_label_, &room_admin_status_label_,
-                    &input_gain_label_, &packet_label_, &jitter_label_,
-                    &queue_label_, &age_limit_label_, &redundancy_label_,
+                    &packet_label_, &jitter_label_, &queue_label_,
+                    &age_limit_label_, &redundancy_label_,
                     &wav_position_label_, &wav_gain_label_,
                     &room_settings_button_, &room_participants_button_,
                     &room_close_button_, &room_copy_invite_button_,
-                    &mic_mute_button_, &monitor_toggle_, &input_gain_slider_,
-                    &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
+                    &mic_mute_button_, &monitor_toggle_, &jitter_ms_slider_,
+                    &queue_limit_slider_, &age_limit_slider_,
                     &auto_jitter_toggle_, &redundancy_combo_, &bpm_editor_,
                     &metronome_start_stop_button_, &metronome_tap_button_,
                     &record_button_, &wav_path_editor_, &wav_load_button_,
@@ -805,11 +804,6 @@ void JuceMixerComponent::configure_controls() {
     monitor_toggle_.onClick = [this]() {
         if (!updating_from_client_) {
             client_.set_self_monitor_enabled(monitor_toggle_.getToggleState());
-        }
-    };
-    input_gain_slider_.onValueChange = [this]() {
-        if (!updating_from_client_) {
-            client_.set_input_gain(static_cast<float>(input_gain_slider_.getValue()));
         }
     };
     jitter_ms_slider_.onValueChange = [this]() {
@@ -1034,9 +1028,7 @@ void JuceMixerComponent::resized() {
     auto monitor_row = local.removeFromTop(ROW);
     mic_mute_button_.setBounds(monitor_row.removeFromLeft(86).reduced(2));
     monitor_row.removeFromLeft(control_gap);
-    monitor_toggle_.setBounds(monitor_row.removeFromLeft(82).reduced(2));
-    monitor_row.removeFromLeft(control_gap);
-    set_labeled_row(monitor_row, input_gain_label_, input_gain_slider_, 44);
+    monitor_toggle_.setBounds(monitor_row.removeFromLeft(86).reduced(2));
     local.removeFromTop(4);
     auto action_row = local.removeFromTop(ROW);
     apply_audio_button_.setBounds(action_row.removeFromLeft(58).reduced(2));
@@ -1181,7 +1173,6 @@ void JuceMixerComponent::refresh_live_state() {
     mic_mute_button_.setToggleState(client_.get_mic_muted(), juce::dontSendNotification);
     monitor_toggle_.setToggleState(client_.get_self_monitor_enabled(),
                                    juce::dontSendNotification);
-    input_gain_slider_.setValue(client_.get_input_gain(), juce::dontSendNotification);
     jitter_ms_slider_.setValue(client_.get_opus_jitter_buffer_ms(),
                                juce::dontSendNotification);
     queue_limit_slider_.setValue(static_cast<double>(client_.get_opus_queue_limit_packets()),

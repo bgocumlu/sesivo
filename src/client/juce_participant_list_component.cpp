@@ -9,7 +9,7 @@ namespace {
 constexpr int PAD = 10;
 constexpr int PARTICIPANT_ROW_HEIGHT = 64;
 constexpr int NAME_WIDTH = 200;
-constexpr int LEVEL_WIDTH = 286;
+constexpr int LEVEL_WIDTH = 220;
 constexpr int BUTTONS_WIDTH = 86;
 constexpr int GAIN_WIDTH = 170;
 constexpr int PAN_WIDTH = 94;
@@ -18,6 +18,9 @@ constexpr int STATUS_WIDTH = 112;
 constexpr int JITTER_WIDTH = 76;
 constexpr int MS_WIDTH = 64;
 constexpr int RESET_WIDTH = 72;
+constexpr int CONTENT_MIN_WIDTH =
+    PAD * 2 + NAME_WIDTH + 8 + LEVEL_WIDTH + BUTTONS_WIDTH + GAIN_WIDTH +
+    PAN_WIDTH + QUEUE_WIDTH + STATUS_WIDTH + JITTER_WIDTH + MS_WIDTH + RESET_WIDTH;
 
 juce::String participant_name(const ParticipantInfo& participant) {
     if (!participant.display_name.empty()) {
@@ -586,7 +589,8 @@ void JuceParticipantListComponent::resized() {
     participants_viewport_.setBounds(area);
 
     const int content_width =
-        std::max(area.getWidth() - participants_viewport_.getScrollBarThickness(), 1280);
+        std::max(area.getWidth() - participants_viewport_.getScrollBarThickness(),
+                 CONTENT_MIN_WIDTH);
     const size_t visible_row_count =
         visible_participant_count_ + (local_participant_visible_ ? size_t{1} : size_t{0});
     participants_content_.setSize(content_width,

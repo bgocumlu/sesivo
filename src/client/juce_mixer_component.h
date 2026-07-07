@@ -167,7 +167,6 @@ private:
     juce::Label wav_label_;
     juce::Label room_admin_label_;
     juce::Label room_admin_status_label_;
-    juce::Label input_gain_label_;
     juce::Label packet_label_;
     juce::Label jitter_label_;
     juce::Label queue_label_;
@@ -185,8 +184,7 @@ private:
     juce::TextButton room_copy_invite_button_;
 
     juce::TextButton mic_mute_button_;
-    juce::ToggleButton monitor_toggle_;
-    juce::Slider input_gain_slider_;
+    juce::TextButton monitor_toggle_;
     juce::Slider jitter_ms_slider_;
     juce::Slider queue_limit_slider_;
     juce::Slider age_limit_slider_;

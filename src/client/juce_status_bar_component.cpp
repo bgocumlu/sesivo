@@ -82,11 +82,11 @@ void JuceStatusBarComponent::paint(juce::Graphics& g) {
     juce_theme::draw_wordmark(g, brand.reduced(0, 12), 27.0F);
 
     draw_metric(g, area.removeFromLeft(170), "Room", room_text_);
-    draw_metric(g, area.removeFromLeft(174), "State", state_text_,
+    draw_metric(g, area.removeFromLeft(146), "State", state_text_,
                 joined_ ? juce_theme::colour::success()
                         : juce_theme::colour::warning());
-    draw_metric(g, area.removeFromLeft(112), "Users", users_text_);
-    draw_metric(g, area.removeFromLeft(166), "Server", server_text_);
+    draw_metric(g, area.removeFromLeft(82), "Users", users_text_);
+    draw_metric(g, area.removeFromLeft(190), "Server", server_text_);
     draw_metric(g, area.removeFromLeft(112), "RTT", rtt_text_);
     draw_metric(g, area.removeFromLeft(116), "RX", rx_text_);
     draw_metric(g, area.removeFromLeft(116), "TX", tx_text_);

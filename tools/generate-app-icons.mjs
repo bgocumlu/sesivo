@@ -80,26 +80,6 @@ function drawRoundedRect(buffer, size, rect, radius, colour) {
   }
 }
 
-function drawCircle(buffer, size, cx, cy, radius, colour) {
-  const aa = 1.15 / size;
-  const minX = Math.max(0, Math.floor((cx - radius) * size) - 2);
-  const maxX = Math.min(size, Math.ceil((cx + radius) * size) + 2);
-  const minY = Math.max(0, Math.floor((cy - radius) * size) - 2);
-  const maxY = Math.min(size, Math.ceil((cy + radius) * size) + 2);
-
-  for (let y = minY; y < maxY; y += 1) {
-    for (let x = minX; x < maxX; x += 1) {
-      const px = (x + 0.5) / size;
-      const py = (y + 0.5) / size;
-      const distance = Math.hypot(px - cx, py - cy) - radius;
-      const coverage = clamp(0.5 - distance / aa);
-      if (coverage > 0) {
-        compositePixel(buffer, (y * size + x) * 4, colour, coverage);
-      }
-    }
-  }
-}
-
 function renderIcon(size) {
   const buffer = Buffer.alloc(size * size * 4);
 
@@ -126,9 +106,6 @@ function renderIcon(size) {
       bar.c,
     );
   }
-
-  drawCircle(buffer, size, 0.43, 0.72, 0.025, colours.mark);
-  drawCircle(buffer, size, 0.57, 0.28, 0.022, colours.light);
 
   return buffer;
 }
@@ -231,8 +208,6 @@ function writeSvg(outputPath) {
   <rect x="520" y="256" width="46" height="512" rx="23" fill="#d7682c"/>
   <rect x="602" y="328" width="46" height="348" rx="23" fill="#e0844c"/>
   <rect x="684" y="389" width="46" height="246" rx="23" fill="#e1dcd2"/>
-  <circle cx="440" cy="737" r="26" fill="#d7682c"/>
-  <circle cx="584" cy="287" r="23" fill="#e1dcd2"/>
 </svg>
 `;
   fs.writeFileSync(outputPath, svg);

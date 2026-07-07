@@ -17,8 +17,8 @@ if(APPLE AND JAM_BUILD_CLIENT)
     set(CPACK_GENERATOR "DragNDrop")
     set(CPACK_DMG_VOLUME_NAME "sesivo")
     set(CPACK_DMG_FORMAT "UDZO")
-    set(CPACK_DMG_DS_STORE
-        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/dmg.DS_Store"
+    set(CPACK_DMG_DS_STORE_SETUP_SCRIPT
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/dmg-layout.applescript"
     )
 
     include(CPack)

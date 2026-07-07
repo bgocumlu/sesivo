@@ -42,7 +42,7 @@ fi
 build_dir="${BUILD_DIR:-build}"
 config="${CONFIG:-Release}"
 package_dir="${PACKAGE_DIR:-${build_dir}/package}"
-app_path="${build_dir}/sesivo.app"
+app_path="${build_dir}/Sesivo.app"
 dmg_path="${package_dir}/sesivo-0.1.0.dmg"
 entitlements="packaging/macos/entitlements.plist"
 

@@ -90,6 +90,7 @@ set_target_properties(client PROPERTIES
 
 if(APPLE)
     set_target_properties(client PROPERTIES
+        OUTPUT_NAME Sesivo
         MACOSX_BUNDLE TRUE
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_client_info.plist.in"
         MACOSX_BUNDLE_BUNDLE_NAME "sesivo"

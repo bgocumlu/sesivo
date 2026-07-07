@@ -21,9 +21,9 @@ function defaultClientPath() {
   }
   if (process.platform === "darwin") {
     return firstExisting([
-      "./build/sesivo.app/Contents/MacOS/sesivo",
-      "./build/Debug/sesivo.app/Contents/MacOS/sesivo",
-      "./build/Release/sesivo.app/Contents/MacOS/sesivo",
+      "./build/Sesivo.app/Contents/MacOS/Sesivo",
+      "./build/Debug/Sesivo.app/Contents/MacOS/Sesivo",
+      "./build/Release/Sesivo.app/Contents/MacOS/Sesivo",
     ]);
   }
   return firstExisting(["./build/sesivo", "./build/Debug/sesivo", "./build/Release/sesivo"]);

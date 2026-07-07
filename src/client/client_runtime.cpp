@@ -234,7 +234,9 @@ public:
     }
 
     void reset_session_security() {
-        session_key_.store(nullptr, std::memory_order_release);
+        std::shared_ptr<const session_crypto::SessionKey> cleared;
+        std::atomic_store_explicit(&session_key_, std::move(cleared),
+                                   std::memory_order_release);
         secure_control_highest_sequence_.clear();
         secure_control_sequence_.store(1, std::memory_order_release);
     }
@@ -269,9 +271,10 @@ public:
             return;
         }
 
-        session_key_.store(
-            std::make_shared<const session_crypto::SessionKey>(*derived),
-            std::memory_order_release);
+        std::shared_ptr<const session_crypto::SessionKey> published =
+            std::make_shared<const session_crypto::SessionKey>(*derived);
+        std::atomic_store_explicit(&session_key_, std::move(published),
+                                   std::memory_order_release);
     }
 
     bool rotate_media_key(const std::string& media_secret) {
@@ -1676,7 +1679,7 @@ private:
     }
 
     std::shared_ptr<const session_crypto::SessionKey> current_session_key() const {
-        return session_key_.load(std::memory_order_acquire);
+        return std::atomic_load_explicit(&session_key_, std::memory_order_acquire);
     }
 
     bool accept_secure_control_sequence(uint32_t sender_id, uint32_t sequence) {
@@ -4640,7 +4643,7 @@ private:
     ClientMediaState media_state_;
     ClientMetronome metronome_;
     std::filesystem::path audio_preferences_path_;
-    std::atomic<std::shared_ptr<const session_crypto::SessionKey>> session_key_{nullptr};
+    std::shared_ptr<const session_crypto::SessionKey> session_key_;
     std::atomic<uint32_t> secure_control_sequence_{1};
     std::unordered_map<uint32_t, uint32_t> secure_control_highest_sequence_;
     session_crypto::E2EPublicKey e2e_public_key_{};

@@ -1240,7 +1240,6 @@ void JuceMixerComponent::refresh_live_state() {
     if (now_ms - last_participant_refresh_ms_ > 30.0) {
         last_participant_refresh_ms_ = now_ms;
         refresh_room_admin_controls(client_.get_participant_info());
-        participants_component_.refresh();
     }
 }
 

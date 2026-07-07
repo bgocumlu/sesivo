@@ -473,6 +473,7 @@ struct ParticipantData {
     std::atomic<int>                      opus_consecutive_empty_callbacks{0};
     std::atomic<int>                      underrun_count{0};
     std::atomic<float>                   current_level{0.0F};  // RMS audio level
+    std::atomic<float>                   current_peak{0.0F};
     std::atomic<bool>                    is_speaking{false};  // Voice activity detection
 
     // Adaptive jitter buffer tracking
@@ -518,6 +519,7 @@ struct ParticipantInfo {
     bool     is_speaking;
     bool     is_muted;
     float    audio_level;
+    float    audio_peak;
     float    gain;
     float    pan;  // 0.0 = full left, 0.5 = center, 1.0 = full right
     bool     buffer_ready;

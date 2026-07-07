@@ -7,7 +7,7 @@
 #include <memory>
 #include <vector>
 
-class JuceParticipantListComponent final : public juce::Component {
+class JuceParticipantListComponent final : public juce::Component, private juce::Timer {
 public:
     explicit JuceParticipantListComponent(ClientAppFacade& client);
     ~JuceParticipantListComponent() override;
@@ -17,6 +17,8 @@ public:
     void resized() override;
 
 private:
+    void timerCallback() override;
+
     class LocalParticipantRowComponent;
     class ParticipantRowComponent;
 

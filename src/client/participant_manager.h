@@ -350,6 +350,7 @@ private:
         info.is_speaking    = data.is_speaking.load(std::memory_order_relaxed);
         info.is_muted       = data.is_muted.load(std::memory_order_relaxed);
         info.audio_level    = data.current_level.load(std::memory_order_relaxed);
+        info.audio_peak     = data.current_peak.load(std::memory_order_relaxed);
         info.gain           = data.gain.load(std::memory_order_relaxed);
         info.pan            = data.pan.load(std::memory_order_relaxed);
         info.buffer_ready   = data.buffer_ready.load(std::memory_order_relaxed);

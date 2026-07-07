@@ -505,6 +505,10 @@ public:
         return own_audio_level_.load();
     }
 
+    float get_own_audio_peak() const {
+        return own_audio_peak_.load();
+    }
+
     // Microphone mute control
     void set_mic_muted(bool muted) {
         mic_muted_.store(muted, std::memory_order_release);
@@ -4372,9 +4376,15 @@ private:
                             participant, frame_count, playout_ratio);
                     }
 
+                    const auto decoded_count = static_cast<size_t>(decoded_samples);
                     float rms = audio_analysis::calculate_rms(participant.pcm_buffer.data(),
-                                                              decoded_samples);
-                    participant.current_level.store(rms, std::memory_order_relaxed);
+                                                              decoded_count);
+                    float peak = audio_analysis::find_peak(participant.pcm_buffer.data(),
+                                                           decoded_count);
+                    participant.current_level.store(std::clamp(rms, 0.0F, 1.0F),
+                                                    std::memory_order_relaxed);
+                    participant.current_peak.store(std::clamp(peak, 0.0F, 1.0F),
+                                                   std::memory_order_relaxed);
 
                     const bool is_speaking = audio_analysis::detect_voice_activity(rms);
                     participant.is_speaking.store(is_speaking, std::memory_order_relaxed);
@@ -4552,9 +4562,13 @@ private:
             const float input_gain = client->audio_state_.input_gain();
             const float rms =
                 audio_analysis::calculate_rms(input_buffer, frame_count) * input_gain;
+            const float peak =
+                audio_analysis::find_peak(input_buffer, frame_count) * input_gain;
             client->own_audio_level_.store(std::clamp(rms, 0.0F, 1.0F));
+            client->own_audio_peak_.store(std::clamp(peak, 0.0F, 1.0F));
         } else if (!client->join_session_.can_send_audio()) {
             client->own_audio_level_.store(0.0F);
+            client->own_audio_peak_.store(0.0F);
         }
 
         if (client->self_monitor_enabled_.load(std::memory_order_acquire) &&
@@ -4597,7 +4611,9 @@ private:
             }
 
             float rms = audio_analysis::calculate_rms(opus_input.data(), frame_count);
-            client->own_audio_level_.store(rms);
+            float peak = audio_analysis::find_peak(opus_input.data(), frame_count);
+            client->own_audio_level_.store(std::clamp(rms, 0.0F, 1.0F));
+            client->own_audio_peak_.store(std::clamp(peak, 0.0F, 1.0F));
             client->record_mono_block(RecordingWriter::TrackKind::Self, 0, opus_input.data(),
                                       frame_count);
             client->enqueue_opus_send_samples(
@@ -4697,6 +4713,7 @@ private:
 
     // Own audio level tracking (thread-safe with atomic)
     std::atomic<float> own_audio_level_{0.0F};
+    std::atomic<float> own_audio_peak_{0.0F};
 
     // RTT tracking (thread-safe with atomic)
     std::atomic<double> rtt_ms_{0.0};
@@ -4851,6 +4868,10 @@ public:
 
     float get_own_audio_level() const override {
         return client_.get_own_audio_level();
+    }
+
+    float get_own_audio_peak() const override {
+        return client_.get_own_audio_peak();
     }
 
     double get_rtt_ms() const override {

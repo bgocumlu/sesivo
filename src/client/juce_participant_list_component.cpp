@@ -18,6 +18,8 @@ constexpr int STATUS_WIDTH = 112;
 constexpr int JITTER_WIDTH = 76;
 constexpr int MS_WIDTH = 64;
 constexpr int RESET_WIDTH = 72;
+constexpr float METER_LEVEL_RELEASE = 0.82F;
+constexpr float METER_PEAK_RELEASE = 0.78F;
 constexpr int CONTENT_MIN_WIDTH =
     PAD * 2 + NAME_WIDTH + 8 + LEVEL_WIDTH + BUTTONS_WIDTH + GAIN_WIDTH +
     PAN_WIDTH + QUEUE_WIDTH + STATUS_WIDTH + JITTER_WIDTH + MS_WIDTH + RESET_WIDTH;
@@ -71,9 +73,32 @@ void draw_meter_bars(juce::Graphics& g, juce::Rectangle<int> bounds, float amoun
 }
 
 void draw_level_meter(juce::Graphics& g, juce::Rectangle<int> bounds, float amount,
-                      juce::Colour active_colour) {
+                      float peak_amount, juce::Colour active_colour) {
     auto meter = bounds.withSizeKeepingCentre(bounds.getWidth(), 16);
-    draw_meter_bars(g, meter, amount, active_colour);
+    auto bar_bounds = meter.reduced(0, 1);
+    constexpr int bar_width = 3;
+    constexpr int gap = 2;
+    const int bars = std::max(1, bar_bounds.getWidth() / (bar_width + gap));
+    amount = juce::jlimit(0.0F, 1.0F, amount);
+    peak_amount = juce::jlimit(0.0F, 1.0F, peak_amount);
+    const int active_bars =
+        juce::jlimit(0, bars, static_cast<int>(std::ceil(amount * bars)));
+    const int peak_bars = juce::jlimit(
+        active_bars, bars, static_cast<int>(std::ceil(peak_amount * bars)));
+
+    for (int index = 0; index < bars; ++index) {
+        auto bar = juce::Rectangle<int>{bar_bounds.getX() + index * (bar_width + gap),
+                                        bar_bounds.getY(), bar_width,
+                                        bar_bounds.getHeight()};
+        if (index < active_bars) {
+            g.setColour(active_colour);
+        } else if (index < peak_bars) {
+            g.setColour(active_colour.withAlpha(0.18F));
+        } else {
+            g.setColour(juce_theme::colour::border_soft());
+        }
+        g.fillRoundedRectangle(bar.toFloat(), 1.0F);
+    }
 }
 
 void draw_row_separators(juce::Graphics& g, int height) {
@@ -217,7 +242,13 @@ public:
     void refresh() {
         updating_ = true;
         const float level = client_.get_own_audio_level();
-        audio_level_ = level >= audio_level_ ? level : std::max(level, audio_level_ * 0.82F);
+        const float peak = client_.get_own_audio_peak();
+        audio_level_ = level >= audio_level_ ? level
+                                             : std::max(level,
+                                                        audio_level_ * METER_LEVEL_RELEASE);
+        audio_peak_ = peak >= audio_peak_ ? peak
+                                          : std::max(peak,
+                                                     audio_peak_ * METER_PEAK_RELEASE);
         const bool muted = client_.get_mic_muted();
         mute_button_.setToggleState(muted, juce::dontSendNotification);
         monitor_button_.setToggleState(client_.get_self_monitor_enabled(),
@@ -257,7 +288,7 @@ public:
         draw_icon(g, avatar_bounds_.reduced(8), RowIcon::user,
                   juce_theme::colour::text_dim());
 
-        draw_level_meter(g, level_meter_bounds_, audio_level_,
+        draw_level_meter(g, level_meter_bounds_, audio_level_, audio_peak_,
                          client_.get_mic_muted() ? juce_theme::colour::text_faint()
                                                  : juce_theme::colour::accent_hi());
         draw_icon(g, speaker_icon_bounds_, RowIcon::speaker,
@@ -300,6 +331,7 @@ private:
     ClientAppFacade& client_;
     bool updating_ = false;
     float audio_level_ = 0.0F;
+    float audio_peak_ = 0.0F;
     juce::String status_text_;
     juce::Colour status_colour_ = juce_theme::colour::text_faint();
 
@@ -372,7 +404,12 @@ public:
         displayed_audio_level_ = info.audio_level >= displayed_audio_level_
                                      ? info.audio_level
                                      : std::max(info.audio_level,
-                                                displayed_audio_level_ * 0.82F);
+                                                displayed_audio_level_ *
+                                                    METER_LEVEL_RELEASE);
+        displayed_audio_peak_ = info.audio_peak >= displayed_audio_peak_
+                                    ? info.audio_peak
+                                    : std::max(info.audio_peak,
+                                               displayed_audio_peak_ * METER_PEAK_RELEASE);
 
         name_label_.setText(participant_name(info), juce::dontSendNotification);
         mute_button_.setToggleState(info.is_muted, juce::dontSendNotification);
@@ -411,6 +448,7 @@ public:
                          juce::Justification::centred, 1);
 
         draw_level_meter(g, level_meter_bounds_, displayed_audio_level_,
+                         displayed_audio_peak_,
                          info_.is_speaking ? juce_theme::colour::accent_hi()
                                            : juce_theme::colour::success());
         draw_icon(g, speaker_icon_bounds_, RowIcon::speaker,
@@ -490,6 +528,7 @@ private:
     ParticipantInfo info_{};
     bool updating_ = false;
     float displayed_audio_level_ = 0.0F;
+    float displayed_audio_peak_ = 0.0F;
 
     juce::Label name_label_;
     juce::Label stats_label_;
@@ -521,9 +560,16 @@ JuceParticipantListComponent::JuceParticipantListComponent(ClientAppFacade& clie
     addAndMakeVisible(participant_header_label_);
     addAndMakeVisible(empty_participants_label_);
     addAndMakeVisible(participants_viewport_);
+    startTimerHz(60);
 }
 
-JuceParticipantListComponent::~JuceParticipantListComponent() = default;
+JuceParticipantListComponent::~JuceParticipantListComponent() {
+    stopTimer();
+}
+
+void JuceParticipantListComponent::timerCallback() {
+    refresh();
+}
 
 void JuceParticipantListComponent::refresh() {
     const auto participants = client_.get_participant_info();

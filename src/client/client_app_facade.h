@@ -96,6 +96,7 @@ public:
     virtual std::string get_room_id() const = 0;
     virtual std::vector<ParticipantInfo> get_participant_info() const = 0;
     virtual float get_own_audio_level() const = 0;
+    virtual float get_own_audio_peak() const = 0;
     virtual double get_rtt_ms() const = 0;
     virtual uint64_t get_total_bytes_rx() const = 0;
     virtual uint64_t get_total_bytes_tx() const = 0;

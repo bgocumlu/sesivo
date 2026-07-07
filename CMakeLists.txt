@@ -4,12 +4,12 @@ project(jam LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Keep dependency population noisy enough to diagnose slow downloads/clones.
+set(FETCHCONTENT_QUIET OFF CACHE BOOL "Show FetchContent population output" FORCE)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
-
-# Keep dependency population noisy enough to diagnose slow downloads/clones.
-set(FETCHCONTENT_QUIET OFF CACHE BOOL "Show FetchContent population output")
 
 option(JAM_BUILD_CLIENT "Build the desktop GUI client" ON)
 option(JAM_BUILD_TESTS "Build and register jam self-tests" OFF)

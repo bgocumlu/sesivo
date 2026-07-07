@@ -62,6 +62,15 @@ FetchContent_Declare(
     GIT_PROGRESS   TRUE
 )
 
+FetchContent_Declare(
+    libsodium_cmake
+    GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
+    GIT_TAG        9b2848dfc1b917a9410f0de9d81059b26cbfaa8d
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE
+    GIT_SUBMODULES_RECURSE TRUE
+)
+
 set(_JAM_PRE_FETCH_BUILD_TESTING_DEFINED FALSE)
 if(DEFINED BUILD_TESTING)
     set(_JAM_PRE_FETCH_BUILD_TESTING_DEFINED TRUE)
@@ -69,7 +78,9 @@ if(DEFINED BUILD_TESTING)
 endif()
 set(BUILD_TESTING OFF)
 set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(asio_src opus concurrentqueue_src spdlog picosha2)
+set(SODIUM_DISABLE_TESTS ON CACHE BOOL "Disable libsodium tests" FORCE)
+set(SODIUM_MINIMAL ON CACHE BOOL "Build only the libsodium high-level API set" FORCE)
+FetchContent_MakeAvailable(asio_src opus concurrentqueue_src spdlog picosha2 libsodium_cmake)
 if(DEFINED opus_BINARY_DIR AND NOT OPUS_BUILD_TESTING)
     # Opus leaves old CTest metadata behind when an existing build tree is
     # reconfigured with tests disabled. Remove it so `ctest` only runs jam tests.
@@ -99,4 +110,4 @@ add_library(token_crypto INTERFACE)
 target_include_directories(token_crypto INTERFACE
     ${picosha2_SOURCE_DIR}
 )
-
+target_link_libraries(token_crypto INTERFACE sodium)

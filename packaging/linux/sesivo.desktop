@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=sesivo
+Exec=sesivo %u
+Icon=sesivo
+Terminal=false
+Categories=Audio;AudioVideo;
+MimeType=x-scheme-handler/sesivo;

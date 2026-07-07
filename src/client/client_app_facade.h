@@ -80,7 +80,15 @@ public:
     virtual void join_room(const std::string& server_address, uint16_t server_port,
                            const std::string& room_id, const std::string& profile_id,
                            const std::string& display_name,
-                           const std::string& join_token) = 0;
+                           const std::string& join_token,
+                           const std::string& media_secret = {},
+                           uint8_t access_mode = ROOM_ACCESS_OPEN) = 0;
+    virtual bool rotate_media_key(const std::string& media_secret) = 0;
+    virtual bool has_media_key() const = 0;
+    virtual std::string current_media_secret() const = 0;
+    virtual void set_room_access_mode(uint8_t access_mode) = 0;
+    virtual bool approve_waiting_participant(uint32_t participant_id) = 0;
+    virtual std::vector<ParticipantInfo> get_waiting_participant_info() const = 0;
     virtual bool is_join_confirmed() const = 0;
     virtual bool consume_room_removed_by_server() = 0;
     virtual std::string get_server_address() const = 0;

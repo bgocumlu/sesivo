@@ -14,6 +14,7 @@
 #include <mutex>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -50,12 +51,11 @@ private:
         juce::String status;
         bool ok = false;
         bool closed = false;
+        bool media_key_rotated = false;
+        uint32_t access_epoch = 0;
+        uint8_t access_mode = ROOM_ACCESS_OPEN;
+        std::string new_media_secret;
     };
-    struct AdminParticipantChoice {
-        uint32_t id = 0;
-        juce::String label;
-    };
-
     void timerCallback() override;
     void configure_controls();
     void configure_device_controls();
@@ -82,15 +82,22 @@ private:
     void load_wav_file();
     void load_wav_path(const juce::File& file);
     void refresh_room_admin_controls(const std::vector<ParticipantInfo>& participants);
-    void request_room_password_change(bool clear_password);
-    void request_room_kick();
+    void request_room_settings_dialog();
+    void request_room_access_change(uint8_t access_mode, std::string password);
+    void request_participants_dialog();
+    void request_room_approve(uint32_t participant_id);
+    void request_room_decline(uint32_t participant_id);
+    void request_room_kick(uint32_t participant_id);
     void request_room_close();
+    void request_copy_invite();
     void start_room_admin_job(uint8_t command, uint32_t target_participant_id,
-                              std::string password_hash, bool closes_room);
+                              std::string password_hash, bool closes_room,
+                              uint8_t access_mode = ROOM_ACCESS_OPEN);
     RoomAdminResult run_room_admin_command(uint8_t command,
                                            uint32_t target_participant_id,
                                            const std::string& password_hash,
-                                           bool closes_room);
+                                           bool closes_room,
+                                           uint8_t access_mode);
     void poll_room_admin_job();
     void apply_room_admin_result(RoomAdminResult result);
     void apply_selected_api_to_pending_devices(int old_api_index);
@@ -103,6 +110,7 @@ private:
     AudioStream::DeviceIndex selected_output_device() const;
     bool has_room_admin() const;
     std::string password_hash(const std::string& password) const;
+    juce::String invite_text() const;
     bool has_pending_audio_changes() const;
     bool pending_stream_restart_needed() const;
     void set_device_status(const juce::String& text);
@@ -142,8 +150,6 @@ private:
     std::vector<AudioStream::DeviceInfo> input_devices_;
     std::vector<AudioStream::DeviceInfo> output_devices_;
     std::vector<AudioStream::ApiInfo> available_apis_;
-    std::vector<AdminParticipantChoice> admin_participant_choices_;
-
     int selected_api_index_ = -1;
     AudioStream::DeviceIndex pending_input_ = AudioStream::NO_DEVICE;
     int pending_input_channel_ = 0;
@@ -173,12 +179,10 @@ private:
     JuceStatusBarComponent status_bar_;
     JuceParticipantListComponent participants_component_;
     juce::TextButton leave_button_;
-    juce::TextEditor room_password_editor_;
-    juce::TextButton room_set_password_button_;
-    juce::TextButton room_open_button_;
-    juce::ComboBox room_kick_combo_;
-    juce::TextButton room_kick_button_;
+    juce::TextButton room_settings_button_;
+    juce::TextButton room_participants_button_;
     juce::TextButton room_close_button_;
+    juce::TextButton room_copy_invite_button_;
 
     juce::TextButton mic_mute_button_;
     juce::ToggleButton monitor_toggle_;

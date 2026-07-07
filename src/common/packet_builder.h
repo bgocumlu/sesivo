@@ -47,7 +47,8 @@ inline void write_fixed(Bytes<N>& target, const std::string& value) {
 
 inline std::shared_ptr<std::vector<unsigned char>> create_participant_info_packet(
     uint32_t participant_id, const std::string& profile_id, const std::string& display_name,
-    uint32_t capabilities = 0) {
+    uint32_t capabilities = 0,
+    const Bytes<E2E_PUBLIC_KEY_BYTES>& key_public = {}) {
     ParticipantInfoCapsHdr info{};
     info.magic          = CTRL_MAGIC;
     info.type           = CtrlHdr::Cmd::PARTICIPANT_INFO;
@@ -55,6 +56,7 @@ inline std::shared_ptr<std::vector<unsigned char>> create_participant_info_packe
     write_fixed(info.profile_id, profile_id);
     write_fixed(info.display_name, display_name);
     info.capabilities = capabilities & AUDIO_SUPPORTED_CAPABILITIES;
+    info.key_public = key_public;
 
     auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(ParticipantInfoCapsHdr));
     std::memcpy(buf->data(), &info, sizeof(ParticipantInfoCapsHdr));

@@ -6,26 +6,69 @@ protocol behavior.
 
 ## Deferred Follow-ups
 
-- Swap the session crypto primitive to libsodium ChaCha20-Poly1305.
-  Noted 2026-07-03. Current `session_crypto.h` uses a picosha2-based
-  HMAC-SHA256 keystream plus HMAC tag. It is encrypt-then-MAC, uses
-  constant-time tag comparison, and has nonce replay protection, so this is not
-  urgent at current jam scale.
-  Triggers:
-  - Rooms grow beyond roughly 8 participants. The server decrypts and
-    re-encrypts per recipient, and the picosha2-based keystream can become a
-    relay throughput ceiling compared with ChaCha20-Poly1305.
-  - The project wants audited crypto before wider hosting.
+- Finish installed invite-link packaging.
+  Noted 2026-07-07. Core crypto cleanup is closed: secure audio uses libsodium
+  IETF ChaCha20-Poly1305 AEAD, clients derive the media key from a client-only
+  media secret plus the signed room instance, the server forwards opaque sealed
+  media/control packets without decrypting or re-encrypting them, and room
+  admins can copy/paste shortcut invite links while encrypted client-to-client
+  room-key handoff stays hidden from the UI. The client now uses a real
+  `JUCEApplication`,
+  routes `sesivo://` launches into Join Invite, self-registers `sesivo://` for
+  the current Windows user, declares the scheme in the macOS bundle plist, and
+  includes a Linux `.desktop` scheme-handler template.
   Scope:
-  - Replace the internals of `seal_audio_packet` and `open_audio_packet` in
-    `session_crypto.h` with libsodium `crypto_aead_chacha20poly1305_ietf`.
-  - Change key derivation if it helps the new design.
-  - Change the wire format cleanly; bump the secure-audio capability/version so
-    mismatched builds fail at JOIN. Do not add compatibility readers, writers,
-    or fallbacks.
-  - Keep `session_crypto_self_test` green and add focused crypto tests if
-    needed. Do not add production-binary smoke flags.
-  Effort: small, likely one header plus one FetchContent dependency.
+  - Move Windows `sesivo://` registration into the installer once Windows
+    installer packaging exists.
+  - Install/register the Linux `.desktop` file in the future Linux package.
+  - Add the optional `https://sesivo.app/invite/...` web bridge.
+  - Keep the server blind to media keys; do not move the media key into room
+    create, room join-token, metrics, or logging payloads.
+  Effort: small.
+
+## Release And Distribution
+
+- Add Windows installer packaging.
+  Noted 2026-07-06. macOS packaging/signing/notarization is working; Windows
+  still needs an installer path.
+  Scope:
+  - Use Inno Setup first unless MSI/enterprise deployment becomes a real need.
+  - Package `sesivo.exe` with Start Menu shortcut, uninstall entry, optional
+    desktop shortcut, and install directory selection.
+  - Decide whether `sesivo-server.exe` ships as a separate artifact or an
+    optional installer component. Do not silently install/run a server service.
+  - Keep installer output naming aligned with macOS, e.g.
+    `sesivo-0.1.0-setup.exe`.
+
+- Add Windows Authenticode signing.
+  Noted 2026-07-06. The Apple Developer ID `.p12` only signs macOS artifacts;
+  Windows needs its own code-signing provider.
+  Scope:
+  - Choose a Windows signing path: OV/EV code-signing certificate or Microsoft
+    Trusted Signing.
+  - Sign both `sesivo.exe` and the final installer `.exe`.
+  - Timestamp signatures.
+  - Add verification commands to the release script.
+
+- Add GitHub release publishing.
+  Noted 2026-07-06. The old Electron `jam-app` release script creates a
+  `v<version>` GitHub release when missing, or uploads artifacts with
+  `gh release upload --clobber` when it already exists.
+  Scope:
+  - Add a native release publishing script using the same pattern.
+  - Upload `build/package/sesivo-0.1.0.dmg` and the future Windows installer.
+  - Keep version/tag source single-purpose and explicit; likely centralize the
+    `0.1.0` value instead of repeating it across CMake/package scripts.
+  - Consider checksum artifacts before public distribution.
+
+- Decide update flow after GitHub releases exist.
+  Noted 2026-07-06. Native JUCE has no Electron auto-updater equivalent.
+  Scope:
+  - Start with a simple manual update check against GitHub Releases.
+  - Show latest version and open/download the installer or DMG.
+  - Defer silent/background updates until the app has stable release channels.
+  - Revisit Sparkle on macOS and WinSparkle or installer handoff on Windows if
+    automatic updates become important.
 
 ## Client Runtime Extractions
 

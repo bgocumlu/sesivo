@@ -96,6 +96,9 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
             options.performer_join.display_name = argv[++i];
         } else if (arg == "--join-token" && i + 1 < argc) {
             options.performer_join.join_token = argv[++i];
+        } else if ((arg == "--media-secret" || arg == "--e2e-media-secret") &&
+                   i + 1 < argc) {
+            options.performer_join.media_secret = argv[++i];
         } else if ((arg == "--frames" || arg == "--buffer-frames") && i + 1 < argc) {
             options.requested_frames = std::stoi(argv[++i]);
         } else if (arg == "--input-channel" && i + 1 < argc) {

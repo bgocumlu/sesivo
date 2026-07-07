@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "protocol.h"
+
 namespace room_registry {
 
 using time_point = std::chrono::steady_clock::time_point;
@@ -25,6 +27,7 @@ struct RoomSnapshot {
     std::string room_name;
     std::string room_instance_id;
     bool locked = false;
+    uint8_t access_mode = ROOM_ACCESS_OPEN;
     uint32_t access_epoch = 1;
 };
 
@@ -65,7 +68,8 @@ inline bool valid_room_id(const std::string& room_id) {
 class RoomRegistry {
 public:
     CreateResult create_room(std::string room_id, std::string room_name,
-                             std::string password_hash, time_point now) {
+                             std::string password_hash, uint8_t access_mode,
+                             time_point now) {
         CreateResult result;
         if (!valid_room_id(room_id)) {
             result.reason = "invalid room id";
@@ -82,6 +86,16 @@ public:
             result.room = snapshot_for(rooms_.at(room_id));
             return result;
         }
+        if (!valid_access_mode(access_mode)) {
+            result.reason = "invalid access mode";
+            return result;
+        }
+        if (access_mode != ROOM_ACCESS_PASSWORD) {
+            password_hash.clear();
+        } else if (password_hash.empty()) {
+            result.reason = "missing room password";
+            return result;
+        }
 
         const std::string admin_token = make_secret_token();
         Room room;
@@ -89,6 +103,7 @@ public:
         room.room_name = std::move(room_name);
         room.room_instance_id = performer_join_token::random_nonce();
         room.password_hash = std::move(password_hash);
+        room.access_mode = access_mode;
         room.admin_token_hash = sha256_hex(admin_token);
         room.created_at = now;
         room.last_activity = now;
@@ -112,6 +127,7 @@ public:
         room.room_id = room_id;
         room.room_name = room_id;
         room.room_instance_id = performer_join_token::random_nonce();
+        room.access_mode = ROOM_ACCESS_OPEN;
         room.created_at = now;
         room.last_activity = now;
         room.ever_joined = true;
@@ -128,7 +144,7 @@ public:
             result.reason = "room not found";
             return result;
         }
-        if (!it->second.password_hash.empty() &&
+        if (it->second.access_mode == ROOM_ACCESS_PASSWORD &&
             it->second.password_hash != password_hash) {
             result.reason = "wrong room password";
             return result;
@@ -168,12 +184,37 @@ public:
                                     const std::string& admin_token,
                                     std::string password_hash,
                                     time_point now) {
+        return change_access_mode(room_id, admin_token,
+                                  password_hash.empty() ? ROOM_ACCESS_OPEN
+                                                        : ROOM_ACCESS_PASSWORD,
+                                  std::move(password_hash), now);
+    }
+
+    AuthorizeResult change_access_mode(const std::string& room_id,
+                                       const std::string& admin_token,
+                                       uint8_t access_mode,
+                                       std::string password_hash,
+                                       time_point now) {
         auto result = authorize_admin(room_id, admin_token, now);
         if (!result.ok) {
             return result;
         }
+        if (!valid_access_mode(access_mode)) {
+            result.ok = false;
+            result.reason = "invalid access mode";
+            return result;
+        }
+        if (access_mode == ROOM_ACCESS_PASSWORD && password_hash.empty()) {
+            result.ok = false;
+            result.reason = "missing room password";
+            return result;
+        }
         auto& room = rooms_.at(room_id);
+        if (access_mode != ROOM_ACCESS_PASSWORD) {
+            password_hash.clear();
+        }
         room.password_hash = std::move(password_hash);
+        room.access_mode = access_mode;
         ++room.access_epoch;
         room.last_activity = now;
         result.room = snapshot_for(room);
@@ -279,6 +320,7 @@ private:
         std::string room_instance_id;
         std::string password_hash;
         std::string admin_token_hash;
+        uint8_t access_mode = ROOM_ACCESS_OPEN;
         uint32_t access_epoch = 1;
         bool ever_joined = false;
         time_point created_at{};
@@ -290,9 +332,16 @@ private:
             room.room_id,
             room.room_name,
             room.room_instance_id,
-            !room.password_hash.empty(),
+            room.access_mode == ROOM_ACCESS_PASSWORD,
+            room.access_mode,
             room.access_epoch,
         };
+    }
+
+    static bool valid_access_mode(uint8_t access_mode) {
+        return access_mode == ROOM_ACCESS_OPEN ||
+               access_mode == ROOM_ACCESS_PASSWORD ||
+               access_mode == ROOM_ACCESS_APPROVE;
     }
 
     std::unordered_map<std::string, Room> rooms_;

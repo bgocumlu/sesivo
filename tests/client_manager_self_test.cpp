@@ -75,52 +75,39 @@ int main() {
     }
 
     ClientManager::ClientSecurityConfig security;
-    security.session_key[0] = 0x42;
-    security.session_key[31] = 0x24;
     security.token_nonce_key = "secure-room|secure-user|nonce-a";
     auto secure_join = manager.register_client(
         secure, now + 3s, "secure-room", "secure-user", "Secure User",
-        AUDIO_CAP_SECURE_AUDIO, std::optional<ClientManager::ClientSecurityConfig>{security});
-    const auto secure_snapshot = manager.get_security(secure);
-    if (secure_join.client_id == 0 || !secure_snapshot.has_value() ||
-        secure_snapshot->session_key[0] != 0x42 ||
-        secure_snapshot->session_key[31] != 0x24 ||
-        secure_snapshot->token_nonce_key != security.token_nonce_key) {
-        std::cerr << "secure session state was not stored\n";
+        AUDIO_CAP_SECURE_AUDIO, {},
+        std::optional<ClientManager::ClientSecurityConfig>{security});
+    if (secure_join.client_id == 0) {
+        std::cerr << "authenticated session was not registered\n";
         return 9;
     }
-    if (!manager.has_session_key(secure) ||
+    if (!manager.has_authenticated_session(secure) ||
         manager.token_nonce_key_for(secure) != security.token_nonce_key) {
-        std::cerr << "secure session accessors failed\n";
+        std::cerr << "authenticated session accessors failed\n";
         return 10;
-    }
-    if (manager.next_secure_send_nonce(secure) != 1 ||
-        manager.next_secure_send_nonce(secure) != 2) {
-        std::cerr << "secure send nonce did not increment from one\n";
-        return 11;
-    }
-    if (!manager.accept_audio_nonce(secure, 1) ||
-        manager.accept_audio_nonce(secure, 1)) {
-        std::cerr << "secure audio replay window did not reject duplicate nonce\n";
-        return 12;
     }
     auto secure_retry = manager.register_client(
         secure, now + 4s, "secure-room", "secure-user", "Secure User",
-        AUDIO_CAP_SECURE_AUDIO, std::optional<ClientManager::ClientSecurityConfig>{security});
+        AUDIO_CAP_SECURE_AUDIO, {},
+        std::optional<ClientManager::ClientSecurityConfig>{security});
     if (secure_retry.client_id != secure_join.client_id ||
-        manager.accept_audio_nonce(secure, 1)) {
-        std::cerr << "same secure session retry reset replay state\n";
-        return 13;
+        manager.token_nonce_key_for(secure) != security.token_nonce_key) {
+        std::cerr << "same authenticated session retry changed auth state\n";
+        return 11;
     }
     auto rotated_security = security;
     rotated_security.token_nonce_key = "secure-room|secure-user|nonce-b";
     manager.register_client(
         secure, now + 5s, "secure-room", "secure-user", "Secure User",
-        AUDIO_CAP_SECURE_AUDIO,
+        AUDIO_CAP_SECURE_AUDIO, {},
         std::optional<ClientManager::ClientSecurityConfig>{rotated_security});
-    if (!manager.accept_audio_nonce(secure, 1)) {
-        std::cerr << "new secure session did not reset replay state\n";
-        return 14;
+    if (!manager.has_authenticated_session(secure) ||
+        manager.token_nonce_key_for(secure) != rotated_security.token_nonce_key) {
+        std::cerr << "rotated authenticated session did not replace token nonce state\n";
+        return 12;
     }
 
     return 0;

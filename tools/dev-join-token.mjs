@@ -38,6 +38,7 @@ const defaults = {
   ttlMs: "120000",
   roomInstance: "",
   accessEpoch: "0",
+  mediaSecret: process.env.JAM_MEDIA_SECRET ?? "dev-media-secret",
   client: process.env.JAM_CLIENT_EXE ?? defaultClientPath(),
 };
 
@@ -58,6 +59,9 @@ function parseArgs(argv) {
     else if (arg === "--ttl-ms" && next) options.ttlMs = argv[++i];
     else if (arg === "--room-instance" && next) options.roomInstance = argv[++i];
     else if (arg === "--access-epoch" && next) options.accessEpoch = argv[++i];
+    else if ((arg === "--media-secret" || arg === "--e2e-media-secret") && next) {
+      options.mediaSecret = argv[++i];
+    }
     else if (arg === "--client" && next) options.client = argv[++i];
   }
   return options;
@@ -71,8 +75,8 @@ function usage() {
       "",
       "optional:",
       "  --server-id local-dev --server 127.0.0.1 --port 9999 --codec opus --frames 120 --ttl-ms 120000",
-      "  --room-instance <id> --access-epoch <n> --client <path>",
-      "env override: JAM_CLIENT_EXE",
+      "  --room-instance <id> --access-epoch <n> --media-secret <secret> --client <path>",
+      "env override: JAM_CLIENT_EXE, JAM_MEDIA_SECRET",
     ].join("\n"),
   );
 }
@@ -138,6 +142,8 @@ const command = [
   displayName,
   "--join-token",
   token,
+  "--media-secret",
+  options.mediaSecret,
   "--codec",
   options.codec,
   "--frames",

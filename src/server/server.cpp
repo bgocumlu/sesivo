@@ -49,6 +49,7 @@ using namespace std::chrono_literals;
 using namespace server_config;
 
 constexpr int64_t METRONOME_SCHEDULE_AHEAD_NS = 150'000'000;
+constexpr int64_t ROOM_JOIN_TICKET_TTL_MS = 10 * 60 * 1000;
 
 static const char* runtime_platform_name() {
 #if defined(_WIN32)
@@ -184,8 +185,12 @@ public:
             handle_ctrl_message(bytes);
         } else if (hdr.magic == AUDIO_V3_MAGIC || hdr.magic == AUDIO_REDUNDANT_MAGIC) {
             handle_audio_message(bytes);
+        } else if (hdr.magic == SECURE_CONTROL_MAGIC) {
+            handle_secure_control_message(bytes);
         } else if (hdr.magic == SECURE_AUDIO_MAGIC) {
             handle_secure_audio_message(bytes);
+        } else if (hdr.magic == E2E_KEY_ENVELOPE_MAGIC) {
+            handle_e2e_key_envelope(bytes);
         }
 
         do_receive();  // start next receive immediately
@@ -383,7 +388,7 @@ private:
     }
 
     static uint8_t room_flags(const room_registry::RoomSnapshot& room) {
-        return room.locked ? ROOM_FLAG_LOCKED : 0;
+        return room.access_mode == ROOM_ACCESS_PASSWORD ? ROOM_FLAG_LOCKED : 0;
     }
 
     static uint16_t saturating_u16(size_t value) {
@@ -391,21 +396,18 @@ private:
             std::min<size_t>(value, std::numeric_limits<uint16_t>::max()));
     }
 
-    bool can_issue_room_join_ticket() const {
-        return options_.allow_insecure_dev_joins || !options_.join_secret.empty();
+    bool can_issue_udp_room_join_ticket() const {
+        return !options_.join_secret.empty();
     }
 
-    std::optional<std::string> create_join_ticket(
+    std::optional<std::string> create_udp_room_join_ticket(
         const room_registry::RoomSnapshot& room, const std::string& profile_id) const {
-        if (options_.allow_insecure_dev_joins) {
-            return std::string{};
-        }
         if (options_.join_secret.empty()) {
             return std::nullopt;
         }
 
         performer_join_token::Claims claims;
-        claims.expires_at_ms = performer_join_token::now_ms() + 120000;
+        claims.expires_at_ms = performer_join_token::now_ms() + ROOM_JOIN_TICKET_TTL_MS;
         claims.server_id = options_.server_id;
         claims.room_id = room.room_id;
         claims.profile_id = profile_id;
@@ -449,15 +451,18 @@ private:
         response.room_offset = saturating_u16(room_offset);
         response.truncated =
             room_offset + response.room_count < rooms.size() ? 1 : 0;
-        response.token_auth_available =
-            !options_.join_secret.empty() || options_.allow_insecure_dev_joins ? 1 : 0;
+        response.token_auth_available = can_issue_udp_room_join_ticket() ? 1 : 0;
         for (size_t index = 0; index < response.room_count; ++index) {
             const auto& room = rooms[room_offset + index];
             packet_builder::write_fixed(response.rooms[index].room_id, room.room_id);
             packet_builder::write_fixed(response.rooms[index].room_name, room.room_name);
+            packet_builder::write_fixed(response.rooms[index].room_instance_id,
+                                        room.room_instance_id);
+            response.rooms[index].access_epoch = room.access_epoch;
             response.rooms[index].participant_count =
                 saturating_u16(room.participant_count);
             response.rooms[index].flags = room_flags(room);
+            response.rooms[index].access_mode = room.access_mode;
         }
 
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(response));
@@ -482,6 +487,7 @@ private:
         const std::string room_name = fixed_string(request.room_name);
         const std::string profile_id = fixed_string(request.profile_id);
         const std::string password_hash = fixed_string(request.password_hash);
+        const uint8_t access_mode = request.access_mode;
 
         RoomCreateResponseHdr response{};
         response.magic = CTRL_MAGIC;
@@ -494,20 +500,23 @@ private:
             send_room_create_response(response);
             return;
         }
-        if (!can_issue_room_join_ticket()) {
-            response.status = ROOM_STATUS_SERVER_ERROR;
-            packet_builder::write_fixed(response.reason, "join secret not configured");
+        if (!can_issue_udp_room_join_ticket()) {
+            response.status = ROOM_STATUS_FORBIDDEN;
+            packet_builder::write_fixed(response.reason,
+                                        "room tickets require a join secret");
             send_room_create_response(response);
             return;
         }
 
         auto result =
-            room_registry_.create_room(room_id, room_name, password_hash, now);
+            room_registry_.create_room(room_id, room_name, password_hash,
+                                       access_mode, now);
         if (!result.ok) {
             response.status = result.reason == "room already exists"
                                   ? ROOM_STATUS_CONFLICT
                                   : ROOM_STATUS_BAD_REQUEST;
             response.flags = room_flags(result.room);
+            response.access_mode = result.room.access_mode;
             response.access_epoch = result.room.access_epoch;
             packet_builder::write_fixed(response.room_id, result.room.room_id);
             packet_builder::write_fixed(response.room_name, result.room.room_name);
@@ -518,7 +527,7 @@ private:
             return;
         }
 
-        const auto ticket = create_join_ticket(result.room, profile_id);
+        const auto ticket = create_udp_room_join_ticket(result.room, profile_id);
         if (!ticket.has_value()) {
             response.status = ROOM_STATUS_SERVER_ERROR;
             packet_builder::write_fixed(response.reason, "could not issue join token");
@@ -528,6 +537,7 @@ private:
 
         response.status = ROOM_STATUS_OK;
         response.flags = room_flags(result.room) | ROOM_FLAG_CREATED;
+        response.access_mode = result.room.access_mode;
         response.access_epoch = result.room.access_epoch;
         packet_builder::write_fixed(response.room_id, result.room.room_id);
         packet_builder::write_fixed(response.room_name, result.room.room_name);
@@ -565,9 +575,10 @@ private:
             send_room_join_token_response(response);
             return;
         }
-        if (!can_issue_room_join_ticket()) {
-            response.status = ROOM_STATUS_SERVER_ERROR;
-            packet_builder::write_fixed(response.reason, "join secret not configured");
+        if (!can_issue_udp_room_join_ticket()) {
+            response.status = ROOM_STATUS_FORBIDDEN;
+            packet_builder::write_fixed(response.reason,
+                                        "room tickets require a join secret");
             send_room_join_token_response(response);
             return;
         }
@@ -583,7 +594,7 @@ private:
             return;
         }
 
-        const auto ticket = create_join_ticket(authorized.room, profile_id);
+        const auto ticket = create_udp_room_join_ticket(authorized.room, profile_id);
         if (!ticket.has_value()) {
             response.status = ROOM_STATUS_SERVER_ERROR;
             packet_builder::write_fixed(response.reason, "could not issue join token");
@@ -593,6 +604,7 @@ private:
 
         response.status = ROOM_STATUS_OK;
         response.flags = room_flags(authorized.room);
+        response.access_mode = authorized.room.access_mode;
         response.access_epoch = authorized.room.access_epoch;
         packet_builder::write_fixed(response.room_id, authorized.room.room_id);
         packet_builder::write_fixed(response.room_name, authorized.room.room_name);
@@ -632,6 +644,10 @@ private:
                 authorized =
                     room_registry_.change_password(room_id, admin_token, password_hash, now);
                 break;
+            case ROOM_ADMIN_CHANGE_ACCESS:
+                authorized = room_registry_.change_access_mode(
+                    room_id, admin_token, request.access_mode, password_hash, now);
+                break;
             case ROOM_ADMIN_KICK_PARTICIPANT:
                 authorized = room_registry_.authorize_admin(room_id, admin_token, now);
                 if (authorized.ok) {
@@ -647,6 +663,9 @@ private:
                 if (authorized.ok) {
                     remove_all_room_participants(room_id, now);
                 }
+                break;
+            case ROOM_ADMIN_ROTATE_MEDIA_KEY:
+                authorized = room_registry_.rotate_access_epoch(room_id, admin_token, now);
                 break;
             default:
                 response.status = ROOM_STATUS_BAD_REQUEST;
@@ -669,6 +688,7 @@ private:
 
         response.status = ROOM_STATUS_OK;
         response.flags = room_flags(authorized.room);
+        response.access_mode = authorized.room.access_mode;
         response.access_epoch = authorized.room.access_epoch;
         packet_builder::write_fixed(response.reason, "ok");
         send_room_admin_response(response);
@@ -746,7 +766,7 @@ private:
     }
 
     void release_token_nonce_for_client(const ClientInfo& client) {
-        if (!client.has_session_key || client.token_nonce_key.empty()) {
+        if (!client.has_authenticated_session || client.token_nonce_key.empty()) {
             return;
         }
         used_token_nonces_.erase(client.token_nonce_key);
@@ -816,7 +836,6 @@ private:
                 return;
             }
             ClientManager::ClientSecurityConfig config;
-            config.session_key = session_crypto::derive_key_from_join_token(*validated_token);
             config.token_nonce_key = session_crypto::nonce_replay_key(validated_token->claims);
             security = config;
         }
@@ -829,8 +848,8 @@ private:
         }
 
         auto registration = client_manager_.register_client(
-            remote_endpoint_, now, room_id, profile_id, display_name, registered_capabilities,
-            security);
+            remote_endpoint_, now, room_id, profile_id, display_name,
+            registered_capabilities, join.key_public, security);
         for (uint32_t removed_client_id: registration.removed_client_ids) {
             spdlog::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
                       removed_client_id, room_id, profile_id);
@@ -852,6 +871,56 @@ private:
         send_join_ack(remote_endpoint_, client_id, ack_capabilities);
         broadcast_participant_info(remote_endpoint_, client_id, profile_id, display_name);
         send_existing_participant_info_to(remote_endpoint_);
+    }
+
+    void handle_e2e_key_envelope(std::size_t bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (bytes < sizeof(E2EKeyEnvelopeHdr)) {
+            rate_limiter_.allow_strict(remote_endpoint_, now);
+            return;
+        }
+
+        if (!client_manager_.exists(remote_endpoint_) ||
+            !client_manager_.has_authenticated_session(remote_endpoint_)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                spdlog::warn("Dropping E2E key envelope from unauthenticated endpoint {}:{}",
+                             remote_endpoint_.address().to_string(),
+                             remote_endpoint_.port());
+            }
+            return;
+        }
+
+        E2EKeyEnvelopeHdr envelope{};
+        std::memcpy(&envelope, recv_buf_.data(), sizeof(envelope));
+        const uint32_t sender_id = client_manager_.get_client_id(remote_endpoint_);
+        if (envelope.sender_id == 0 || envelope.sender_id != sender_id ||
+            envelope.target_id == 0 || envelope.reserved != 0 ||
+            envelope.encrypted_bytes == 0 ||
+            envelope.encrypted_bytes > E2E_KEY_ENVELOPE_MAX_BYTES) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                spdlog::warn("Dropping malformed E2E key envelope from {}:{}",
+                             remote_endpoint_.address().to_string(),
+                             remote_endpoint_.port());
+            }
+            return;
+        }
+
+        const auto target =
+            client_manager_.get_room_endpoint_by_client_id(remote_endpoint_,
+                                                           envelope.target_id);
+        if (!target.has_value() ||
+            !client_manager_.has_authenticated_session(*target)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                spdlog::warn("Dropping E2E key envelope sender={} target={} not in room",
+                             envelope.sender_id, envelope.target_id);
+            }
+            return;
+        }
+
+        client_manager_.update_alive(remote_endpoint_, now);
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(
+            recv_buf_.data(), recv_buf_.data() + sizeof(E2EKeyEnvelopeHdr));
+        send(packet_copy->data(), packet_copy->size(), *target, packet_copy);
     }
 
     bool extract_audio_rate_shape(const unsigned char* packet_data, std::size_t bytes,
@@ -892,6 +961,18 @@ private:
             return true;
         }
 
+        if (hdr.magic == SECURE_AUDIO_MAGIC) {
+            session_crypto::SecureAudioMetadata metadata;
+            uint16_t encrypted_bytes = 0;
+            if (!session_crypto::parse_secure_audio_header(
+                    packet_data, bytes, metadata, encrypted_bytes)) {
+                return false;
+            }
+            sample_rate = metadata.sample_rate;
+            frame_count = metadata.frame_count;
+            return true;
+        }
+
         return false;
     }
 
@@ -924,6 +1005,60 @@ private:
                                    false);
     }
 
+    void handle_secure_control_message(std::size_t bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (bytes < SECURE_CONTROL_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
+            rate_limiter_.allow_strict(remote_endpoint_, now);
+            return;
+        }
+
+        if (!client_manager_.exists(remote_endpoint_)) {
+            if (rate_limiter_.allow_unknown(remote_endpoint_, now)) {
+                record_unknown_audio_drop(remote_endpoint_);
+            }
+            return;
+        }
+
+        if (!client_manager_.has_authenticated_session(remote_endpoint_)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                spdlog::warn("Dropping secure control from unauthenticated endpoint {}:{}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            }
+            return;
+        }
+
+        const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
+        session_crypto::SecureControlMetadata metadata;
+        uint16_t encrypted_bytes = 0;
+        std::string reason;
+        if (!session_crypto::parse_secure_control_header(packet_data, bytes, metadata,
+                                                         encrypted_bytes, &reason)) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                spdlog::warn("Dropping invalid secure control from {}:{} reason={} bytes={}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                          reason, bytes);
+            }
+            return;
+        }
+
+        const uint32_t sender_id = client_manager_.get_client_id(remote_endpoint_);
+        if (sender_id == 0 || metadata.sender_id != sender_id) {
+            if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
+                spdlog::warn("Dropping secure control with wrong sender id from {}:{} "
+                             "metadata_sender={} expected_sender={}",
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                          metadata.sender_id, sender_id);
+            }
+            return;
+        }
+
+        client_manager_.update_alive(remote_endpoint_, now);
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(
+            packet_data, packet_data + bytes);
+        forward_secure_control_to_others(remote_endpoint_, packet_copy->data(),
+                                         packet_copy->size(), packet_copy);
+    }
+
     void handle_secure_audio_message(std::size_t bytes) {
         const auto now = std::chrono::steady_clock::now();
         if (bytes < SECURE_PACKET_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
@@ -938,40 +1073,48 @@ private:
             return;
         }
 
-        const auto security = client_manager_.get_security(remote_endpoint_);
-        if (!security.has_value()) {
+        if (!client_manager_.has_authenticated_session(remote_endpoint_)) {
             if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
-                spdlog::warn("Dropping secure audio from endpoint without session key {}:{}",
+                spdlog::warn("Dropping secure audio from unauthenticated endpoint {}:{}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port());
             }
             return;
         }
 
-        uint64_t nonce = 0;
-        size_t plaintext_bytes = 0;
         const auto* packet_data = reinterpret_cast<const unsigned char*>(recv_buf_.data());
-        if (!session_crypto::open_audio_packet(
-                security->session_key, packet_data, bytes, nonce,
-                secure_plaintext_buf_.data(), secure_plaintext_buf_.size(),
-                plaintext_bytes)) {
+        session_crypto::SecureAudioMetadata metadata;
+        uint16_t encrypted_bytes = 0;
+        std::string reason;
+        if (!session_crypto::parse_secure_audio_header(packet_data, bytes, metadata,
+                                                       encrypted_bytes, &reason)) {
             if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
-                spdlog::warn("Dropping audio with invalid auth tag from {}:{} bytes={}",
+                spdlog::warn("Dropping invalid secure audio from {}:{} reason={} bytes={}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(),
-                          bytes);
+                          reason, bytes);
             }
             return;
         }
 
-        if (!client_manager_.accept_audio_nonce(remote_endpoint_, nonce)) {
+        const uint32_t sender_id = client_manager_.get_client_id(remote_endpoint_);
+        if (sender_id == 0 || metadata.sender_id != sender_id) {
             if (rate_limiter_.allow_strict(remote_endpoint_, now)) {
-                spdlog::warn("Dropping replayed secure audio from {}:{} nonce={}",
+                spdlog::warn("Dropping secure audio with wrong sender id from {}:{} "
+                             "metadata_sender={} expected_sender={}",
                           remote_endpoint_.address().to_string(), remote_endpoint_.port(),
-                          nonce);
+                          metadata.sender_id, sender_id);
             }
             return;
         }
 
-        handle_plain_audio_message(secure_plaintext_buf_.data(), plaintext_bytes, true);
+        if (!allow_audio_rate(packet_data, bytes)) {
+            return;
+        }
+
+        client_manager_.update_alive(remote_endpoint_, now);
+        auto packet_copy = std::make_shared<std::vector<unsigned char>>(
+            packet_data, packet_data + bytes);
+        record_audio_ingress(sender_id, remote_endpoint_, packet_copy->data(), bytes);
+        forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
     }
 
     void handle_plain_audio_message(unsigned char* packet_data, std::size_t bytes,
@@ -1010,7 +1153,7 @@ private:
             return;
         }
 
-        if (!authenticated && client_manager_.has_session_key(remote_endpoint_)) {
+        if (!authenticated && client_manager_.has_authenticated_session(remote_endpoint_)) {
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
                 spdlog::warn("Dropping plaintext audio from signed session {}:{}",
@@ -1060,7 +1203,7 @@ private:
             return;
         }
 
-        if (!authenticated && client_manager_.has_session_key(remote_endpoint_)) {
+        if (!authenticated && client_manager_.has_authenticated_session(remote_endpoint_)) {
             if (rate_limiter_.allow_strict(remote_endpoint_,
                                            std::chrono::steady_clock::now())) {
                 spdlog::warn("Dropping plaintext redundant audio from signed session {}:{}",
@@ -1330,8 +1473,12 @@ private:
                                     const std::string& display_name) {
         const uint32_t capabilities =
             client_manager_.get_client_capabilities(joined_endpoint);
+        Bytes<E2E_PUBLIC_KEY_BYTES> key_public{};
+        client_manager_.with_client(joined_endpoint, [&](const ClientInfo& info) {
+            key_public = info.key_public;
+        });
         auto buf = packet_builder::create_participant_info_packet(
-            participant_id, profile_id, display_name, capabilities);
+            participant_id, profile_id, display_name, capabilities, key_public);
         auto endpoints = client_manager_.get_room_endpoints_except(joined_endpoint);
         endpoints.push_back(joined_endpoint);
 
@@ -1347,7 +1494,8 @@ private:
                 continue;
             }
             auto buf = packet_builder::create_participant_info_packet(
-                info.client_id, info.profile_id, info.display_name, info.capabilities);
+                info.client_id, info.profile_id, info.display_name,
+                info.capabilities, info.key_public);
             send(buf->data(), buf->size(), joined_endpoint, buf);
         }
     }
@@ -1360,42 +1508,32 @@ private:
 
         auto endpoints = client_manager_.get_room_endpoints_except(sender);
         const uint32_t sender_id = client_manager_.get_client_id(sender);
+        const bool secure_audio =
+            packet_magic(static_cast<const unsigned char*>(packet_data), packet_size) ==
+            SECURE_AUDIO_MAGIC;
 
         for (const auto& endpoint: endpoints) {
-            record_audio_forward_datagram(sender_id, endpoint, packet_data, packet_size);
-            auto secure_packet = secure_packet_for_receiver(
-                endpoint, static_cast<const unsigned char*>(packet_data), packet_size);
-            if (secure_packet != nullptr) {
-                send(secure_packet->data(), secure_packet->size(), endpoint, secure_packet);
-            } else if (!client_manager_.has_session_key(endpoint)) {
+            if (secure_audio) {
+                if (client_manager_.has_authenticated_session(endpoint)) {
+                    record_audio_forward_datagram(sender_id, endpoint, packet_data, packet_size);
+                    send(packet_data, packet_size, endpoint, keep_alive);
+                }
+            } else if (!client_manager_.has_authenticated_session(endpoint)) {
+                record_audio_forward_datagram(sender_id, endpoint, packet_data, packet_size);
                 send(packet_data, packet_size, endpoint, keep_alive);
             }
         }
     }
 
-    std::shared_ptr<std::vector<unsigned char>> secure_packet_for_receiver(
-        const udp::endpoint& endpoint, const unsigned char* packet_data,
-        std::size_t packet_size) {
-        const auto security = client_manager_.get_security(endpoint);
-        if (!security.has_value()) {
-            return nullptr;
+    void forward_secure_control_to_others(
+        const udp::endpoint& sender, void* packet_data, std::size_t packet_size,
+        const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
+        auto endpoints = client_manager_.get_room_endpoints_except(sender);
+        for (const auto& endpoint: endpoints) {
+            if (client_manager_.has_authenticated_session(endpoint)) {
+                send(packet_data, packet_size, endpoint, keep_alive);
+            }
         }
-
-        const uint64_t nonce = client_manager_.next_secure_send_nonce(endpoint);
-        if (nonce == 0) {
-            return nullptr;
-        }
-
-        auto secure_packet = std::make_shared<std::vector<unsigned char>>(
-            SECURE_PACKET_HEADER_BYTES + packet_size + SECURE_PACKET_TAG_BYTES);
-        size_t bytes_written = 0;
-        if (!session_crypto::seal_audio_packet(
-                security->session_key, nonce, packet_data, packet_size,
-                secure_packet->data(), secure_packet->size(), bytes_written)) {
-            return nullptr;
-        }
-        secure_packet->resize(bytes_written);
-        return secure_packet;
     }
 
     static uint32_t packet_magic(const unsigned char* packet_data, std::size_t packet_size) {
@@ -1436,6 +1574,42 @@ private:
             return;
         }
 
+        if (packet_magic(static_cast<const unsigned char*>(packet_data), packet_size) ==
+            SECURE_AUDIO_MAGIC) {
+            session_crypto::SecureAudioMetadata metadata;
+            uint16_t encrypted_bytes = 0;
+            if (!session_crypto::parse_secure_audio_header(
+                    static_cast<const unsigned char*>(packet_data), packet_size, metadata,
+                    encrypted_bytes) ||
+                metadata.sender_id != sender_id) {
+                return;
+            }
+
+            auto& stats = audio_ingress_stats_[sender_id];
+            stats.endpoint = endpoint;
+            stats.last_frame_count = metadata.frame_count;
+            if (count_received) {
+                ++stats.received_total;
+                ++stats.received_interval;
+            }
+            const auto sequence_delta = stats.sequence_tracker.record(metadata.sequence);
+            if (sequence_delta.gaps_detected > 0) {
+                stats.sequence_gaps_total += sequence_delta.gaps_detected;
+                stats.sequence_gaps_interval += sequence_delta.gaps_detected;
+            }
+            if (sequence_delta.gaps_recovered > 0) {
+                stats.sequence_gap_recoveries_total += sequence_delta.gaps_recovered;
+                stats.sequence_gap_recoveries_interval += sequence_delta.gaps_recovered;
+            }
+            stats.sequence_unresolved_gaps = stats.sequence_tracker.unresolved_gaps();
+            if (sequence_delta.late_or_duplicate &&
+                (count_received || sequence_delta.gaps_recovered > 0)) {
+                ++stats.sequence_late_or_reordered_total;
+                ++stats.sequence_late_or_reordered_interval;
+            }
+            return;
+        }
+
         const auto parsed = audio_packet::parse_audio_header(
             static_cast<const unsigned char*>(packet_data), packet_size);
         if (!parsed.valid || parsed.magic != AUDIO_V3_MAGIC) {
@@ -1469,6 +1643,43 @@ private:
     void record_audio_forward(uint32_t sender_id, const udp::endpoint& target, void* packet_data,
                               std::size_t packet_size) {
         if (sender_id == 0 || packet_size < sizeof(MsgHdr)) {
+            return;
+        }
+
+        if (packet_magic(static_cast<const unsigned char*>(packet_data), packet_size) ==
+            SECURE_AUDIO_MAGIC) {
+            session_crypto::SecureAudioMetadata metadata;
+            uint16_t encrypted_bytes = 0;
+            if (!session_crypto::parse_secure_audio_header(
+                    static_cast<const unsigned char*>(packet_data), packet_size, metadata,
+                    encrypted_bytes) ||
+                metadata.sender_id != sender_id) {
+                return;
+            }
+
+            const uint32_t target_id = client_manager_.get_client_id(target);
+            if (target_id == 0) {
+                return;
+            }
+
+            const uint64_t key = (static_cast<uint64_t>(sender_id) << 32) | target_id;
+            auto& stats = audio_forward_stats_[key];
+            ++stats.forwarded_total;
+            ++stats.forwarded_interval;
+            const auto sequence_delta = stats.sequence_tracker.record(metadata.sequence);
+            if (sequence_delta.gaps_detected > 0) {
+                stats.sequence_gaps_total += sequence_delta.gaps_detected;
+                stats.sequence_gaps_interval += sequence_delta.gaps_detected;
+            }
+            if (sequence_delta.gaps_recovered > 0) {
+                stats.sequence_gap_recoveries_total += sequence_delta.gaps_recovered;
+                stats.sequence_gap_recoveries_interval += sequence_delta.gaps_recovered;
+            }
+            stats.sequence_unresolved_gaps = stats.sequence_tracker.unresolved_gaps();
+            if (sequence_delta.late_or_duplicate) {
+                ++stats.sequence_late_or_reordered_total;
+                ++stats.sequence_late_or_reordered_interval;
+            }
             return;
         }
 
@@ -1808,7 +2019,6 @@ private:
         std::chrono::steady_clock::now();
 
     std::array<char, server_config::RECV_BUF_SIZE> recv_buf_;
-    std::array<unsigned char, server_config::RECV_BUF_SIZE> secure_plaintext_buf_;
     udp::endpoint                                  remote_endpoint_;
 
     PeriodicTimer alive_check_timer_;
@@ -1889,6 +2099,8 @@ int main(int argc, char** argv) {
         spdlog::info("Forwarding audio packets between clients");
         if (options.allow_insecure_dev_joins) {
             spdlog::warn("Insecure performer dev joins enabled");
+        } else if (!options.join_secret.empty()) {
+            spdlog::info("Join secret configured; distribute join tokens out-of-band");
         } else if (options.join_secret.empty()) {
             spdlog::warn("Join secret is not configured; JOIN packets will be rejected unless insecure dev joins are enabled");
         }

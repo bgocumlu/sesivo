@@ -453,6 +453,8 @@ struct ParticipantData {
     // Participant state
     std::string                           profile_id;
     std::string                           display_name;
+    Bytes<E2E_PUBLIC_KEY_BYTES>           key_public{};
+    bool                                  has_key_public = false;
     std::atomic<bool>                    is_muted{false};
     std::atomic<float>                   gain{1.0F};
     std::atomic<float>                   pan{0.5F};  // 0.0 = full left, 0.5 = center, 1.0 = full right
@@ -511,6 +513,8 @@ struct ParticipantInfo {
     uint32_t id;
     std::string profile_id;
     std::string display_name;
+    Bytes<E2E_PUBLIC_KEY_BYTES> key_public;
+    bool     has_key_public;
     bool     is_speaking;
     bool     is_muted;
     float    audio_level;

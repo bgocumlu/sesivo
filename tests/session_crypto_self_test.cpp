@@ -1,5 +1,6 @@
 #include "session_crypto.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <vector>
 
 #include "audio_packet.h"
+#include "packet_builder.h"
 
 namespace {
 
@@ -17,100 +19,210 @@ void require(bool condition, const char* message) {
     }
 }
 
-performer_join_token::Claims make_claims(const std::string& nonce) {
-    performer_join_token::Claims claims;
-    claims.expires_at_ms = performer_join_token::now_ms() + 120000;
-    claims.server_id = "local.dev";
-    claims.room_id = "secure.room";
-    claims.profile_id = "secure.user";
-    claims.room_instance_id = "room.instance.a";
-    claims.access_epoch = 3;
-    claims.nonce = nonce;
-    return claims;
-}
-
-session_crypto::SessionKey validated_key_for(const std::string& token,
-                                             const std::string& secret) {
-    const auto validated = performer_join_token::validate_with_claims(
-        token, secret, "local.dev", "secure.room", "secure.user",
-        "room.instance.a", 3);
-    require(validated.ok, "token should validate");
-    return session_crypto::derive_key_from_join_token(validated);
+bool same_metadata(const session_crypto::SecureAudioMetadata& lhs,
+                   const session_crypto::SecureAudioMetadata& rhs) {
+    return lhs.sender_id == rhs.sender_id &&
+           lhs.sequence == rhs.sequence &&
+           lhs.sample_rate == rhs.sample_rate &&
+           lhs.frame_count == rhs.frame_count &&
+           lhs.plaintext_bytes == rhs.plaintext_bytes &&
+           lhs.channels == rhs.channels &&
+           lhs.codec == rhs.codec &&
+           lhs.capture_server_time_ns == rhs.capture_server_time_ns;
 }
 
 void test_key_derivation_is_stable() {
-    const std::string secret = "test-secret";
-    const auto claims = make_claims("nonce-a");
-    const auto token = performer_join_token::create(claims, secret);
+    const auto key = session_crypto::derive_media_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
+    const auto same_key = session_crypto::derive_media_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
+    const auto other_room_key = session_crypto::derive_media_key_from_secret(
+        "other.room", "room.instance.a", "test-media-secret");
+    const auto other_instance_key = session_crypto::derive_media_key_from_secret(
+        "secure.room", "room.instance.b", "test-media-secret");
+    const auto other_secret_key = session_crypto::derive_media_key_from_secret(
+        "secure.room", "room.instance.a", "other-media-secret");
 
-    const auto server_key = validated_key_for(token, secret);
-    const auto client_key = session_crypto::derive_key_from_join_token_string(token);
-    require(client_key.has_value(), "client should derive key from token string");
-    require(server_key == *client_key, "client and server keys should match");
-
-    const auto other_token = performer_join_token::create(make_claims("nonce-b"), secret);
-    const auto other_key = validated_key_for(other_token, secret);
-    require(server_key != other_key, "different token nonce should produce different key");
+    require(key == same_key, "same media secret and room should produce same key");
+    require(key != other_room_key, "different room should produce different media key");
+    require(key != other_instance_key,
+            "different room instance should produce different media key");
+    require(key != other_secret_key, "different secret should produce different media key");
 }
 
 void test_seal_open_round_trip_and_tamper_rejection() {
-    const std::string secret = "test-secret";
-    const auto token = performer_join_token::create(make_claims("nonce-c"), secret);
-    const auto key = validated_key_for(token, secret);
+    const auto key = session_crypto::derive_media_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
 
     const std::array<unsigned char, 4> payload{0x11, 0x22, 0x33, 0x44};
     const auto audio = audio_packet::create_audio_packet_v3(
         42, 48000, 120, 1, payload.data(),
         static_cast<uint16_t>(payload.size()), 123456789LL);
     require(audio != nullptr, "audio packet should build");
+    packet_builder::embed_sender_id(audio->data(), 7);
+
+    session_crypto::SecureAudioMetadata metadata;
+    metadata.sender_id = 7;
+    metadata.sequence = 42;
+    metadata.sample_rate = 48000;
+    metadata.frame_count = 120;
+    metadata.plaintext_bytes = static_cast<uint16_t>(audio->size());
+    metadata.channels = 1;
+    metadata.codec = AudioCodec::Opus;
+    metadata.capture_server_time_ns = 123456789LL;
 
     std::array<unsigned char, 2048> sealed{};
     size_t sealed_bytes = 0;
-    require(session_crypto::seal_audio_packet(key, 1, audio->data(), audio->size(),
+    require(session_crypto::seal_audio_packet(key, metadata, audio->data(), audio->size(),
                                               sealed.data(), sealed.size(), sealed_bytes),
             "seal should succeed");
+    require(sealed_bytes == SECURE_PACKET_HEADER_BYTES + audio->size() +
+                                SECURE_PACKET_TAG_BYTES,
+            "AEAD packet size should include header and authentication tag");
 
     uint32_t magic = 0;
     std::memcpy(&magic, sealed.data(), sizeof(magic));
     require(magic == SECURE_AUDIO_MAGIC, "secure packet should use secure magic");
 
+    session_crypto::SecureAudioMetadata parsed_metadata;
+    uint16_t encrypted_bytes = 0;
+    require(session_crypto::parse_secure_audio_header(
+                sealed.data(), sealed_bytes, parsed_metadata, encrypted_bytes),
+            "secure header should parse");
+    require(same_metadata(parsed_metadata, metadata), "secure metadata should round trip");
+    require(encrypted_bytes == audio->size() + SECURE_PACKET_TAG_BYTES,
+            "encrypted byte count should include authentication tag");
+
     std::array<unsigned char, 2048> opened{};
     size_t opened_bytes = 0;
-    uint64_t nonce = 0;
-    require(session_crypto::open_audio_packet(key, sealed.data(), sealed_bytes, nonce,
-                                              opened.data(), opened.size(), opened_bytes),
+    session_crypto::SecureAudioMetadata opened_metadata;
+    require(session_crypto::open_audio_packet(key, sealed.data(), sealed_bytes,
+                                              opened_metadata, opened.data(),
+                                              opened.size(), opened_bytes),
             "open should succeed");
-    require(nonce == 1, "nonce should round trip");
+    require(same_metadata(opened_metadata, metadata), "opened metadata should match");
     require(opened_bytes == audio->size(), "opened size should match plaintext");
     require(std::equal(audio->begin(), audio->end(), opened.begin()),
             "opened plaintext should match");
 
+    std::array<unsigned char, 2048> wrong_key_opened{};
+    auto wrong_key = key;
+    wrong_key[0] ^= 0x80;
+    require(!session_crypto::open_audio_packet(wrong_key, sealed.data(), sealed_bytes,
+                                               opened_metadata, wrong_key_opened.data(),
+                                               wrong_key_opened.size(), opened_bytes),
+            "wrong key should fail authentication");
+
     auto tampered_ciphertext = sealed;
     tampered_ciphertext[SECURE_PACKET_HEADER_BYTES] ^= 0x01;
     require(!session_crypto::open_audio_packet(key, tampered_ciphertext.data(), sealed_bytes,
-                                               nonce, opened.data(), opened.size(),
+                                               opened_metadata, opened.data(), opened.size(),
                                                opened_bytes),
             "ciphertext tamper should fail");
+
+    auto tampered_header = sealed;
+    SecureAudioHdr header{};
+    std::memcpy(&header, tampered_header.data(), sizeof(header));
+    header.reserved = 1;
+    std::memcpy(tampered_header.data(), &header, sizeof(header));
+    require(!session_crypto::open_audio_packet(key, tampered_header.data(), sealed_bytes,
+                                               opened_metadata, opened.data(), opened.size(),
+                                               opened_bytes),
+            "reserved header tamper should fail");
+
+    auto tampered_nonce = sealed;
+    std::memcpy(&header, tampered_nonce.data(), sizeof(header));
+    header.nonce[0] ^= 0x01;
+    std::memcpy(tampered_nonce.data(), &header, sizeof(header));
+    require(!session_crypto::open_audio_packet(key, tampered_nonce.data(), sealed_bytes,
+                                               opened_metadata, opened.data(), opened.size(),
+                                               opened_bytes),
+            "nonce tamper should fail");
 
     auto tampered_tag = sealed;
     tampered_tag[sealed_bytes - 1] ^= 0x01;
     require(!session_crypto::open_audio_packet(key, tampered_tag.data(), sealed_bytes,
-                                               nonce, opened.data(), opened.size(),
+                                               opened_metadata, opened.data(), opened.size(),
                                                opened_bytes),
             "tag tamper should fail");
+
+    require(!session_crypto::open_audio_packet(key, sealed.data(), sealed_bytes - 1,
+                                               opened_metadata, opened.data(), opened.size(),
+                                               opened_bytes),
+            "truncated packet should fail");
 }
 
-void test_replay_window() {
-    session_crypto::ReplayWindow window;
-    require(window.accept(1), "nonce 1 should be accepted");
-    require(window.accept(2), "nonce 2 should be accepted");
-    require(window.accept(70), "nonce 70 should be accepted");
-    require(!window.accept(2), "duplicate nonce 2 should be rejected");
-    require(!window.accept(1), "old nonce outside the window should be rejected");
-    require(window.accept(69), "unseen nonce inside the window should be accepted");
-    window.reset();
-    require(window.accept(1), "reset window should accept nonce 1 again");
-    require(!window.accept(0), "nonce 0 is reserved");
+void test_secure_control_round_trip_and_tamper_rejection() {
+    const auto key = session_crypto::derive_media_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
+
+    MediaKeyRotationPayload payload{};
+    const std::string next_secret = "next-media-secret";
+    payload.media_secret_bytes = static_cast<uint16_t>(next_secret.size());
+    std::copy_n(next_secret.begin(), next_secret.size(), payload.media_secret.begin());
+
+    session_crypto::SecureControlMetadata metadata;
+    metadata.sender_id = 7;
+    metadata.sequence = 3;
+    metadata.plaintext_bytes = sizeof(payload);
+
+    std::array<unsigned char, 512> sealed{};
+    size_t sealed_bytes = 0;
+    require(session_crypto::seal_control_packet(
+                key, metadata, reinterpret_cast<const unsigned char*>(&payload),
+                sizeof(payload), sealed.data(), sealed.size(), sealed_bytes),
+            "control seal should succeed");
+    require(sealed_bytes == SECURE_CONTROL_HEADER_BYTES + sizeof(payload) +
+                                SECURE_PACKET_TAG_BYTES,
+            "control AEAD packet size should include header and authentication tag");
+
+    session_crypto::SecureControlMetadata parsed_metadata;
+    uint16_t encrypted_bytes = 0;
+    require(session_crypto::parse_secure_control_header(
+                sealed.data(), sealed_bytes, parsed_metadata, encrypted_bytes),
+            "secure control header should parse");
+    require(parsed_metadata.sender_id == metadata.sender_id &&
+                parsed_metadata.sequence == metadata.sequence &&
+                parsed_metadata.plaintext_bytes == metadata.plaintext_bytes,
+            "secure control metadata should round trip");
+
+    std::array<unsigned char, 512> opened{};
+    size_t opened_bytes = 0;
+    session_crypto::SecureControlMetadata opened_metadata;
+    require(session_crypto::open_control_packet(
+                key, sealed.data(), sealed_bytes, opened_metadata, opened.data(),
+                opened.size(), opened_bytes),
+            "control open should succeed");
+    require(opened_bytes == sizeof(payload), "opened control size should match");
+    require(opened_metadata.sender_id == metadata.sender_id &&
+                opened_metadata.sequence == metadata.sequence,
+            "opened control metadata should match");
+    MediaKeyRotationPayload opened_payload{};
+    std::memcpy(&opened_payload, opened.data(), sizeof(opened_payload));
+    require(opened_payload.command == SECURE_CONTROL_ROTATE_MEDIA_KEY,
+            "opened control command should match");
+    require(opened_payload.media_secret_bytes == next_secret.size(),
+            "opened media secret size should match");
+    require(std::equal(next_secret.begin(), next_secret.end(),
+                       opened_payload.media_secret.begin()),
+            "opened media secret should match");
+
+    auto tampered_header = sealed;
+    SecureControlHdr header{};
+    std::memcpy(&header, tampered_header.data(), sizeof(header));
+    header.sequence ^= 0x01;
+    std::memcpy(tampered_header.data(), &header, sizeof(header));
+    require(!session_crypto::open_control_packet(
+                key, tampered_header.data(), sealed_bytes, opened_metadata,
+                opened.data(), opened.size(), opened_bytes),
+            "control header tamper should fail");
+
+    auto tampered_ciphertext = sealed;
+    tampered_ciphertext[SECURE_CONTROL_HEADER_BYTES] ^= 0x01;
+    require(!session_crypto::open_control_packet(
+                key, tampered_ciphertext.data(), sealed_bytes, opened_metadata,
+                opened.data(), opened.size(), opened_bytes),
+            "control ciphertext tamper should fail");
 }
 
 }  // namespace
@@ -118,7 +230,7 @@ void test_replay_window() {
 int main() {
     test_key_derivation_is_stable();
     test_seal_open_round_trip_and_tamper_rejection();
-    test_replay_window();
+    test_secure_control_round_trip_and_tamper_rejection();
     std::cout << "session crypto self-test passed\n";
     return 0;
 }

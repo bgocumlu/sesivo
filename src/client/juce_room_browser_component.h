@@ -23,6 +23,10 @@ public:
         uint16_t server_port = 0;
         std::string room_id;
         std::string room_admin_token;
+        std::string room_instance_id;
+        uint32_t access_epoch = 0;
+        std::string media_secret;
+        uint8_t access_mode = ROOM_ACCESS_OPEN;
     };
 
     JuceRoomBrowserComponent(ClientAppFacade& client,
@@ -36,6 +40,7 @@ public:
     void mouseDoubleClick(const juce::MouseEvent& event) override;
     void mouseWheelMove(const juce::MouseEvent& event,
                         const juce::MouseWheelDetails& wheel) override;
+    void open_invite(std::string invite_text);
 
 private:
     class MonitorToggleButton final : public juce::Button {
@@ -57,8 +62,11 @@ private:
     struct BrowserRoom {
         std::string room_id;
         std::string room_name;
+        std::string room_instance_id;
+        uint32_t access_epoch = 0;
         uint16_t participant_count = 0;
         bool locked = false;
+        uint8_t access_mode = ROOM_ACCESS_OPEN;
     };
 
     struct ServerStatus {
@@ -81,6 +89,12 @@ private:
         std::chrono::steady_clock::time_point last_refresh{};
     };
 
+    struct PendingInviteJoin {
+        std::string server_address;
+        uint16_t server_port = 0;
+        std::string room_id;
+    };
+
     enum class JobKind {
         Status,
         Join,
@@ -92,6 +106,9 @@ private:
         uint8_t status = 0;
         std::string room_id;
         std::string room_name;
+        std::string room_instance_id;
+        uint32_t access_epoch = 0;
+        uint8_t access_mode = ROOM_ACCESS_OPEN;
         std::string join_token;
         std::string admin_token;
         std::string reason;
@@ -105,7 +122,10 @@ private:
         ServerStatus status;
         TicketResult ticket;
         bool joined = false;
+        bool waiting_for_room_key = false;
         std::string joined_room_id;
+        std::string media_secret;
+        uint8_t access_mode = ROOM_ACCESS_OPEN;
         std::string message;
     };
 
@@ -134,6 +154,7 @@ private:
     void save_servers() const;
     void start_status_refresh(bool manual);
     void start_join_flow(int room_index);
+    void start_join_invite_flow(std::string initial_invite = {});
     void start_create_flow();
     void start_add_server_flow();
     void start_edit_servers_flow();
@@ -141,6 +162,9 @@ private:
     void poll_job_result();
     void apply_status(BrowserJobResult result);
     void apply_ticket_result(const BrowserJobResult& result);
+    void show_waiting_for_room_key(JoinLaunch launch);
+    void finish_waiting_join();
+    void cancel_waiting_join();
 
     uint32_t next_request_id();
     BrowserServer selected_server() const;
@@ -185,12 +209,16 @@ private:
     juce::Rectangle<int> refresh_button_bounds_;
     juce::Rectangle<int> edit_servers_button_bounds_;
     juce::Rectangle<int> add_server_bottom_bounds_;
+    juce::Rectangle<int> join_invite_button_bounds_;
     juce::Rectangle<int> create_button_bounds_;
     juce::Rectangle<int> server_list_area_;
     juce::Rectangle<int> room_list_area_;
     int server_scroll_px_ = 0;
     int room_scroll_px_ = 0;
     std::unique_ptr<juce::AlertWindow> active_dialog_;
+    std::optional<JoinLaunch> pending_join_launch_;
+    std::optional<PendingInviteJoin> pending_invite_join_;
+    bool waiting_for_room_key_ = false;
 
     std::mutex job_mutex_;
     std::thread job_thread_;

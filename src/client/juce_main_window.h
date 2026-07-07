@@ -6,8 +6,10 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <functional>
+#include <string>
 
 class ClientAppFacade;
+class JuceRootComponent;
 
 class JuceMainWindow final : public juce::DocumentWindow {
 public:
@@ -17,8 +19,10 @@ public:
     ~JuceMainWindow() override;
 
     void closeButtonPressed() override;
+    void open_invite(std::string invite_text);
 
 private:
     juce_theme::LookAndFeel look_and_feel_;
+    JuceRootComponent* root_component_ = nullptr;
     std::function<void()> close_callback_;
 };

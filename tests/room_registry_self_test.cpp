@@ -19,11 +19,14 @@ void test_create_join_and_password_change() {
     const auto now = std::chrono::steady_clock::now();
 
     const auto created =
-        registry.create_room("room-a", "Room A", "hash-a", now);
+        registry.create_room("room-a", "Room A", "hash-a",
+                             ROOM_ACCESS_PASSWORD, now);
     require(created.ok, "room should be created");
     require(created.created, "create result should mark new room");
     require(!created.admin_token.empty(), "admin token should be returned");
     require(created.room.locked, "room with password hash should be locked");
+    require(created.room.access_mode == ROOM_ACCESS_PASSWORD,
+            "room should report password access");
     require(created.room.access_epoch == 1, "initial access epoch should be 1");
 
     const auto wrong = registry.authorize_join("room-a", "wrong", now);
@@ -64,6 +67,31 @@ void test_create_join_and_password_change() {
     require(!stale_after_rotation.ok, "rotated access epoch should reject old claims");
 }
 
+void test_open_and_approve_ignore_password() {
+    room_registry::RoomRegistry registry;
+    const auto now = std::chrono::steady_clock::now();
+
+    const auto open =
+        registry.create_room("open-room", "Open Room", "ignored",
+                             ROOM_ACCESS_OPEN, now);
+    require(open.ok, "open room should be created");
+    require(!open.room.locked, "open room should not be locked");
+    require(open.room.access_mode == ROOM_ACCESS_OPEN,
+            "open room should report open access");
+    require(registry.authorize_join("open-room", "", now).ok,
+            "open room should allow empty password");
+
+    const auto approve =
+        registry.create_room("approve-room", "Approve Room", "ignored",
+                             ROOM_ACCESS_APPROVE, now);
+    require(approve.ok, "approve room should be created");
+    require(!approve.room.locked, "approve room should not be password locked");
+    require(approve.room.access_mode == ROOM_ACCESS_APPROVE,
+            "approve room should report approve access");
+    require(registry.authorize_join("approve-room", "", now).ok,
+            "approval happens through hidden media key handoff");
+}
+
 void test_empty_rooms_disappear() {
     room_registry::RoomRegistry registry;
     const auto now = std::chrono::steady_clock::now();
@@ -81,6 +109,7 @@ void test_empty_rooms_disappear() {
 
 int main() {
     test_create_join_and_password_change();
+    test_open_and_approve_ignore_password();
     test_empty_rooms_disappear();
     std::cout << "room registry self-test passed\n";
     return 0;

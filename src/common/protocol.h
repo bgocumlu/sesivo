@@ -9,7 +9,9 @@ constexpr uint32_t PING_MAGIC  = 0x50494E47;  // 'PING'
 constexpr uint32_t CTRL_MAGIC  = 0x4354524C;  // 'CTRL'
 constexpr uint32_t AUDIO_V3_MAGIC = 0x41553349;  // 'AU3I'
 constexpr uint32_t AUDIO_REDUNDANT_MAGIC = 0x41555244;  // 'AURD'
-constexpr uint32_t SECURE_AUDIO_MAGIC = 0x53454341;  // 'SECA'
+constexpr uint32_t SECURE_AUDIO_MAGIC = 0x53454341;  // 'SECA' E2E-sealed audio
+constexpr uint32_t SECURE_CONTROL_MAGIC = 0x53454343;  // 'SECC' E2E-sealed control
+constexpr uint32_t E2E_KEY_ENVELOPE_MAGIC = 0x4532454B;  // 'E2EK' sealed key handoff
 
 // Buffer sizes
 constexpr size_t AUDIO_BUF_SIZE = 512;
@@ -45,12 +47,14 @@ constexpr uint32_t AUDIO_CAP_SECURE_AUDIO = 1U << 2;
 constexpr uint32_t AUDIO_SUPPORTED_CAPABILITIES =
     AUDIO_CAP_REDUNDANCY | AUDIO_CAP_SECURE_AUDIO;
 
-// Secure audio packet envelope: MsgHdr, uint64 nonce, uint16 ciphertext bytes,
-// uint16 reserved, ciphertext, 16-byte authentication tag.
-constexpr size_t SECURE_PACKET_NONCE_BYTES = sizeof(uint64_t);
+// Secure audio packet envelope uses a 96-bit AEAD nonce and a 16-byte
+// ChaCha20-Poly1305 tag. The packet header is cleartext authenticated metadata.
+constexpr size_t SECURE_PACKET_NONCE_BYTES = 12;
 constexpr size_t SECURE_PACKET_TAG_BYTES = 16;
-constexpr size_t SECURE_PACKET_HEADER_BYTES =
-    sizeof(uint32_t) + SECURE_PACKET_NONCE_BYTES + sizeof(uint16_t) + sizeof(uint16_t);
+constexpr size_t MEDIA_SECRET_MAX_BYTES = 128;
+constexpr size_t E2E_PUBLIC_KEY_BYTES = 32;
+constexpr size_t E2E_SECRET_KEY_BYTES = 32;
+constexpr size_t E2E_KEY_ENVELOPE_MAX_BYTES = 256;
 
 // Type aliases
 template <size_t N>
@@ -100,6 +104,7 @@ struct JoinHdr : CtrlHdr {
     Bytes<64>  display_name;
     Bytes<512> join_token;
     uint32_t   capabilities = 0;
+    Bytes<E2E_PUBLIC_KEY_BYTES> key_public;
 };
 
 struct JoinAckHdr : CtrlHdr {
@@ -113,6 +118,20 @@ struct ParticipantInfoHdr : CtrlHdr {
 
 struct ParticipantInfoCapsHdr : ParticipantInfoHdr {
     uint32_t capabilities = 0;
+    Bytes<E2E_PUBLIC_KEY_BYTES> key_public;
+};
+
+struct E2EKeyEnvelopeHdr : MsgHdr {
+    uint32_t sender_id = 0;
+    uint32_t target_id = 0;
+    uint16_t encrypted_bytes = 0;
+    uint16_t reserved = 0;
+    Bytes<E2E_KEY_ENVELOPE_MAX_BYTES> encrypted;
+};
+
+struct E2EKeyEnvelopePayload {
+    uint16_t media_secret_bytes = 0;
+    Bytes<MEDIA_SECRET_MAX_BYTES> media_secret;
 };
 
 constexpr uint8_t METRONOME_FLAG_RUNNING = 1 << 0;
@@ -142,6 +161,42 @@ struct AudioHdrV3 : MsgHdr {
     Bytes<AUDIO_BUF_SIZE> buf;
 };
 
+struct SecureAudioHdr : MsgHdr {
+    uint32_t sender_id = 0;       // Sender-owned JOIN_ACK participant id
+    uint32_t sequence = 0;        // Sender-local packet sequence
+    uint32_t sample_rate = 0;     // Plaintext audio packet sample rate
+    uint16_t frame_count = 0;     // Plaintext Opus frame count
+    uint16_t plaintext_bytes = 0; // Sealed AudioHdrV3/AURD bytes
+    uint16_t encrypted_bytes = 0; // Ciphertext plus AEAD tag bytes
+    uint16_t reserved = 0;
+    uint8_t  channels = 0;       // Plaintext channel count
+    AudioCodec codec = AudioCodec::Opus;
+    int64_t  capture_server_time_ns = 0;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce;
+};
+
+constexpr size_t SECURE_PACKET_HEADER_BYTES = sizeof(SecureAudioHdr);
+
+constexpr uint8_t SECURE_CONTROL_ROTATE_MEDIA_KEY = 1;
+
+struct SecureControlHdr : MsgHdr {
+    uint32_t sender_id = 0;       // Sender-owned JOIN_ACK participant id
+    uint32_t sequence = 0;        // Sender-local secure control sequence
+    uint16_t plaintext_bytes = 0; // Sealed control payload bytes
+    uint16_t encrypted_bytes = 0; // Ciphertext plus AEAD tag bytes
+    uint16_t reserved = 0;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce;
+};
+
+constexpr size_t SECURE_CONTROL_HEADER_BYTES = sizeof(SecureControlHdr);
+
+struct MediaKeyRotationPayload {
+    uint8_t  command = SECURE_CONTROL_ROTATE_MEDIA_KEY;
+    uint8_t  reserved8 = 0;
+    uint16_t media_secret_bytes = 0;
+    Bytes<MEDIA_SECRET_MAX_BYTES> media_secret;
+};
+
 struct AudioRedundantHdr : MsgHdr {
     uint8_t packet_count = 0;
     uint8_t reserved[3] = {};
@@ -160,23 +215,31 @@ struct AudioPathStatsHdr : CtrlHdr {
 
 constexpr uint8_t ROOM_FLAG_LOCKED = 1 << 0;
 constexpr uint8_t ROOM_FLAG_CREATED = 1 << 1;
+constexpr uint8_t ROOM_ACCESS_OPEN = 1;
+constexpr uint8_t ROOM_ACCESS_PASSWORD = 2;
+constexpr uint8_t ROOM_ACCESS_APPROVE = 3;
 constexpr uint8_t ROOM_STATUS_OK = 0;
 constexpr uint8_t ROOM_STATUS_BAD_REQUEST = 1;
 constexpr uint8_t ROOM_STATUS_NOT_FOUND = 2;
 constexpr uint8_t ROOM_STATUS_FORBIDDEN = 3;
 constexpr uint8_t ROOM_STATUS_CONFLICT = 4;
 constexpr uint8_t ROOM_STATUS_SERVER_ERROR = 5;
+constexpr uint8_t ROOM_STATUS_PENDING = 6;
 constexpr uint8_t ROOM_ADMIN_CHANGE_PASSWORD = 1;
 constexpr uint8_t ROOM_ADMIN_KICK_PARTICIPANT = 2;
 constexpr uint8_t ROOM_ADMIN_CLOSE_ROOM = 3;
+constexpr uint8_t ROOM_ADMIN_ROTATE_MEDIA_KEY = 4;
+constexpr uint8_t ROOM_ADMIN_CHANGE_ACCESS = 5;
 constexpr size_t MAX_ROOM_STATUS_SUMMARIES = 8;
 
 struct RoomSummaryWire {
     Bytes<64> room_id;
     Bytes<64> room_name;
+    Bytes<64> room_instance_id;
+    uint32_t access_epoch = 0;
     uint16_t participant_count = 0;
     uint8_t  flags = 0;
-    uint8_t  reserved = 0;
+    uint8_t  access_mode = ROOM_ACCESS_OPEN;
 };
 
 struct ServerStatusRequestHdr : CtrlHdr {
@@ -206,13 +269,16 @@ struct RoomCreateRequestHdr : CtrlHdr {
     Bytes<64> profile_id;
     Bytes<64> display_name;
     Bytes<128> password_hash;
+    uint8_t  access_mode = ROOM_ACCESS_OPEN;
+    uint8_t  reserved[3] = {};
 };
 
 struct RoomCreateResponseHdr : CtrlHdr {
     uint32_t request_id = 0;
     uint8_t  status = ROOM_STATUS_OK;
     uint8_t  flags = 0;
-    uint16_t reserved = 0;
+    uint8_t  access_mode = ROOM_ACCESS_OPEN;
+    uint8_t  reserved = 0;
     uint32_t access_epoch = 0;
     Bytes<64> room_id;
     Bytes<64> room_name;
@@ -234,7 +300,8 @@ struct RoomJoinTokenResponseHdr : CtrlHdr {
     uint32_t request_id = 0;
     uint8_t  status = ROOM_STATUS_OK;
     uint8_t  flags = 0;
-    uint16_t reserved = 0;
+    uint8_t  access_mode = ROOM_ACCESS_OPEN;
+    uint8_t  reserved = 0;
     uint32_t access_epoch = 0;
     Bytes<64> room_id;
     Bytes<64> room_name;
@@ -246,7 +313,7 @@ struct RoomJoinTokenResponseHdr : CtrlHdr {
 struct RoomAdminRequestHdr : CtrlHdr {
     uint32_t request_id = 0;
     uint8_t  command = 0;
-    uint8_t  reserved8 = 0;
+    uint8_t  access_mode = ROOM_ACCESS_OPEN;
     uint16_t reserved16 = 0;
     uint32_t target_participant_id = 0;
     Bytes<64> room_id;
@@ -258,7 +325,8 @@ struct RoomAdminResponseHdr : CtrlHdr {
     uint32_t request_id = 0;
     uint8_t  status = ROOM_STATUS_OK;
     uint8_t  flags = 0;
-    uint16_t reserved = 0;
+    uint8_t  access_mode = ROOM_ACCESS_OPEN;
+    uint8_t  reserved = 0;
     uint32_t access_epoch = 0;
     uint32_t target_participant_id = 0;
     Bytes<64> room_id;

@@ -20,6 +20,8 @@ class ParticipantManager {
     struct ParticipantMetadata {
         std::string profile_id;
         std::string display_name;
+        Bytes<E2E_PUBLIC_KEY_BYTES> key_public{};
+        bool has_key_public = false;
     };
 
     struct ParticipantEntry {
@@ -89,6 +91,8 @@ public:
             if (pending != pending_metadata_.end()) {
                 new_participant->profile_id   = pending->second.profile_id;
                 new_participant->display_name = pending->second.display_name;
+                new_participant->key_public = pending->second.key_public;
+                new_participant->has_key_public = pending->second.has_key_public;
                 pending_metadata_.erase(pending);
             }
             participants_[id] = std::move(new_participant);
@@ -100,16 +104,21 @@ public:
     }
 
     void set_participant_metadata(uint32_t id, const std::string& profile_id,
-                                  const std::string& display_name) {
+                                  const std::string& display_name,
+                                  Bytes<E2E_PUBLIC_KEY_BYTES> key_public = {},
+                                  bool has_key_public = false) {
         assert_not_audio_callback_lock();
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = participants_.find(id);
         if (it != participants_.end()) {
             it->second->profile_id   = profile_id;
             it->second->display_name = display_name;
+            it->second->key_public = key_public;
+            it->second->has_key_public = has_key_public;
             publish_metadata_snapshot_locked();
         } else {
-            pending_metadata_[id] = {profile_id, display_name};
+            pending_metadata_[id] = {profile_id, display_name, key_public,
+                                     has_key_public};
         }
     }
 
@@ -313,7 +322,9 @@ private:
         snapshot->reserve(participants_.size());
         for (const auto& [id, participant]: participants_) {
             snapshot->emplace(id, ParticipantMetadata{participant->profile_id,
-                                                      participant->display_name});
+                                                      participant->display_name,
+                                                      participant->key_public,
+                                                      participant->has_key_public});
         }
         ParticipantMetadataSnapshotPtr published = std::move(snapshot);
         std::atomic_store_explicit(&metadata_snapshot_, std::move(published),
@@ -333,6 +344,8 @@ private:
         if (metadata != nullptr) {
             info.profile_id   = metadata->profile_id;
             info.display_name = metadata->display_name;
+            info.key_public = metadata->key_public;
+            info.has_key_public = metadata->has_key_public;
         }
         info.is_speaking    = data.is_speaking.load(std::memory_order_relaxed);
         info.is_muted       = data.is_muted.load(std::memory_order_relaxed);

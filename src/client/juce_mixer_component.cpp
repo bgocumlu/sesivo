@@ -5,6 +5,7 @@
 #include "packet_builder.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "secure_invite.h"
 
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
@@ -237,6 +238,371 @@ juce::String admin_participant_label(const ParticipantInfo& participant) {
     return name + " #" + juce::String(static_cast<int>(participant.id));
 }
 
+uint8_t access_mode_from_combo_id(int selected_id) {
+    switch (selected_id) {
+        case 2:
+            return ROOM_ACCESS_PASSWORD;
+        case 3:
+            return ROOM_ACCESS_APPROVE;
+        default:
+            return ROOM_ACCESS_OPEN;
+    }
+}
+
+int combo_id_for_access_mode(uint8_t access_mode) {
+    switch (access_mode) {
+        case ROOM_ACCESS_PASSWORD:
+            return 2;
+        case ROOM_ACCESS_APPROVE:
+            return 3;
+        default:
+            return 1;
+    }
+}
+
+class RoomSettingsDialog final : public juce::Component {
+public:
+    RoomSettingsDialog(uint8_t current_access_mode,
+                       std::function<void(uint8_t, std::string)> on_apply)
+        : on_apply_(std::move(on_apply)) {
+        setSize(420, 218);
+        title_.setText("Room Settings", juce::dontSendNotification);
+        juce_theme::style_label(title_, juce_theme::colour::text(), 16.0F, true);
+        access_label_.setText("Access", juce::dontSendNotification);
+        juce_theme::style_label(access_label_, juce_theme::colour::text_dim(), 12.5F);
+        password_label_.setText("Password", juce::dontSendNotification);
+        juce_theme::style_label(password_label_, juce_theme::colour::text_dim(), 12.5F);
+        status_label_.setText({}, juce::dontSendNotification);
+        juce_theme::style_label(status_label_, juce_theme::colour::warning(), 12.0F);
+
+        access_combo_.addItem("Open", 1);
+        access_combo_.addItem("Password", 2);
+        access_combo_.addItem("Approve", 3);
+        access_combo_.setSelectedId(combo_id_for_access_mode(current_access_mode),
+                                    juce::dontSendNotification);
+        access_combo_.onChange = [this]() { update_password_visibility(); };
+
+        password_editor_.setTextToShowWhenEmpty("Room password",
+                                                juce_theme::colour::text_faint());
+        juce_theme::style_editor(password_editor_, 14.0F);
+        apply_button_.setButtonText("Apply");
+        cancel_button_.setButtonText("Cancel");
+        apply_button_.onClick = [this]() { apply(); };
+        cancel_button_.onClick = [this]() { close(); };
+
+        addAndMakeVisible(title_);
+        addAndMakeVisible(access_label_);
+        addAndMakeVisible(access_combo_);
+        addAndMakeVisible(password_label_);
+        addAndMakeVisible(password_editor_);
+        addAndMakeVisible(status_label_);
+        addAndMakeVisible(apply_button_);
+        addAndMakeVisible(cancel_button_);
+        update_password_visibility();
+    }
+
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce_theme::colour::panel_bottom());
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(20, 16);
+        title_.setBounds(area.removeFromTop(24));
+        area.removeFromTop(12);
+        auto access_row = area.removeFromTop(32);
+        access_label_.setBounds(access_row.removeFromLeft(82));
+        access_combo_.setBounds(access_row);
+        area.removeFromTop(10);
+        auto password_row = area.removeFromTop(32);
+        password_label_.setBounds(password_row.removeFromLeft(82));
+        password_editor_.setBounds(password_row);
+        area.removeFromTop(8);
+        status_label_.setBounds(area.removeFromTop(22));
+        auto buttons = area.removeFromBottom(34);
+        cancel_button_.setBounds(buttons.removeFromRight(88).reduced(2));
+        buttons.removeFromRight(8);
+        apply_button_.setBounds(buttons.removeFromRight(88).reduced(2));
+    }
+
+private:
+    void update_password_visibility() {
+        const bool password_mode =
+            access_mode_from_combo_id(access_combo_.getSelectedId()) == ROOM_ACCESS_PASSWORD;
+        password_label_.setVisible(password_mode);
+        password_editor_.setVisible(password_mode);
+        if (!password_mode) {
+            password_editor_.clear();
+        }
+    }
+
+    void apply() {
+        const uint8_t access_mode =
+            access_mode_from_combo_id(access_combo_.getSelectedId());
+        const auto password = password_editor_.getText().trim().toStdString();
+        if (access_mode == ROOM_ACCESS_PASSWORD && password.empty()) {
+            status_label_.setText("Password is required for password access",
+                                  juce::dontSendNotification);
+            return;
+        }
+        if (on_apply_) {
+            on_apply_(access_mode, password);
+        }
+        close();
+    }
+
+    void close() {
+        if (auto* dialog = findParentComponentOfClass<juce::DialogWindow>()) {
+            dialog->exitModalState(0);
+        }
+    }
+
+    std::function<void(uint8_t, std::string)> on_apply_;
+    juce::Label title_;
+    juce::Label access_label_;
+    juce::ComboBox access_combo_;
+    juce::Label password_label_;
+    juce::TextEditor password_editor_;
+    juce::Label status_label_;
+    juce::TextButton apply_button_;
+    juce::TextButton cancel_button_;
+};
+
+class ParticipantAdminRow final : public juce::Component {
+public:
+    ParticipantAdminRow(const ParticipantInfo& participant, bool waiting,
+                        std::function<void(uint32_t)> on_approve,
+                        std::function<void(uint32_t)> on_decline,
+                        std::function<void(uint32_t)> on_kick)
+        : participant_id_(participant.id),
+          waiting_(waiting),
+          on_approve_(std::move(on_approve)),
+          on_decline_(std::move(on_decline)),
+          on_kick_(std::move(on_kick)) {
+        name_.setText(admin_participant_label(participant), juce::dontSendNotification);
+        juce_theme::style_label(name_, juce_theme::colour::text(), 13.5F, true);
+        addAndMakeVisible(name_);
+        if (waiting_) {
+            approve_button_.setButtonText(juce::String::fromUTF8("\xE2\x9C\x93"));
+            decline_button_.setButtonText("X");
+            approve_button_.onClick = [this]() { invoke(on_approve_); };
+            decline_button_.onClick = [this]() { invoke(on_decline_); };
+            addAndMakeVisible(approve_button_);
+            addAndMakeVisible(decline_button_);
+        } else {
+            kick_button_.setButtonText("Kick");
+            kick_button_.onClick = [this]() { invoke(on_kick_); };
+            addAndMakeVisible(kick_button_);
+        }
+    }
+
+    void paint(juce::Graphics& g) override {
+        auto area = getLocalBounds().toFloat().reduced(0.5F, 2.0F);
+        g.setColour(waiting_ ? juce::Colour{0xff2a241f}
+                             : juce_theme::colour::row());
+        g.fillRoundedRectangle(area, juce_theme::radius);
+        g.setColour(waiting_ ? juce_theme::colour::accent()
+                             : juce_theme::colour::border_soft());
+        g.drawRoundedRectangle(area, juce_theme::radius, 1.0F);
+    }
+
+    void resized() override {
+        auto row = getLocalBounds().reduced(10, 5);
+        if (waiting_) {
+            decline_button_.setBounds(row.removeFromRight(44).reduced(2));
+            row.removeFromRight(6);
+            approve_button_.setBounds(row.removeFromRight(44).reduced(2));
+        } else {
+            kick_button_.setBounds(row.removeFromRight(72).reduced(2));
+        }
+        name_.setBounds(row);
+    }
+
+private:
+    void invoke(const std::function<void(uint32_t)>& callback) {
+        if (callback) {
+            callback(participant_id_);
+        }
+    }
+
+    uint32_t participant_id_ = 0;
+    bool waiting_ = false;
+    std::function<void(uint32_t)> on_approve_;
+    std::function<void(uint32_t)> on_decline_;
+    std::function<void(uint32_t)> on_kick_;
+    juce::Label name_;
+    juce::TextButton approve_button_;
+    juce::TextButton decline_button_;
+    juce::TextButton kick_button_;
+};
+
+class ParticipantsDialog final : public juce::Component, private juce::Timer {
+public:
+    ParticipantsDialog(std::function<std::vector<ParticipantInfo>()> get_waiting,
+                       std::function<std::vector<ParticipantInfo>()> get_participants,
+                       std::function<void(uint32_t)> on_approve,
+                       std::function<void(uint32_t)> on_decline,
+                       std::function<void(uint32_t)> on_kick)
+        : get_waiting_(std::move(get_waiting)),
+          get_participants_(std::move(get_participants)),
+          on_approve_(std::move(on_approve)),
+          on_decline_(std::move(on_decline)),
+          on_kick_(std::move(on_kick)) {
+        setSize(540, 320);
+        title_.setText("Participants", juce::dontSendNotification);
+        juce_theme::style_label(title_, juce_theme::colour::text(), 16.0F, true);
+        juce_theme::style_label(waiting_label_, juce_theme::colour::text_dim(), 12.5F, true);
+        juce_theme::style_label(in_room_label_, juce_theme::colour::text_dim(), 12.5F, true);
+        juce_theme::style_label(empty_label_, juce_theme::colour::text_faint(), 13.0F);
+        close_button_.setButtonText("Close");
+        close_button_.onClick = [this]() {
+            if (auto* dialog = findParentComponentOfClass<juce::DialogWindow>()) {
+                dialog->exitModalState(0);
+            }
+        };
+        viewport_.setScrollBarsShown(true, false);
+        viewport_.setViewedComponent(&rows_content_, false);
+
+        addAndMakeVisible(title_);
+        rows_content_.addAndMakeVisible(waiting_label_);
+        rows_content_.addAndMakeVisible(in_room_label_);
+        rows_content_.addAndMakeVisible(empty_label_);
+        addAndMakeVisible(viewport_);
+        addAndMakeVisible(close_button_);
+        refresh_rows(true);
+        startTimerHz(4);
+    }
+
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce_theme::colour::panel_bottom());
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(20, 16);
+        title_.setBounds(area.removeFromTop(24));
+        area.removeFromTop(10);
+        close_button_.setBounds(getWidth() - 108, getHeight() - 50, 88, 30);
+        area.removeFromBottom(48);
+        viewport_.setBounds(area);
+        layout_rows_content();
+    }
+
+private:
+    void timerCallback() override {
+        refresh_rows(false);
+    }
+
+    static std::string signature_for(const std::vector<ParticipantInfo>& waiting,
+                                     const std::vector<ParticipantInfo>& participants) {
+        std::string out;
+        out.reserve((waiting.size() + participants.size()) * 24);
+        auto append = [&](char prefix, const ParticipantInfo& info) {
+            out.push_back(prefix);
+            out += std::to_string(info.id);
+            out.push_back(':');
+            out += info.display_name;
+            out.push_back(':');
+            out += info.profile_id;
+            out.push_back('|');
+        };
+        for (const auto& info: waiting) {
+            append('w', info);
+        }
+        for (const auto& info: participants) {
+            append('p', info);
+        }
+        return out;
+    }
+
+    void remove_rows() {
+        for (auto& row: waiting_rows_) {
+            rows_content_.removeChildComponent(row.get());
+        }
+        for (auto& row: participant_rows_) {
+            rows_content_.removeChildComponent(row.get());
+        }
+        waiting_rows_.clear();
+        participant_rows_.clear();
+    }
+
+    void layout_rows_content() {
+        const int row_count = static_cast<int>(waiting_rows_.size() +
+                                               participant_rows_.size());
+        const bool empty = row_count == 0;
+        const int content_height =
+            20 + static_cast<int>(waiting_rows_.size()) * 36 + 10 + 20 +
+            static_cast<int>(participant_rows_.size()) * 36 + (empty ? 28 : 8);
+        rows_content_.setSize(juce::jmax(1, viewport_.getWidth() - 14),
+                              juce::jmax(viewport_.getHeight(), content_height));
+
+        auto area = rows_content_.getLocalBounds().reduced(0, 0);
+        waiting_label_.setBounds(area.removeFromTop(20));
+        for (auto& row: waiting_rows_) {
+            row->setBounds(area.removeFromTop(36));
+        }
+        area.removeFromTop(10);
+        in_room_label_.setBounds(area.removeFromTop(20));
+        for (auto& row: participant_rows_) {
+            row->setBounds(area.removeFromTop(36));
+        }
+        empty_label_.setBounds(area.removeFromTop(28));
+    }
+
+    void refresh_rows(bool force) {
+        const auto waiting = get_waiting_ ? get_waiting_()
+                                          : std::vector<ParticipantInfo>{};
+        const auto participants = get_participants_ ? get_participants_()
+                                                    : std::vector<ParticipantInfo>{};
+        const auto signature = signature_for(waiting, participants);
+        if (!force && signature == rows_signature_) {
+            return;
+        }
+        rows_signature_ = signature;
+
+        remove_rows();
+        waiting_label_.setText(
+            "Waiting (" + juce::String(static_cast<int>(waiting.size())) + ")",
+            juce::dontSendNotification);
+        in_room_label_.setText(
+            "In room (" + juce::String(static_cast<int>(participants.size())) + ")",
+            juce::dontSendNotification);
+        empty_label_.setText(waiting.empty() && participants.empty()
+                                 ? "No participants"
+                                 : "",
+                             juce::dontSendNotification);
+
+        for (const auto& participant: waiting) {
+            auto row = std::make_unique<ParticipantAdminRow>(
+                participant, true, on_approve_, on_decline_, on_kick_);
+            rows_content_.addAndMakeVisible(*row);
+            waiting_rows_.push_back(std::move(row));
+        }
+        for (const auto& participant: participants) {
+            auto row = std::make_unique<ParticipantAdminRow>(
+                participant, false, on_approve_, on_decline_, on_kick_);
+            rows_content_.addAndMakeVisible(*row);
+            participant_rows_.push_back(std::move(row));
+        }
+        layout_rows_content();
+        repaint();
+    }
+
+    std::function<std::vector<ParticipantInfo>()> get_waiting_;
+    std::function<std::vector<ParticipantInfo>()> get_participants_;
+    std::function<void(uint32_t)> on_approve_;
+    std::function<void(uint32_t)> on_decline_;
+    std::function<void(uint32_t)> on_kick_;
+    std::string rows_signature_;
+    juce::Label title_;
+    juce::Viewport viewport_;
+    juce::Component rows_content_;
+    juce::Label waiting_label_;
+    juce::Label in_room_label_;
+    juce::Label empty_label_;
+    juce::TextButton close_button_;
+    std::vector<std::unique_ptr<ParticipantAdminRow>> waiting_rows_;
+    std::vector<std::unique_ptr<ParticipantAdminRow>> participant_rows_;
+};
+
 bool matches_api(const AudioStream::DeviceInfo& device, const std::string& api_name) {
     return api_name.empty() || api_name == "All" || device.api_name == api_name;
 }
@@ -404,14 +770,10 @@ void JuceMixerComponent::configure_controls() {
     configure_linear_slider(wav_gain_slider_, 0.0, 2.0, 0.01, "x");
     wav_gain_slider_.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
     wav_mute_toggle_.setButtonText("Local mute");
-    room_password_editor_.setTextToShowWhenEmpty(
-        "Password", juce_theme::colour::text_faint());
-    juce_theme::style_editor(room_password_editor_, 14.0F);
-    room_set_password_button_.setButtonText("Set password");
-    room_open_button_.setButtonText("Clear password");
-    room_kick_combo_.setTextWhenNothingSelected("Participant");
-    room_kick_button_.setButtonText("Kick");
+    room_settings_button_.setButtonText("Settings");
+    room_participants_button_.setButtonText("Participants");
     room_close_button_.setButtonText("Close room");
+    room_copy_invite_button_.setButtonText("Copy invite");
 
     add_all(*this, {&status_bar_, &leave_button_, &diagnostics_label_, &participants_component_,
                     &local_audio_label_, &network_label_, &redundancy_section_label_,
@@ -420,9 +782,8 @@ void JuceMixerComponent::configure_controls() {
                     &input_gain_label_, &packet_label_, &jitter_label_,
                     &queue_label_, &age_limit_label_, &redundancy_label_,
                     &wav_position_label_, &wav_gain_label_,
-                    &room_password_editor_, &room_set_password_button_,
-                    &room_open_button_, &room_kick_combo_, &room_kick_button_,
-                    &room_close_button_,
+                    &room_settings_button_, &room_participants_button_,
+                    &room_close_button_, &room_copy_invite_button_,
                     &mic_mute_button_, &monitor_toggle_, &input_gain_slider_,
                     &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
                     &auto_jitter_toggle_, &redundancy_combo_, &bpm_editor_,
@@ -432,10 +793,10 @@ void JuceMixerComponent::configure_controls() {
                     &wav_mute_toggle_});
 
     leave_button_.onClick = [this]() { leave_room(); };
-    room_set_password_button_.onClick = [this]() { request_room_password_change(false); };
-    room_open_button_.onClick = [this]() { request_room_password_change(true); };
-    room_kick_button_.onClick = [this]() { request_room_kick(); };
+    room_settings_button_.onClick = [this]() { request_room_settings_dialog(); };
+    room_participants_button_.onClick = [this]() { request_participants_dialog(); };
     room_close_button_.onClick = [this]() { request_room_close(); };
+    room_copy_invite_button_.onClick = [this]() { request_copy_invite(); };
     mic_mute_button_.onClick = [this]() {
         if (!updating_from_client_) {
             client_.set_mic_muted(mic_mute_button_.getToggleState());
@@ -741,35 +1102,29 @@ void JuceMixerComponent::resized() {
     const bool admin_visible = has_room_admin();
     for (auto* component: {static_cast<juce::Component*>(&room_admin_label_),
                            static_cast<juce::Component*>(&room_admin_status_label_),
-                           static_cast<juce::Component*>(&room_password_editor_),
-                           static_cast<juce::Component*>(&room_set_password_button_),
-                           static_cast<juce::Component*>(&room_open_button_),
-                           static_cast<juce::Component*>(&room_kick_combo_),
-                           static_cast<juce::Component*>(&room_kick_button_),
-                           static_cast<juce::Component*>(&room_close_button_)}) {
+                           static_cast<juce::Component*>(&room_settings_button_),
+                           static_cast<juce::Component*>(&room_participants_button_),
+                           static_cast<juce::Component*>(&room_close_button_),
+                           static_cast<juce::Component*>(&room_copy_invite_button_)}) {
         component->setVisible(admin_visible);
     }
 
     auto participants_area = area.reduced(12, 10);
     if (admin_visible) {
-        auto admin = participants_area.removeFromTop(34);
-        participants_area.removeFromTop(8);
+        auto admin_row = participants_area.removeFromTop(34);
+        participants_area.removeFromTop(10);
 
-        room_admin_label_.setBounds(admin.removeFromLeft(96));
-        admin.removeFromLeft(control_gap);
-        room_password_editor_.setBounds(admin.removeFromLeft(180).reduced(2));
-        admin.removeFromLeft(control_gap);
-        room_set_password_button_.setBounds(admin.removeFromLeft(104).reduced(2));
-        admin.removeFromLeft(control_gap);
-        room_open_button_.setBounds(admin.removeFromLeft(116).reduced(2));
-        admin.removeFromLeft(control_gap + 8);
-        room_kick_combo_.setBounds(admin.removeFromLeft(176).reduced(2));
-        admin.removeFromLeft(control_gap);
-        room_kick_button_.setBounds(admin.removeFromLeft(60).reduced(2));
-        admin.removeFromLeft(control_gap + 8);
-        room_close_button_.setBounds(admin.removeFromLeft(92).reduced(2));
-        admin.removeFromLeft(control_gap);
-        room_admin_status_label_.setBounds(admin.reduced(2));
+        room_admin_label_.setBounds(admin_row.removeFromLeft(96));
+        admin_row.removeFromLeft(control_gap);
+        room_copy_invite_button_.setBounds(admin_row.removeFromLeft(104).reduced(2));
+        admin_row.removeFromLeft(control_gap);
+        room_settings_button_.setBounds(admin_row.removeFromLeft(92).reduced(2));
+        admin_row.removeFromLeft(control_gap);
+        room_participants_button_.setBounds(admin_row.removeFromLeft(128).reduced(2));
+        admin_row.removeFromLeft(control_gap);
+        room_close_button_.setBounds(admin_row.removeFromLeft(92).reduced(2));
+        admin_row.removeFromLeft(control_gap);
+        room_admin_status_label_.setBounds(admin_row.reduced(2));
     }
 
     participants_component_.setBounds(participants_area);
@@ -1364,93 +1719,135 @@ void JuceMixerComponent::refresh_room_admin_controls(
         running = room_admin_job_running_;
     }
 
-    room_password_editor_.setEnabled(admin && !running);
-    room_set_password_button_.setEnabled(admin && !running);
-    room_open_button_.setEnabled(admin && !running);
+    room_settings_button_.setEnabled(admin && !running);
     room_close_button_.setEnabled(admin && !running);
-
-    uint32_t selected_participant_id = 0;
-    const int selected_combo_id = room_kick_combo_.getSelectedId();
-    if (selected_combo_id > 0 &&
-        selected_combo_id <= static_cast<int>(admin_participant_choices_.size())) {
-        selected_participant_id =
-            admin_participant_choices_[static_cast<size_t>(selected_combo_id - 1)].id;
-    }
-
-    std::vector<AdminParticipantChoice> choices;
-    choices.reserve(participants.size());
-    for (const auto& participant: participants) {
-        choices.push_back({participant.id, admin_participant_label(participant)});
-    }
-
-    bool changed = choices.size() != admin_participant_choices_.size();
-    if (!changed) {
-        for (size_t i = 0; i < choices.size(); ++i) {
-            if (choices[i].id != admin_participant_choices_[i].id ||
-                choices[i].label != admin_participant_choices_[i].label) {
-                changed = true;
-                break;
-            }
-        }
-    }
-
-    if (changed) {
-        admin_participant_choices_ = std::move(choices);
-        room_kick_combo_.clear(juce::dontSendNotification);
-        int item_id = 1;
-        int selected_item_id = 0;
-        for (const auto& choice: admin_participant_choices_) {
-            room_kick_combo_.addItem(choice.label, item_id);
-            if (choice.id == selected_participant_id) {
-                selected_item_id = item_id;
-            }
-            ++item_id;
-        }
-        room_kick_combo_.setSelectedId(selected_item_id, juce::dontSendNotification);
-    }
-
-    const bool can_kick = admin && !running && !admin_participant_choices_.empty();
-    room_kick_combo_.setEnabled(can_kick);
-    room_kick_button_.setEnabled(can_kick && room_kick_combo_.getSelectedId() > 0);
+    const auto waiting = client_.get_waiting_participant_info();
+    room_participants_button_.setEnabled(admin && !running);
+    room_participants_button_.setButtonText(
+        waiting.empty()
+            ? "Participants"
+            : "Participants (" + juce::String(static_cast<int>(waiting.size())) + ")");
+    room_participants_button_.setToggleState(!waiting.empty(), juce::dontSendNotification);
+    room_copy_invite_button_.setEnabled(admin);
 }
 
-void JuceMixerComponent::request_room_password_change(bool clear_password) {
+void JuceMixerComponent::request_room_settings_dialog() {
     if (!has_room_admin()) {
         set_room_admin_status("Only the room creator can change this room");
         return;
     }
 
+    auto* content = new RoomSettingsDialog(
+        startup_options_.access_mode,
+        [safe_this = juce::Component::SafePointer<JuceMixerComponent>(this)](
+            uint8_t access_mode, std::string password) {
+            if (auto* self = safe_this.getComponent()) {
+                self->request_room_access_change(access_mode, std::move(password));
+            }
+        });
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "Room Settings";
+    options.content.setOwned(content);
+    options.componentToCentreAround = this;
+    options.dialogBackgroundColour = juce_theme::colour::panel_bottom();
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = false;
+    options.resizable = false;
+    options.launchAsync();
+}
+
+void JuceMixerComponent::request_room_access_change(uint8_t access_mode,
+                                                    std::string password) {
+    if (!has_room_admin()) {
+        set_room_admin_status("Only the room creator can change this room");
+        return;
+    }
     std::string hash;
-    if (!clear_password) {
-        const auto password = room_password_editor_.getText().trim().toStdString();
+    if (access_mode == ROOM_ACCESS_PASSWORD) {
         if (password.empty()) {
-            set_room_admin_status("Enter a password or clear password");
+            set_room_admin_status("Password is required for password access");
             return;
         }
         hash = password_hash(password);
     }
+    set_room_admin_status("Saving room settings...");
+    start_room_admin_job(ROOM_ADMIN_CHANGE_ACCESS, 0, std::move(hash), false,
+                         access_mode);
+}
 
-    set_room_admin_status(clear_password ? "Clearing password..." : "Setting password...");
-    start_room_admin_job(ROOM_ADMIN_CHANGE_PASSWORD, 0, std::move(hash), false);
-    if (clear_password) {
-        room_password_editor_.clear();
+void JuceMixerComponent::request_participants_dialog() {
+    if (!has_room_admin()) {
+        set_room_admin_status("Only the room creator can manage participants");
+        return;
+    }
+
+    const auto safe_this = juce::Component::SafePointer<JuceMixerComponent>(this);
+    auto* content = new ParticipantsDialog(
+        [safe_this]() {
+            if (auto* self = safe_this.getComponent()) {
+                return self->client_.get_waiting_participant_info();
+            }
+            return std::vector<ParticipantInfo>{};
+        },
+        [safe_this]() {
+            if (auto* self = safe_this.getComponent()) {
+                return self->client_.get_participant_info();
+            }
+            return std::vector<ParticipantInfo>{};
+        },
+        [safe_this](uint32_t participant_id) {
+            if (auto* self = safe_this.getComponent()) {
+                self->request_room_approve(participant_id);
+            }
+        },
+        [safe_this](uint32_t participant_id) {
+            if (auto* self = safe_this.getComponent()) {
+                self->request_room_decline(participant_id);
+            }
+        },
+        [safe_this](uint32_t participant_id) {
+            if (auto* self = safe_this.getComponent()) {
+                self->request_room_kick(participant_id);
+            }
+        });
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "Participants";
+    options.content.setOwned(content);
+    options.componentToCentreAround = this;
+    options.dialogBackgroundColour = juce_theme::colour::panel_bottom();
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = false;
+    options.resizable = false;
+    options.launchAsync();
+}
+
+void JuceMixerComponent::request_room_approve(uint32_t participant_id) {
+    if (!has_room_admin()) {
+        set_room_admin_status("Only the room creator can approve");
+        return;
+    }
+    if (client_.approve_waiting_participant(participant_id)) {
+        set_room_admin_status("Participant approved");
+    } else {
+        set_room_admin_status("Approve failed");
     }
 }
 
-void JuceMixerComponent::request_room_kick() {
+void JuceMixerComponent::request_room_decline(uint32_t participant_id) {
+    request_room_kick(participant_id);
+}
+
+void JuceMixerComponent::request_room_kick(uint32_t participant_id) {
     if (!has_room_admin()) {
         set_room_admin_status("Only the room creator can kick");
         return;
     }
-    const int selected = room_kick_combo_.getSelectedId();
-    if (selected <= 0 || selected > static_cast<int>(admin_participant_choices_.size())) {
-        set_room_admin_status("Choose a participant to kick");
+    if (participant_id == 0) {
+        set_room_admin_status("Choose a participant");
         return;
     }
 
-    const uint32_t participant_id =
-        admin_participant_choices_[static_cast<size_t>(selected - 1)].id;
-    set_room_admin_status("Kicking participant...");
+    set_room_admin_status("Removing participant...");
     start_room_admin_job(ROOM_ADMIN_KICK_PARTICIPANT, participant_id, {}, false);
 }
 
@@ -1463,10 +1860,21 @@ void JuceMixerComponent::request_room_close() {
     start_room_admin_job(ROOM_ADMIN_CLOSE_ROOM, 0, {}, true);
 }
 
+void JuceMixerComponent::request_copy_invite() {
+    if (!has_room_admin()) {
+        set_room_admin_status("Only the room creator can copy invites");
+        return;
+    }
+
+    juce::SystemClipboard::copyTextToClipboard(invite_text());
+    set_room_admin_status("Invite copied");
+}
+
 void JuceMixerComponent::start_room_admin_job(uint8_t command,
                                               uint32_t target_participant_id,
                                               std::string hash,
-                                              bool closes_room) {
+                                              bool closes_room,
+                                              uint8_t access_mode) {
     {
         std::lock_guard<std::mutex> lock(room_admin_job_mutex_);
         if (room_admin_job_running_) {
@@ -1484,9 +1892,10 @@ void JuceMixerComponent::start_room_admin_job(uint8_t command,
 
     room_admin_job_thread_ =
         std::thread([this, command, target_participant_id,
-                     hash = std::move(hash), closes_room]() {
+                     hash = std::move(hash), closes_room, access_mode]() {
             auto result =
-                run_room_admin_command(command, target_participant_id, hash, closes_room);
+                run_room_admin_command(command, target_participant_id, hash,
+                                       closes_room, access_mode);
             std::lock_guard<std::mutex> lock(room_admin_job_mutex_);
             room_admin_job_result_ = std::move(result);
             room_admin_job_finished_ = true;
@@ -1495,7 +1904,7 @@ void JuceMixerComponent::start_room_admin_job(uint8_t command,
 
 JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
     uint8_t command, uint32_t target_participant_id,
-    const std::string& hash, bool closes_room) {
+    const std::string& hash, bool closes_room, uint8_t access_mode) {
     RoomAdminResult result;
 
     const auto connected_port = client_.get_server_port();
@@ -1515,6 +1924,7 @@ JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
     request.type = CtrlHdr::Cmd::ROOM_ADMIN_REQUEST;
     request.request_id = room_admin_request_id_.fetch_add(1, std::memory_order_relaxed);
     request.command = command;
+    request.access_mode = access_mode;
     request.target_participant_id = target_participant_id;
     write_fixed(request.room_id, room_id);
     write_fixed(request.admin_token, startup_options_.room_admin_token);
@@ -1528,6 +1938,8 @@ JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
         const auto reason = fixed_string(response.reason);
         result.ok = response.status == ROOM_STATUS_OK;
         result.closed = result.ok && closes_room;
+        result.access_epoch = response.access_epoch;
+        result.access_mode = response.access_mode;
         if (!result.ok) {
             result.status = room_admin_status_text(response.status, reason);
             return result;
@@ -1537,15 +1949,40 @@ JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
             case ROOM_ADMIN_CHANGE_PASSWORD:
                 result.status = hash.empty() ? "Password cleared" : "Password set";
                 break;
+            case ROOM_ADMIN_CHANGE_ACCESS:
+                result.status = "Room settings saved";
+                break;
             case ROOM_ADMIN_KICK_PARTICIPANT:
                 result.status = "Participant kicked";
                 break;
             case ROOM_ADMIN_CLOSE_ROOM:
                 result.status = "Room closed";
                 break;
+            case ROOM_ADMIN_ROTATE_MEDIA_KEY:
+                result.status = "Room key rotated";
+                break;
             default:
                 result.status = "Done";
                 break;
+        }
+
+        const bool should_rotate_media_key =
+            command == ROOM_ADMIN_CHANGE_PASSWORD ||
+            command == ROOM_ADMIN_CHANGE_ACCESS ||
+            command == ROOM_ADMIN_KICK_PARTICIPANT ||
+            command == ROOM_ADMIN_ROTATE_MEDIA_KEY;
+        const auto current_secret = client_.current_media_secret();
+        if (should_rotate_media_key && !current_secret.empty()) {
+            const auto new_secret = make_media_secret();
+            if (client_.rotate_media_key(new_secret)) {
+                result.media_key_rotated = true;
+                result.new_media_secret = new_secret;
+                if (command != ROOM_ADMIN_ROTATE_MEDIA_KEY) {
+                    result.status += "; room key rotated";
+                }
+            } else {
+                result.status += "; room key rotation failed";
+            }
         }
     } catch (const std::exception& e) {
         result.status = e.what();
@@ -1578,6 +2015,18 @@ void JuceMixerComponent::apply_room_admin_result(RoomAdminResult result) {
     set_room_admin_status(result.status);
     if (!result.ok) {
         return;
+    }
+    if (result.access_mode == ROOM_ACCESS_OPEN ||
+        result.access_mode == ROOM_ACCESS_PASSWORD ||
+        result.access_mode == ROOM_ACCESS_APPROVE) {
+        startup_options_.access_mode = result.access_mode;
+        client_.set_room_access_mode(result.access_mode);
+    }
+    if (result.access_epoch != 0) {
+        startup_options_.access_epoch = result.access_epoch;
+    }
+    if (result.media_key_rotated) {
+        startup_options_.media_secret = std::move(result.new_media_secret);
     }
     if (result.closed) {
         client_.stop_connection();
@@ -1700,6 +2149,18 @@ std::string JuceMixerComponent::password_hash(const std::string& password) const
     }
     const std::vector<unsigned char> bytes(password.begin(), password.end());
     return performer_join_token::hex(performer_join_token::sha256(bytes));
+}
+
+juce::String JuceMixerComponent::invite_text() const {
+    const auto connected_port = client_.get_server_port();
+    const std::string address =
+        client_.get_server_address().empty() ? startup_options_.server_address
+                                             : client_.get_server_address();
+    const uint16_t port =
+        connected_port == 0 ? startup_options_.server_port : connected_port;
+    const std::string room_id = client_.get_room_id();
+
+    return juce::String(make_secure_invite_link(address, port, room_id));
 }
 
 bool JuceMixerComponent::has_pending_audio_changes() const {

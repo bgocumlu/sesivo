@@ -6,16 +6,20 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <optional>
 #include <string>
 #include <vector>
 
+#include <sodium.h>
+
+#include "opus_network_clock.h"
 #include "performer_join_token.h"
 #include "protocol.h"
 
 namespace session_crypto {
 
 using SessionKey = std::array<unsigned char, 32>;
+using E2EPublicKey = std::array<unsigned char, E2E_PUBLIC_KEY_BYTES>;
+using E2ESecretKey = std::array<unsigned char, E2E_SECRET_KEY_BYTES>;
 
 namespace detail {
 
@@ -25,42 +29,6 @@ inline std::vector<unsigned char> bytes_from_string(const std::string& value) {
 
 inline void append_string(std::vector<unsigned char>& out, const std::string& value) {
     out.insert(out.end(), value.begin(), value.end());
-}
-
-inline void append_u64(std::vector<unsigned char>& out, uint64_t value) {
-    for (int i = 0; i < 8; ++i) {
-        out.push_back(static_cast<unsigned char>((value >> (i * 8)) & 0xFFU));
-    }
-}
-
-inline std::optional<unsigned char> from_hex_digit(char digit) {
-    if (digit >= '0' && digit <= '9') {
-        return static_cast<unsigned char>(digit - '0');
-    }
-    if (digit >= 'a' && digit <= 'f') {
-        return static_cast<unsigned char>(10 + digit - 'a');
-    }
-    if (digit >= 'A' && digit <= 'F') {
-        return static_cast<unsigned char>(10 + digit - 'A');
-    }
-    return std::nullopt;
-}
-
-inline std::optional<std::vector<unsigned char>> hex_to_bytes(const std::string& hex) {
-    if ((hex.size() % 2) != 0) {
-        return std::nullopt;
-    }
-    std::vector<unsigned char> out;
-    out.reserve(hex.size() / 2);
-    for (size_t i = 0; i < hex.size(); i += 2) {
-        const auto high = from_hex_digit(hex[i]);
-        const auto low = from_hex_digit(hex[i + 1]);
-        if (!high.has_value() || !low.has_value()) {
-            return std::nullopt;
-        }
-        out.push_back(static_cast<unsigned char>((*high << 4) | *low));
-    }
-    return out;
 }
 
 inline std::vector<unsigned char> hmac_sha256_bytes(
@@ -96,63 +64,129 @@ inline SessionKey session_key_from_digest(const std::vector<unsigned char>& dige
     return key;
 }
 
-inline std::vector<unsigned char> key_to_vector(const SessionKey& key) {
-    return std::vector<unsigned char>(key.begin(), key.end());
-}
-
-inline std::vector<unsigned char> derive_subkey(const SessionKey& key,
-                                                const std::string& label) {
-    return hmac_sha256_bytes(key_to_vector(key), bytes_from_string(label));
-}
-
-inline std::vector<unsigned char> auth_tag(const std::vector<unsigned char>& auth_key,
-                                           const unsigned char* bytes,
-                                           size_t byte_count) {
-    std::vector<unsigned char> message(bytes, bytes + byte_count);
-    return hmac_sha256_bytes(auth_key, message);
-}
-
-inline bool constant_time_equal(const unsigned char* left, const unsigned char* right,
-                                size_t byte_count) {
-    unsigned char diff = 0;
-    for (size_t i = 0; i < byte_count; ++i) {
-        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
-    }
-    return diff == 0;
-}
-
-inline void xor_keystream(const std::vector<unsigned char>& enc_key, uint64_t nonce,
-                          unsigned char* bytes, size_t byte_count) {
-    size_t offset = 0;
-    uint64_t counter = 0;
-    while (offset < byte_count) {
-        std::vector<unsigned char> input;
-        append_string(input, "jam-audio-stream-v1");
-        append_u64(input, nonce);
-        append_u64(input, counter++);
-        const auto block = hmac_sha256_bytes(enc_key, input);
-        const size_t chunk = std::min(block.size(), byte_count - offset);
-        for (size_t i = 0; i < chunk; ++i) {
-            bytes[offset + i] ^= block[i];
-        }
-        offset += chunk;
-    }
-}
-
-inline void write_header(unsigned char* out, uint64_t nonce, uint16_t ciphertext_bytes) {
-    uint32_t magic = SECURE_AUDIO_MAGIC;
-    uint16_t reserved = 0;
-    size_t offset = 0;
-    std::memcpy(out + offset, &magic, sizeof(magic));
-    offset += sizeof(magic);
-    std::memcpy(out + offset, &nonce, sizeof(nonce));
-    offset += sizeof(nonce);
-    std::memcpy(out + offset, &ciphertext_bytes, sizeof(ciphertext_bytes));
-    offset += sizeof(ciphertext_bytes);
-    std::memcpy(out + offset, &reserved, sizeof(reserved));
+inline bool ensure_sodium_initialized() {
+    return sodium_init() >= 0;
 }
 
 }  // namespace detail
+
+struct SecureAudioMetadata {
+    uint32_t sender_id = 0;
+    uint32_t sequence = 0;
+    uint32_t sample_rate = 0;
+    uint16_t frame_count = 0;
+    uint16_t plaintext_bytes = 0;
+    uint8_t channels = 0;
+    AudioCodec codec = AudioCodec::Opus;
+    int64_t capture_server_time_ns = 0;
+};
+
+struct SecureControlMetadata {
+    uint32_t sender_id = 0;
+    uint32_t sequence = 0;
+    uint16_t plaintext_bytes = 0;
+};
+
+inline bool parse_secure_audio_header(const unsigned char* packet, size_t packet_len,
+                                      SecureAudioMetadata& metadata,
+                                      uint16_t& encrypted_bytes,
+                                      std::string* reason = nullptr) {
+    metadata = {};
+    encrypted_bytes = 0;
+    if (packet == nullptr || packet_len < sizeof(SecureAudioHdr)) {
+        if (reason != nullptr) {
+            *reason = "short secure audio header";
+        }
+        return false;
+    }
+
+    SecureAudioHdr hdr{};
+    std::memcpy(&hdr, packet, sizeof(hdr));
+    if (hdr.magic != SECURE_AUDIO_MAGIC) {
+        if (reason != nullptr) {
+            *reason = "wrong secure audio magic";
+        }
+        return false;
+    }
+    if (hdr.reserved != 0) {
+        if (reason != nullptr) {
+            *reason = "nonzero secure audio reserved field";
+        }
+        return false;
+    }
+    if (hdr.sender_id == 0 || hdr.plaintext_bytes == 0 ||
+        hdr.encrypted_bytes < SECURE_PACKET_TAG_BYTES ||
+        hdr.encrypted_bytes != hdr.plaintext_bytes + SECURE_PACKET_TAG_BYTES ||
+        packet_len != sizeof(SecureAudioHdr) + hdr.encrypted_bytes) {
+        if (reason != nullptr) {
+            *reason = "invalid secure audio lengths";
+        }
+        return false;
+    }
+    if (hdr.sample_rate != opus_network_clock::SAMPLE_RATE || hdr.channels != 1 ||
+        hdr.codec != AudioCodec::Opus ||
+        !opus_network_clock::is_supported_frame_count(hdr.sample_rate, hdr.frame_count)) {
+        if (reason != nullptr) {
+            *reason = "unsupported secure audio shape";
+        }
+        return false;
+    }
+
+    metadata.sender_id = hdr.sender_id;
+    metadata.sequence = hdr.sequence;
+    metadata.sample_rate = hdr.sample_rate;
+    metadata.frame_count = hdr.frame_count;
+    metadata.plaintext_bytes = hdr.plaintext_bytes;
+    metadata.channels = hdr.channels;
+    metadata.codec = hdr.codec;
+    metadata.capture_server_time_ns = hdr.capture_server_time_ns;
+    encrypted_bytes = hdr.encrypted_bytes;
+    return true;
+}
+
+inline bool parse_secure_control_header(const unsigned char* packet, size_t packet_len,
+                                        SecureControlMetadata& metadata,
+                                        uint16_t& encrypted_bytes,
+                                        std::string* reason = nullptr) {
+    metadata = {};
+    encrypted_bytes = 0;
+    if (packet == nullptr || packet_len < sizeof(SecureControlHdr)) {
+        if (reason != nullptr) {
+            *reason = "short secure control header";
+        }
+        return false;
+    }
+
+    SecureControlHdr hdr{};
+    std::memcpy(&hdr, packet, sizeof(hdr));
+    if (hdr.magic != SECURE_CONTROL_MAGIC) {
+        if (reason != nullptr) {
+            *reason = "wrong secure control magic";
+        }
+        return false;
+    }
+    if (hdr.reserved != 0) {
+        if (reason != nullptr) {
+            *reason = "nonzero secure control reserved field";
+        }
+        return false;
+    }
+    if (hdr.sender_id == 0 || hdr.plaintext_bytes == 0 ||
+        hdr.encrypted_bytes < SECURE_PACKET_TAG_BYTES ||
+        hdr.encrypted_bytes != hdr.plaintext_bytes + SECURE_PACKET_TAG_BYTES ||
+        packet_len != sizeof(SecureControlHdr) + hdr.encrypted_bytes) {
+        if (reason != nullptr) {
+            *reason = "invalid secure control lengths";
+        }
+        return false;
+    }
+
+    metadata.sender_id = hdr.sender_id;
+    metadata.sequence = hdr.sequence;
+    metadata.plaintext_bytes = hdr.plaintext_bytes;
+    encrypted_bytes = hdr.encrypted_bytes;
+    return true;
+}
 
 inline std::string nonce_replay_key(const performer_join_token::Claims& claims) {
     return std::to_string(claims.server_id.size()) + ":" + claims.server_id + "|" +
@@ -163,162 +197,257 @@ inline std::string nonce_replay_key(const performer_join_token::Claims& claims) 
            std::to_string(claims.nonce.size()) + ":" + claims.nonce;
 }
 
-inline SessionKey derive_key_from_join_token(
-    const performer_join_token::ValidatedToken& token) {
-    const auto signature_bytes =
-        detail::hex_to_bytes(token.signature_hex)
-            .value_or(detail::bytes_from_string(token.signature_hex));
+inline SessionKey derive_media_key_from_secret(const std::string& room_id,
+                                               const std::string& room_instance_id,
+                                               const std::string& media_secret) {
     std::vector<unsigned char> message;
-    detail::append_string(message, "jam-session-key-v1|");
-    detail::append_string(message, token.signing_input);
-    const auto digest = detail::hmac_sha256_bytes(signature_bytes, message);
+    detail::append_string(message, "sesivo-e2e-media-v3|");
+    detail::append_string(message, room_id);
+    detail::append_string(message, "|");
+    detail::append_string(message, room_instance_id);
+    const auto digest = detail::hmac_sha256_bytes(
+        detail::bytes_from_string(media_secret), message);
     return detail::session_key_from_digest(digest);
 }
 
-inline std::optional<SessionKey> derive_key_from_join_token_string(
-    const std::string& token) {
-    std::string reason;
-    auto parsed = performer_join_token::parse_unverified(token, reason);
-    if (!parsed.has_value()) {
-        return std::nullopt;
+inline bool make_e2e_keypair(E2EPublicKey& public_key, E2ESecretKey& secret_key) {
+    static_assert(E2E_PUBLIC_KEY_BYTES == crypto_box_PUBLICKEYBYTES);
+    static_assert(E2E_SECRET_KEY_BYTES == crypto_box_SECRETKEYBYTES);
+    if (!detail::ensure_sodium_initialized()) {
+        public_key.fill(0);
+        secret_key.fill(0);
+        return false;
     }
-    return derive_key_from_join_token(*parsed);
+    return crypto_box_keypair(public_key.data(), secret_key.data()) == 0;
 }
 
-inline bool seal_audio_packet(const SessionKey& key, uint64_t nonce,
-                              const unsigned char* plaintext, size_t plaintext_len,
-                              unsigned char* out, size_t out_capacity,
-                              size_t& bytes_written) {
-    bytes_written = 0;
-    if (nonce == 0 || out == nullptr ||
-        (plaintext_len > 0 && plaintext == nullptr) ||
-        plaintext_len > std::numeric_limits<uint16_t>::max()) {
+inline bool seal_key_envelope(const E2EPublicKey& recipient_public_key,
+                              const unsigned char* plaintext,
+                              size_t plaintext_len,
+                              unsigned char* encrypted_out,
+                              size_t encrypted_capacity,
+                              size_t& encrypted_len) {
+    encrypted_len = 0;
+    if (plaintext == nullptr || encrypted_out == nullptr || plaintext_len == 0 ||
+        plaintext_len > E2E_KEY_ENVELOPE_MAX_BYTES - crypto_box_SEALBYTES ||
+        encrypted_capacity < plaintext_len + crypto_box_SEALBYTES ||
+        !detail::ensure_sodium_initialized()) {
         return false;
     }
 
+    if (crypto_box_seal(encrypted_out, plaintext,
+                        static_cast<unsigned long long>(plaintext_len),
+                        recipient_public_key.data()) != 0) {
+        return false;
+    }
+    encrypted_len = plaintext_len + crypto_box_SEALBYTES;
+    return true;
+}
+
+inline bool open_key_envelope(const E2EPublicKey& recipient_public_key,
+                              const E2ESecretKey& recipient_secret_key,
+                              const unsigned char* encrypted,
+                              size_t encrypted_len,
+                              unsigned char* plaintext_out,
+                              size_t plaintext_capacity,
+                              size_t& plaintext_len) {
+    plaintext_len = 0;
+    if (encrypted == nullptr || plaintext_out == nullptr ||
+        encrypted_len <= crypto_box_SEALBYTES ||
+        encrypted_len > E2E_KEY_ENVELOPE_MAX_BYTES ||
+        plaintext_capacity < encrypted_len - crypto_box_SEALBYTES ||
+        !detail::ensure_sodium_initialized()) {
+        return false;
+    }
+
+    const size_t expected_plaintext_len = encrypted_len - crypto_box_SEALBYTES;
+    if (crypto_box_seal_open(plaintext_out, encrypted,
+                             static_cast<unsigned long long>(encrypted_len),
+                             recipient_public_key.data(),
+                             recipient_secret_key.data()) != 0) {
+        return false;
+    }
+    plaintext_len = expected_plaintext_len;
+    return true;
+}
+
+inline bool seal_audio_packet(const SessionKey& key,
+                              const SecureAudioMetadata& metadata,
+                              const unsigned char* plaintext, size_t plaintext_len,
+                              unsigned char* out, size_t out_capacity,
+                              size_t& bytes_written) {
+    static_assert(SECURE_PACKET_NONCE_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_NPUBBYTES);
+    static_assert(SECURE_PACKET_TAG_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_ABYTES);
+    static_assert(SessionKey{}.size() ==
+                  crypto_aead_chacha20poly1305_IETF_KEYBYTES);
+
+    bytes_written = 0;
+    if (metadata.sender_id == 0 || metadata.plaintext_bytes != plaintext_len ||
+        metadata.sample_rate != opus_network_clock::SAMPLE_RATE ||
+        metadata.channels != 1 || metadata.codec != AudioCodec::Opus ||
+        !opus_network_clock::is_supported_frame_count(metadata.sample_rate,
+                                                      metadata.frame_count) ||
+        out == nullptr ||
+        (plaintext_len > 0 && plaintext == nullptr) ||
+        plaintext_len >
+            std::numeric_limits<uint16_t>::max() - SECURE_PACKET_TAG_BYTES ||
+        !detail::ensure_sodium_initialized()) {
+        return false;
+    }
+
+    const size_t encrypted_bytes = plaintext_len + SECURE_PACKET_TAG_BYTES;
     const size_t required =
-        SECURE_PACKET_HEADER_BYTES + plaintext_len + SECURE_PACKET_TAG_BYTES;
+        SECURE_PACKET_HEADER_BYTES + encrypted_bytes;
     if (out_capacity < required) {
         return false;
     }
 
-    detail::write_header(out, nonce, static_cast<uint16_t>(plaintext_len));
-    unsigned char* ciphertext = out + SECURE_PACKET_HEADER_BYTES;
-    if (plaintext_len > 0) {
-        std::memcpy(ciphertext, plaintext, plaintext_len);
-        const auto enc_key = detail::derive_subkey(key, "jam-audio-enc-v1");
-        detail::xor_keystream(enc_key, nonce, ciphertext, plaintext_len);
-    }
+    SecureAudioHdr hdr{};
+    hdr.magic = SECURE_AUDIO_MAGIC;
+    hdr.sender_id = metadata.sender_id;
+    hdr.sequence = metadata.sequence;
+    hdr.sample_rate = metadata.sample_rate;
+    hdr.frame_count = metadata.frame_count;
+    hdr.plaintext_bytes = static_cast<uint16_t>(plaintext_len);
+    hdr.encrypted_bytes = static_cast<uint16_t>(encrypted_bytes);
+    hdr.channels = metadata.channels;
+    hdr.codec = metadata.codec;
+    hdr.capture_server_time_ns = metadata.capture_server_time_ns;
+    randombytes_buf(hdr.nonce.data(), hdr.nonce.size());
+    std::memcpy(out, &hdr, sizeof(hdr));
 
-    const auto auth_key = detail::derive_subkey(key, "jam-audio-auth-v1");
-    const auto tag = detail::auth_tag(auth_key, out,
-                                      SECURE_PACKET_HEADER_BYTES + plaintext_len);
-    std::memcpy(out + SECURE_PACKET_HEADER_BYTES + plaintext_len, tag.data(),
-                SECURE_PACKET_TAG_BYTES);
+    unsigned long long actual_encrypted_bytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(
+            out + SECURE_PACKET_HEADER_BYTES, &actual_encrypted_bytes, plaintext,
+            static_cast<unsigned long long>(plaintext_len), out,
+            SECURE_PACKET_HEADER_BYTES, nullptr,
+            reinterpret_cast<const unsigned char*>(hdr.nonce.data()), key.data()) != 0 ||
+        actual_encrypted_bytes != encrypted_bytes) {
+        return false;
+    }
     bytes_written = required;
     return true;
 }
 
 inline bool open_audio_packet(const SessionKey& key, const unsigned char* packet,
-                              size_t packet_len, uint64_t& nonce,
+                              size_t packet_len, SecureAudioMetadata& metadata,
                               unsigned char* plaintext_out,
                               size_t plaintext_capacity, size_t& plaintext_len) {
-    nonce = 0;
+    metadata = {};
     plaintext_len = 0;
     if (packet == nullptr || plaintext_out == nullptr ||
-        packet_len < SECURE_PACKET_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
+        packet_len < SECURE_PACKET_HEADER_BYTES + SECURE_PACKET_TAG_BYTES ||
+        !detail::ensure_sodium_initialized()) {
         return false;
     }
 
-    uint32_t magic = 0;
-    uint16_t ciphertext_bytes = 0;
-    uint16_t reserved = 0;
-    size_t offset = 0;
-    std::memcpy(&magic, packet + offset, sizeof(magic));
-    offset += sizeof(magic);
-    std::memcpy(&nonce, packet + offset, sizeof(nonce));
-    offset += sizeof(nonce);
-    std::memcpy(&ciphertext_bytes, packet + offset, sizeof(ciphertext_bytes));
-    offset += sizeof(ciphertext_bytes);
-    std::memcpy(&reserved, packet + offset, sizeof(reserved));
-
-    if (magic != SECURE_AUDIO_MAGIC || nonce == 0 || reserved != 0 ||
-        plaintext_capacity < ciphertext_bytes) {
+    uint16_t encrypted_bytes = 0;
+    if (!parse_secure_audio_header(packet, packet_len, metadata, encrypted_bytes) ||
+        plaintext_capacity < metadata.plaintext_bytes) {
         return false;
     }
 
-    const size_t expected =
-        SECURE_PACKET_HEADER_BYTES + ciphertext_bytes + SECURE_PACKET_TAG_BYTES;
-    if (packet_len != expected) {
+    SecureAudioHdr hdr{};
+    std::memcpy(&hdr, packet, sizeof(hdr));
+    unsigned long long actual_plaintext_bytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(
+            plaintext_out, &actual_plaintext_bytes, nullptr,
+            packet + SECURE_PACKET_HEADER_BYTES, encrypted_bytes, packet,
+            SECURE_PACKET_HEADER_BYTES,
+            reinterpret_cast<const unsigned char*>(hdr.nonce.data()), key.data()) != 0) {
         return false;
     }
-
-    const auto auth_key = detail::derive_subkey(key, "jam-audio-auth-v1");
-    const auto tag = detail::auth_tag(auth_key, packet,
-                                      SECURE_PACKET_HEADER_BYTES + ciphertext_bytes);
-    const unsigned char* packet_tag =
-        packet + SECURE_PACKET_HEADER_BYTES + ciphertext_bytes;
-    if (!detail::constant_time_equal(tag.data(), packet_tag,
-                                     SECURE_PACKET_TAG_BYTES)) {
+    if (actual_plaintext_bytes != metadata.plaintext_bytes) {
         return false;
     }
-
-    if (ciphertext_bytes > 0) {
-        std::memcpy(plaintext_out, packet + SECURE_PACKET_HEADER_BYTES,
-                    ciphertext_bytes);
-        const auto enc_key = detail::derive_subkey(key, "jam-audio-enc-v1");
-        detail::xor_keystream(enc_key, nonce, plaintext_out, ciphertext_bytes);
-    }
-    plaintext_len = ciphertext_bytes;
+    plaintext_len = static_cast<size_t>(actual_plaintext_bytes);
     return true;
 }
 
-class ReplayWindow {
-public:
-    bool accept(uint64_t nonce) {
-        if (nonce == 0) {
-            return false;
-        }
-        if (!initialized_) {
-            initialized_ = true;
-            highest_nonce_ = nonce;
-            seen_bitmap_ = 1;
-            return true;
-        }
-        if (nonce > highest_nonce_) {
-            const uint64_t shift = nonce - highest_nonce_;
-            if (shift >= 64) {
-                seen_bitmap_ = 0;
-            } else {
-                seen_bitmap_ <<= shift;
-            }
-            seen_bitmap_ |= 1;
-            highest_nonce_ = nonce;
-            return true;
-        }
+inline bool seal_control_packet(const SessionKey& key,
+                                const SecureControlMetadata& metadata,
+                                const unsigned char* plaintext, size_t plaintext_len,
+                                unsigned char* out, size_t out_capacity,
+                                size_t& bytes_written) {
+    static_assert(SECURE_PACKET_NONCE_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_NPUBBYTES);
+    static_assert(SECURE_PACKET_TAG_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_ABYTES);
+    static_assert(SessionKey{}.size() ==
+                  crypto_aead_chacha20poly1305_IETF_KEYBYTES);
 
-        const uint64_t delta = highest_nonce_ - nonce;
-        if (delta >= 64) {
-            return false;
-        }
-        const uint64_t mask = 1ULL << delta;
-        if ((seen_bitmap_ & mask) != 0) {
-            return false;
-        }
-        seen_bitmap_ |= mask;
-        return true;
+    bytes_written = 0;
+    if (metadata.sender_id == 0 || metadata.plaintext_bytes != plaintext_len ||
+        out == nullptr || (plaintext_len > 0 && plaintext == nullptr) ||
+        plaintext_len >
+            std::numeric_limits<uint16_t>::max() - SECURE_PACKET_TAG_BYTES ||
+        !detail::ensure_sodium_initialized()) {
+        return false;
     }
 
-    void reset() {
-        initialized_ = false;
-        highest_nonce_ = 0;
-        seen_bitmap_ = 0;
+    const size_t encrypted_bytes = plaintext_len + SECURE_PACKET_TAG_BYTES;
+    const size_t required = SECURE_CONTROL_HEADER_BYTES + encrypted_bytes;
+    if (out_capacity < required) {
+        return false;
     }
 
-private:
-    bool initialized_ = false;
-    uint64_t highest_nonce_ = 0;
-    uint64_t seen_bitmap_ = 0;
-};
+    SecureControlHdr hdr{};
+    hdr.magic = SECURE_CONTROL_MAGIC;
+    hdr.sender_id = metadata.sender_id;
+    hdr.sequence = metadata.sequence;
+    hdr.plaintext_bytes = static_cast<uint16_t>(plaintext_len);
+    hdr.encrypted_bytes = static_cast<uint16_t>(encrypted_bytes);
+    randombytes_buf(hdr.nonce.data(), hdr.nonce.size());
+    std::memcpy(out, &hdr, sizeof(hdr));
+
+    unsigned long long actual_encrypted_bytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(
+            out + SECURE_CONTROL_HEADER_BYTES, &actual_encrypted_bytes, plaintext,
+            static_cast<unsigned long long>(plaintext_len), out,
+            SECURE_CONTROL_HEADER_BYTES, nullptr,
+            reinterpret_cast<const unsigned char*>(hdr.nonce.data()), key.data()) != 0 ||
+        actual_encrypted_bytes != encrypted_bytes) {
+        return false;
+    }
+    bytes_written = required;
+    return true;
+}
+
+inline bool open_control_packet(const SessionKey& key, const unsigned char* packet,
+                                size_t packet_len, SecureControlMetadata& metadata,
+                                unsigned char* plaintext_out,
+                                size_t plaintext_capacity, size_t& plaintext_len) {
+    metadata = {};
+    plaintext_len = 0;
+    if (packet == nullptr || plaintext_out == nullptr ||
+        packet_len < SECURE_CONTROL_HEADER_BYTES + SECURE_PACKET_TAG_BYTES ||
+        !detail::ensure_sodium_initialized()) {
+        return false;
+    }
+
+    uint16_t encrypted_bytes = 0;
+    if (!parse_secure_control_header(packet, packet_len, metadata, encrypted_bytes) ||
+        plaintext_capacity < metadata.plaintext_bytes) {
+        return false;
+    }
+
+    SecureControlHdr hdr{};
+    std::memcpy(&hdr, packet, sizeof(hdr));
+    unsigned long long actual_plaintext_bytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(
+            plaintext_out, &actual_plaintext_bytes, nullptr,
+            packet + SECURE_CONTROL_HEADER_BYTES, encrypted_bytes, packet,
+            SECURE_CONTROL_HEADER_BYTES,
+            reinterpret_cast<const unsigned char*>(hdr.nonce.data()), key.data()) != 0) {
+        return false;
+    }
+    if (actual_plaintext_bytes != metadata.plaintext_bytes) {
+        return false;
+    }
+    plaintext_len = static_cast<size_t>(actual_plaintext_bytes);
+    return true;
+}
 
 }  // namespace session_crypto

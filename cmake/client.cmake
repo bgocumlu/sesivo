@@ -68,6 +68,7 @@ add_executable(client
     ${JAM_CLIENT_DIR}/client_network_path.cpp
     ${JAM_CLIENT_DIR}/client_runtime.cpp
     ${JAM_CLIENT_DIR}/client_startup.cpp
+    ${JAM_CLIENT_DIR}/secure_invite.cpp
     ${JAM_CLIENT_DIR}/juce_app.cpp
     ${JAM_CLIENT_DIR}/audio_stream.cpp
     ${JAM_CLIENT_DIR}/juce_audio_backend.cpp

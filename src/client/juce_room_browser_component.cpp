@@ -4,6 +4,7 @@
 #include "packet_builder.h"
 #include "performer_join_token.h"
 #include "protocol.h"
+#include "secure_invite.h"
 
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
@@ -19,6 +20,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -141,7 +143,8 @@ enum class Icon {
     speaker,
     wave,
     wifi,
-    lock
+    lock,
+    link
 };
 
 juce::String hex_byte(int value) {
@@ -186,6 +189,8 @@ const char* icon_svg_body(Icon icon) {
             return R"(<path d="M5 13a10 10 0 0 1 14 0"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M12 20h.01"/>)";
         case Icon::lock:
             return R"(<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>)";
+        case Icon::link:
+            return R"(<path d="M10 13a5 5 0 0 0 7.07 0l2.12-2.12a5 5 0 0 0-7.07-7.07L11 4.93"/><path d="M14 11a5 5 0 0 0-7.07 0L4.81 13.12a5 5 0 0 0 7.07 7.07L13 19.07"/>)";
     }
     return "";
 }
@@ -385,6 +390,31 @@ juce::String status_text_for_code(uint8_t status, const std::string& reason) {
     }
 }
 
+bool room_access_requires_password(uint8_t access_mode) {
+    return access_mode == ROOM_ACCESS_PASSWORD;
+}
+
+juce::String room_access_label(uint8_t access_mode) {
+    switch (access_mode) {
+        case ROOM_ACCESS_PASSWORD:
+            return "Password";
+        case ROOM_ACCESS_APPROVE:
+            return "Approve";
+        default:
+            return "Open";
+    }
+}
+
+juce::Colour room_access_colour(uint8_t access_mode) {
+    switch (access_mode) {
+        case ROOM_ACCESS_PASSWORD:
+        case ROOM_ACCESS_APPROVE:
+            return ui::amber;
+        default:
+            return ui::green;
+    }
+}
+
 juce::String format_ping(double ms) {
     if (ms <= 0.0) {
         return "...";
@@ -524,6 +554,173 @@ void style_dialog_editors(juce::AlertWindow& alert,
         }
     }
 }
+
+uint8_t access_mode_from_create_combo(int selected_id) {
+    switch (selected_id) {
+        case 2:
+            return ROOM_ACCESS_PASSWORD;
+        case 3:
+            return ROOM_ACCESS_APPROVE;
+        default:
+            return ROOM_ACCESS_OPEN;
+    }
+}
+
+struct CreateRoomInput {
+    std::string room_name;
+    std::string display_name;
+    std::string password;
+    uint8_t access_mode = ROOM_ACCESS_OPEN;
+};
+
+class CreateRoomDialog final : public juce::Component {
+public:
+    CreateRoomDialog(juce::String display_name,
+                     std::function<void(CreateRoomInput)> on_create)
+        : on_create_(std::move(on_create)) {
+        setSize(420, 320);
+
+        room_label_.setText("Room", juce::dontSendNotification);
+        name_label_.setText("Name", juce::dontSendNotification);
+        access_label_.setText("Access", juce::dontSendNotification);
+        password_label_.setText("Password", juce::dontSendNotification);
+        status_label_.setText({}, juce::dontSendNotification);
+        for (auto* label: {&room_label_, &name_label_, &access_label_,
+                           &password_label_}) {
+            juce_theme::style_label(*label, juce_theme::colour::text(), 12.5F);
+        }
+        juce_theme::style_label(status_label_, juce_theme::colour::warning(), 12.0F);
+
+        room_editor_.setText("Untitled Room", juce::dontSendNotification);
+        name_editor_.setText(display_name, juce::dontSendNotification);
+        password_editor_.setTextToShowWhenEmpty("Room password",
+                                                juce_theme::colour::text_faint());
+        for (auto* editor: {&room_editor_, &name_editor_, &password_editor_}) {
+            style_dialog_editor(*editor);
+        }
+
+        access_combo_.addItem("Open", 1);
+        access_combo_.addItem("Password", 2);
+        access_combo_.addItem("Approve", 3);
+        access_combo_.setSelectedId(1, juce::dontSendNotification);
+        access_combo_.onChange = [this]() { update_password_visibility(); };
+
+        create_button_.setButtonText("Create");
+        cancel_button_.setButtonText("Cancel");
+        create_button_.onClick = [this]() { submit(); };
+        cancel_button_.onClick = [this]() { close(); };
+
+        addAndMakeVisible(room_label_);
+        addAndMakeVisible(room_editor_);
+        addAndMakeVisible(name_label_);
+        addAndMakeVisible(name_editor_);
+        addAndMakeVisible(access_label_);
+        addAndMakeVisible(access_combo_);
+        addAndMakeVisible(password_label_);
+        addAndMakeVisible(password_editor_);
+        addAndMakeVisible(status_label_);
+        addAndMakeVisible(create_button_);
+        addAndMakeVisible(cancel_button_);
+        update_password_visibility();
+    }
+
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce_theme::colour::panel_bottom());
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(34, 20);
+        auto buttons = area.removeFromBottom(40);
+        area.removeFromBottom(10);
+
+        layout_text_row(area, room_label_, room_editor_);
+        area.removeFromTop(8);
+        layout_text_row(area, name_label_, name_editor_);
+        area.removeFromTop(8);
+        layout_combo_row(area, access_label_, access_combo_);
+        if (password_label_.isVisible()) {
+            area.removeFromTop(8);
+            layout_text_row(area, password_label_, password_editor_);
+        }
+        status_label_.setBounds(area.removeFromTop(22));
+
+        const int button_width = 86;
+        const int gap = 16;
+        const int total = button_width * 2 + gap;
+        buttons = buttons.withSizeKeepingCentre(total, 34);
+        create_button_.setBounds(buttons.removeFromLeft(button_width).reduced(2));
+        buttons.removeFromLeft(gap);
+        cancel_button_.setBounds(buttons.removeFromLeft(button_width).reduced(2));
+    }
+
+private:
+    static void layout_text_row(juce::Rectangle<int>& area, juce::Label& label,
+                                juce::TextEditor& editor) {
+        label.setBounds(area.removeFromTop(18));
+        editor.setBounds(area.removeFromTop(28));
+    }
+
+    static void layout_combo_row(juce::Rectangle<int>& area, juce::Label& label,
+                                 juce::ComboBox& combo) {
+        label.setBounds(area.removeFromTop(18));
+        combo.setBounds(area.removeFromTop(30));
+    }
+
+    void update_password_visibility() {
+        const bool password_mode =
+            access_mode_from_create_combo(access_combo_.getSelectedId()) ==
+            ROOM_ACCESS_PASSWORD;
+        password_label_.setVisible(password_mode);
+        password_editor_.setVisible(password_mode);
+        password_editor_.setEnabled(password_mode);
+        if (!password_mode) {
+            password_editor_.clear();
+        }
+        resized();
+    }
+
+    void submit() {
+        CreateRoomInput input;
+        input.room_name = trim_copy(room_editor_.getText().toStdString());
+        input.display_name = trim_copy(name_editor_.getText().toStdString());
+        input.password = password_editor_.getText().toStdString();
+        input.access_mode = access_mode_from_create_combo(access_combo_.getSelectedId());
+
+        if (input.room_name.empty() || input.display_name.empty()) {
+            status_label_.setText("Room and name are required",
+                                  juce::dontSendNotification);
+            return;
+        }
+        if (input.access_mode == ROOM_ACCESS_PASSWORD && input.password.empty()) {
+            status_label_.setText("Password is required for password rooms",
+                                  juce::dontSendNotification);
+            return;
+        }
+        if (on_create_) {
+            on_create_(std::move(input));
+        }
+        close();
+    }
+
+    void close() {
+        if (auto* dialog = findParentComponentOfClass<juce::DialogWindow>()) {
+            dialog->exitModalState(0);
+        }
+    }
+
+    std::function<void(CreateRoomInput)> on_create_;
+    juce::Label room_label_;
+    juce::TextEditor room_editor_;
+    juce::Label name_label_;
+    juce::TextEditor name_editor_;
+    juce::Label access_label_;
+    juce::ComboBox access_combo_;
+    juce::Label password_label_;
+    juce::TextEditor password_editor_;
+    juce::Label status_label_;
+    juce::TextButton create_button_;
+    juce::TextButton cancel_button_;
+};
 
 template <typename Request, typename Response>
 Response send_control_request(const std::string& address, uint16_t port,
@@ -1189,6 +1386,10 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
     ui::draw_label(g, create_button_bounds_, "Create", 14.5f, ui::text, true,
                    juce::Justification::centred);
     top.removeFromRight(10);
+    join_invite_button_bounds_ = top.removeFromRight(134).reduced(0, 2);
+    ui::draw_toolbar_button(g, join_invite_button_bounds_, "Join Invite",
+                            ui::Icon::link);
+    top.removeFromRight(10);
     auto search_container = top.removeFromRight(285).reduced(0, 2);
     ui::fill_button(g, search_container);
     ui::draw_icon(g, search_container.withWidth(38).reduced(9), ui::Icon::search);
@@ -1263,15 +1464,15 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
             ui::draw_label(g, title,
                            room.room_name.empty() ? room.room_id : room.room_name,
                            17.0f, ui::text, true);
-            if (room.locked) {
+            if (room.access_mode == ROOM_ACCESS_PASSWORD) {
                 ui::draw_icon(g, title.withTrimmedLeft(150).withWidth(22).reduced(3),
                               ui::Icon::lock, ui::text_faint);
             }
             auto tags = name.withHeight(22);
             ui::draw_pill(g, tags.removeFromLeft(70), "Live");
             tags.removeFromLeft(6);
-            ui::draw_pill(g, tags.removeFromLeft(room.locked ? 76 : 70),
-                          room.locked ? "Locked" : "Open");
+            ui::draw_pill(g, tags.removeFromLeft(86),
+                          room_access_label(room.access_mode));
 
             auto players = row.removeFromLeft(row_columns.players);
             ui::draw_icon(g, players.removeFromLeft(26).reduced(3), ui::Icon::users,
@@ -1279,8 +1480,8 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
             ui::draw_label(g, players, juce::String(room.participant_count), 14.5f,
                            ui::text);
             ui::draw_label(g, row.removeFromLeft(row_columns.access),
-                           room.locked ? "Password" : "Open", 14.0f,
-                           room.locked ? ui::amber : ui::green);
+                           room_access_label(room.access_mode), 14.0f,
+                           room_access_colour(room.access_mode));
 
             auto join = row.withWidth(row_columns.join);
             const auto menu_width = 44;
@@ -1362,6 +1563,8 @@ void JuceRoomBrowserComponent::resized() {
     top.removeFromLeft(130);
     top.removeFromRight(110);
     top.removeFromRight(10);
+    top.removeFromRight(134);
+    top.removeFromRight(10);
     auto search_container = top.removeFromRight(285).reduced(0, 2);
     search_editor_.setBounds(
         search_container.withTrimmedLeft(40).withTrimmedRight(10).reduced(0, 1));
@@ -1420,6 +1623,10 @@ void JuceRoomBrowserComponent::mouseDown(const juce::MouseEvent& event) {
         start_create_flow();
         return;
     }
+    if (join_invite_button_bounds_.contains(position)) {
+        start_join_invite_flow();
+        return;
+    }
 
     const int server_index = server_row_at(position);
     if (server_index >= 0) {
@@ -1467,9 +1674,22 @@ void JuceRoomBrowserComponent::mouseWheelMove(
     }
 }
 
+void JuceRoomBrowserComponent::open_invite(std::string invite_text) {
+    start_join_invite_flow(std::move(invite_text));
+}
+
 void JuceRoomBrowserComponent::timerCallback() {
     poll_job_result();
     poll_audio_device_refresh();
+    if (waiting_for_room_key_ && client_.consume_room_removed_by_server()) {
+        cancel_waiting_join();
+        status_text_ = "Request declined";
+        repaint();
+        return;
+    }
+    if (waiting_for_room_key_ && client_.has_media_key()) {
+        finish_waiting_join();
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now >= next_auto_refresh_) {
         bool running = false;
@@ -1531,9 +1751,12 @@ void JuceRoomBrowserComponent::start_status_refresh(bool manual) {
                     BrowserRoom room;
                     room.room_id = fixed_string(response.rooms[i].room_id);
                     room.room_name = fixed_string(response.rooms[i].room_name);
+                    room.room_instance_id =
+                        fixed_string(response.rooms[i].room_instance_id);
+                    room.access_epoch = response.rooms[i].access_epoch;
                     room.participant_count = response.rooms[i].participant_count;
-                    room.locked =
-                        (response.rooms[i].flags & ROOM_FLAG_LOCKED) != 0;
+                    room.access_mode = response.rooms[i].access_mode;
+                    room.locked = room.access_mode == ROOM_ACCESS_PASSWORD;
                     result.status.rooms.push_back(std::move(room));
                 }
 
@@ -1567,11 +1790,13 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
         return;
     }
     const auto room = status.rooms[static_cast<size_t>(room_index)];
+    const auto server = selected_server();
+
     active_dialog_ = std::make_unique<juce::AlertWindow>(
         "Join Room", "", juce::AlertWindow::NoIcon, this);
     auto& alert = *active_dialog_;
     alert.addTextEditor("displayName", last_display_name_, "Name");
-    if (room.locked) {
+    if (room_access_requires_password(room.access_mode)) {
         alert.addTextEditor("password", "", "Password", true);
         style_dialog_editors(alert, {"displayName", "password"});
     } else {
@@ -1582,7 +1807,7 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
     alert.enterModalState(
         true, juce::ModalCallbackFunction::create(
                   [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this),
-                   room](int result) {
+                   room, server](int result) {
                       auto* self = safe_this.getComponent();
                       if (self == nullptr || self->active_dialog_ == nullptr) {
                           return;
@@ -1603,12 +1828,11 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                       }
                       self->last_display_name_ = display_name;
                       const auto password =
-                          room.locked
+                          room_access_requires_password(room.access_mode)
                               ? dialog.getTextEditorContents("password").toStdString()
                               : "";
                       const auto profile_id =
                           self->profile_id_for_display_name(display_name);
-                      const auto server = self->selected_server();
                       const int server_index = self->selected_server_index_;
                       const uint32_t request_id = self->next_request_id();
 
@@ -1618,7 +1842,8 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                                                               : room.room_name) +
                           "...";
                       self->start_job([self, server, server_index, room, profile_id,
-                                       display_name, password, request_id]() {
+                                       display_name, password,
+                                       request_id]() {
                           BrowserJobResult result_value;
                           result_value.kind = JobKind::Join;
                           result_value.server_index = server_index;
@@ -1647,6 +1872,12 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                               result_value.ticket.room_id = fixed_string(response.room_id);
                               result_value.ticket.room_name =
                                   fixed_string(response.room_name);
+                              result_value.ticket.room_instance_id =
+                                  fixed_string(response.room_instance_id);
+                              result_value.ticket.access_epoch =
+                                  response.access_epoch;
+                              result_value.ticket.access_mode =
+                                  response.access_mode;
                               result_value.ticket.join_token =
                                   fixed_string(response.join_token);
                               result_value.ticket.ok =
@@ -1659,14 +1890,27 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                                           .toStdString();
                                   return result_value;
                               }
+                              if (result_value.ticket.room_instance_id !=
+                                      room.room_instance_id ||
+                                  result_value.ticket.access_epoch !=
+                                      room.access_epoch) {
+                                  result_value.message =
+                                      "Room changed; refresh and use a new invite";
+                                  return result_value;
+                              }
 
                               self->client_.join_room(
                                   server.address, server.port,
                                   result_value.ticket.room_id, profile_id,
-                                  display_name, result_value.ticket.join_token);
-                              result_value.joined = true;
+                                  display_name, result_value.ticket.join_token,
+                                  {}, room.access_mode);
+                              result_value.joined =
+                                  room.access_mode != ROOM_ACCESS_APPROVE;
+                              result_value.waiting_for_room_key =
+                                  room.access_mode == ROOM_ACCESS_APPROVE;
                               result_value.joined_room_id =
                                   result_value.ticket.room_id;
+                              result_value.access_mode = room.access_mode;
                           } catch (const std::exception& e) {
                               result_value.message = e.what();
                           }
@@ -1676,15 +1920,23 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
         false);
 }
 
-void JuceRoomBrowserComponent::start_create_flow() {
+void JuceRoomBrowserComponent::start_join_invite_flow(std::string initial_invite) {
+    juce::String initial_invite_text(initial_invite);
+    if (initial_invite.empty()) {
+        std::string invite_reason;
+        const auto clipboard_text = juce::SystemClipboard::getTextFromClipboard();
+        if (parse_secure_invite_text(clipboard_text.toStdString(), invite_reason)
+                .has_value()) {
+            initial_invite_text = clipboard_text;
+        }
+    }
+
     active_dialog_ = std::make_unique<juce::AlertWindow>(
-        "Create Room", "", juce::AlertWindow::NoIcon, this);
+        "Join Invite", "", juce::AlertWindow::NoIcon, this);
     auto& alert = *active_dialog_;
-    alert.addTextEditor("roomName", "Untitled Room", "Room");
-    alert.addTextEditor("displayName", last_display_name_, "Name");
-    alert.addTextEditor("password", "", "Password");
-    style_dialog_editors(alert, {"roomName", "displayName", "password"});
-    alert.addButton("Create", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    alert.addTextEditor("invite", initial_invite_text, "Invite");
+    style_dialog_editors(alert, {"invite"});
+    alert.addButton("Open", 1, juce::KeyPress(juce::KeyPress::returnKey));
     alert.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
     alert.enterModalState(
         true,
@@ -1702,26 +1954,67 @@ void JuceRoomBrowserComponent::start_create_flow() {
                     return;
                 }
 
-                const auto room_name = read_required_text(dialog, "roomName");
-                const auto display_name = read_required_text(dialog, "displayName");
-                if (room_name.empty() || display_name.empty()) {
-                    self->status_text_ = "Room and name are required";
+                std::string reason;
+                const auto invite = parse_secure_invite_text(
+                    dialog.getTextEditorContents("invite").toStdString(), reason);
+                if (!invite.has_value()) {
+                    self->status_text_ = reason;
                     self->repaint();
                     return;
                 }
-                self->last_display_name_ = display_name;
-                const auto password =
-                    dialog.getTextEditorContents("password").toStdString();
-                const auto room_id = normalized_id(room_name, "room");
+
+                auto server_it = std::find_if(
+                    self->servers_.begin(), self->servers_.end(),
+                    [&](const BrowserServer& server) {
+                        return server.address == invite->server_address &&
+                               server.port == invite->server_port;
+                    });
+                if (server_it == self->servers_.end()) {
+                    BrowserServer server;
+                    server.name = "Invite";
+                    server.address = invite->server_address;
+                    server.port = invite->server_port;
+                    self->servers_.insert(self->servers_.begin(), std::move(server));
+                    self->selected_server_index_ = 0;
+                    self->save_servers();
+                } else {
+                    self->selected_server_index_ =
+                        static_cast<int>(std::distance(self->servers_.begin(), server_it));
+                }
+                self->pending_invite_join_ = PendingInviteJoin{
+                    invite->server_address, invite->server_port, invite->room_id};
+                self->selected_room_index_ = -1;
+                self->status_text_ = "Opening invite...";
+                self->start_status_refresh(true);
+            }),
+        false);
+}
+
+void JuceRoomBrowserComponent::start_create_flow() {
+    auto* content = new CreateRoomDialog(
+        last_display_name_,
+        [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this)](
+            CreateRoomInput input) {
+                auto* self = safe_this.getComponent();
+                if (self == nullptr) {
+                    return;
+                }
+                self->last_display_name_ = input.display_name;
+                const auto media_secret = make_media_secret();
+                const auto room_id = normalized_id(input.room_name, "room");
                 const auto profile_id =
-                    self->profile_id_for_display_name(display_name);
+                    self->profile_id_for_display_name(input.display_name);
                 const auto server = self->selected_server();
                 const int server_index = self->selected_server_index_;
                 const uint32_t request_id = self->next_request_id();
 
-                self->status_text_ = "Creating " + juce::String(room_name) + "...";
-                self->start_job([self, server, server_index, room_id, room_name,
-                                 profile_id, display_name, password, request_id]() {
+                self->status_text_ =
+                    "Creating " + juce::String(input.room_name) + "...";
+                self->start_job([self, server, server_index, room_id,
+                                 room_name = input.room_name, profile_id,
+                                 display_name = input.display_name,
+                                 password = input.password, media_secret,
+                                 access_mode = input.access_mode, request_id]() {
                     BrowserJobResult result_value;
                     result_value.kind = JobKind::Create;
                     result_value.server_index = server_index;
@@ -1736,7 +2029,11 @@ void JuceRoomBrowserComponent::start_create_flow() {
                     write_fixed(request.room_name, room_name);
                     write_fixed(request.profile_id, profile_id);
                     write_fixed(request.display_name, display_name);
-                    write_fixed(request.password_hash, self->password_hash(password));
+                    if (access_mode == ROOM_ACCESS_PASSWORD) {
+                        write_fixed(request.password_hash,
+                                    self->password_hash(password));
+                    }
+                    request.access_mode = access_mode;
 
                     try {
                         double rtt = 0.0;
@@ -1749,6 +2046,10 @@ void JuceRoomBrowserComponent::start_create_flow() {
                         result_value.ticket.reason = fixed_string(response.reason);
                         result_value.ticket.room_id = fixed_string(response.room_id);
                         result_value.ticket.room_name = fixed_string(response.room_name);
+                        result_value.ticket.room_instance_id =
+                            fixed_string(response.room_instance_id);
+                        result_value.ticket.access_epoch = response.access_epoch;
+                        result_value.ticket.access_mode = response.access_mode;
                         result_value.ticket.join_token =
                             fixed_string(response.join_token);
                         result_value.ticket.admin_token =
@@ -1767,16 +2068,29 @@ void JuceRoomBrowserComponent::start_create_flow() {
                         self->client_.join_room(server.address, server.port,
                                                 result_value.ticket.room_id,
                                                 profile_id, display_name,
-                                                result_value.ticket.join_token);
+                                                result_value.ticket.join_token,
+                                                media_secret,
+                                                response.access_mode);
                         result_value.joined = true;
                         result_value.joined_room_id = result_value.ticket.room_id;
+                        result_value.media_secret = media_secret;
+                        result_value.access_mode = response.access_mode;
                     } catch (const std::exception& e) {
                         result_value.message = e.what();
                     }
                     return result_value;
                 });
-            }),
-        false);
+            });
+
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "Create Room";
+    options.content.setOwned(content);
+    options.componentToCentreAround = this;
+    options.dialogBackgroundColour = juce_theme::colour::panel_bottom();
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = false;
+    options.resizable = false;
+    options.launchAsync();
 }
 
 void JuceRoomBrowserComponent::start_edit_servers_flow() {
@@ -1996,16 +2310,53 @@ void JuceRoomBrowserComponent::apply_status(BrowserJobResult result) {
         status_text_ = result.message.empty() ? "Server offline" : result.message;
     }
     clamp_scroll_offsets();
+    if (result.status.ok && pending_invite_join_.has_value() &&
+        pending_invite_join_->server_address == result.server_address &&
+        pending_invite_join_->server_port == result.server_port) {
+        const auto room_id = pending_invite_join_->room_id;
+        const auto it = std::find_if(
+            selected_status().rooms.begin(), selected_status().rooms.end(),
+            [&](const BrowserRoom& room) { return room.room_id == room_id; });
+        if (it != selected_status().rooms.end()) {
+            const int room_index =
+                static_cast<int>(std::distance(selected_status().rooms.begin(), it));
+            pending_invite_join_.reset();
+            selected_room_index_ = room_index;
+            juce::MessageManager::callAsync(
+                [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this),
+                 room_index]() {
+                    if (auto* self = safe_this.getComponent()) {
+                        self->start_join_flow(room_index);
+                    }
+                });
+        } else {
+            status_text_ = "Invite room is not listed on this server";
+            pending_invite_join_.reset();
+        }
+    }
     repaint();
 }
 
 void JuceRoomBrowserComponent::apply_ticket_result(const BrowserJobResult& result) {
+    auto make_launch = [&]() {
+        return JoinLaunch{result.server_address, result.server_port,
+                          result.joined_room_id, result.ticket.admin_token,
+                          result.ticket.room_instance_id,
+                          result.ticket.access_epoch,
+                          result.media_secret,
+                          result.access_mode == ROOM_ACCESS_OPEN
+                              ? result.ticket.access_mode
+                              : result.access_mode};
+    };
+    if (result.waiting_for_room_key) {
+        show_waiting_for_room_key(make_launch());
+        return;
+    }
     if (result.joined) {
         status_text_ = "Joined";
         if (joined_callback_) {
             auto callback = joined_callback_;
-            JoinLaunch launch{result.server_address, result.server_port,
-                              result.joined_room_id, result.ticket.admin_token};
+            JoinLaunch launch = make_launch();
             juce::MessageManager::callAsync(
                 [callback = std::move(callback), launch = std::move(launch)]() mutable {
                     callback(std::move(launch));
@@ -2014,6 +2365,66 @@ void JuceRoomBrowserComponent::apply_ticket_result(const BrowserJobResult& resul
         return;
     }
     status_text_ = result.message.empty() ? "Join failed" : result.message;
+    repaint();
+}
+
+void JuceRoomBrowserComponent::show_waiting_for_room_key(JoinLaunch launch) {
+    pending_join_launch_ = std::move(launch);
+    waiting_for_room_key_ = true;
+    status_text_ = "Waiting for host approval...";
+
+    active_dialog_ = std::make_unique<juce::AlertWindow>(
+        "Waiting for Host", "Waiting for the host to approve access.",
+        juce::AlertWindow::NoIcon, this);
+    auto& alert = *active_dialog_;
+    alert.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    alert.enterModalState(
+        true,
+        juce::ModalCallbackFunction::create(
+            [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this)](
+                int) {
+                if (auto* self = safe_this.getComponent()) {
+                    if (self->waiting_for_room_key_) {
+                        self->cancel_waiting_join();
+                    }
+                }
+            }),
+        false);
+}
+
+void JuceRoomBrowserComponent::finish_waiting_join() {
+    if (!waiting_for_room_key_ || !pending_join_launch_.has_value()) {
+        return;
+    }
+    auto launch = std::move(*pending_join_launch_);
+    launch.media_secret = client_.current_media_secret();
+    pending_join_launch_.reset();
+    waiting_for_room_key_ = false;
+    if (active_dialog_ != nullptr) {
+        active_dialog_->exitModalState(1);
+        active_dialog_->setVisible(false);
+        active_dialog_.reset();
+    }
+    status_text_ = "Joined";
+    if (joined_callback_) {
+        auto callback = joined_callback_;
+        juce::MessageManager::callAsync(
+            [callback = std::move(callback), launch = std::move(launch)]() mutable {
+                callback(std::move(launch));
+            });
+    }
+}
+
+void JuceRoomBrowserComponent::cancel_waiting_join() {
+    waiting_for_room_key_ = false;
+    pending_join_launch_.reset();
+    client_.stop_connection();
+    if (active_dialog_ != nullptr) {
+        active_dialog_->exitModalState(0);
+        active_dialog_->setVisible(false);
+        active_dialog_.reset();
+    }
+    status_text_ = "Join canceled";
     repaint();
 }
 

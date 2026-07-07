@@ -13,6 +13,7 @@
 #include <exception>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -64,6 +65,7 @@
 #include "packet_builder.h"
 #include "participant_info.h"
 #include "participant_manager.h"
+#include "performer_join_token.h"
 #include "periodic_timer.h"
 #include "protocol.h"
 #include "session_crypto.h"
@@ -92,6 +94,7 @@ public:
           join_retry_timer_(io_context, 1s, [this]() { join_retry_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
           cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
+        initialize_e2e_keypair();
         std::error_code socket_error;
         const auto protocol =
             udp_network::open_dual_stack_socket(socket_, 0, socket_error);
@@ -134,13 +137,18 @@ public:
 
     void join_room(const std::string& server_address, uint16_t server_port,
                    const std::string& room_id, const std::string& profile_id,
-                   const std::string& display_name, const std::string& join_token) {
+                   const std::string& display_name, const std::string& join_token,
+                   const std::string& media_secret = {},
+                   uint8_t access_mode = ROOM_ACCESS_OPEN) {
         PerformerJoinOptions options;
         options.room_id = room_id;
         options.room_handle = room_id;
         options.user_id = profile_id;
         options.display_name = display_name;
         options.join_token = join_token;
+        options.media_secret = media_secret;
+        options.access_mode = access_mode;
+        options.key_public = e2e_key_public_bytes_;
 
         auto started = std::make_shared<std::promise<void>>();
         auto future = started->get_future();
@@ -149,6 +157,7 @@ public:
             try {
                 join_session_.configure(std::move(options));
                 participant_manager_.clear();
+                clear_access_request_state();
                 start_connection_on_io_context(server_address, server_port);
                 started->set_value();
             } catch (...) {
@@ -214,45 +223,120 @@ public:
         const JoinHdr join = join_session_.make_join_header();
         auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(JoinHdr));
         std::memcpy(buf->data(), &join, sizeof(JoinHdr));
-        update_session_key_from_join_token();
+        update_media_key_from_secret();
         join_session_.mark_join_sent(std::chrono::steady_clock::now());
         send(buf->data(), buf->size(), buf);
-        spdlog::info("Sent JOIN for room '{}' user '{}' token {}", join_session_.room_id(),
+        spdlog::info("Sent JOIN for room '{}' user '{}' token {} room_key {}",
+                  join_session_.room_id(),
                   join_session_.user_id(),
-                  join_session_.has_join_token() ? "present" : "missing");
+                  join_session_.has_join_token() ? "present" : "missing",
+                  join_session_.has_media_secret() ? "present" : "missing");
     }
 
     void reset_session_security() {
-        session_key_.reset();
-        server_audio_replay_window_.reset();
-        secure_audio_send_nonce_.store(1, std::memory_order_release);
+        session_key_.store(nullptr, std::memory_order_release);
+        secure_control_highest_sequence_.clear();
+        secure_control_sequence_.store(1, std::memory_order_release);
     }
 
-    void update_session_key_from_join_token() {
+    void update_media_key_from_secret() {
+        if (!join_session_.has_media_secret()) {
+            reset_session_security();
+            return;
+        }
         if (!join_session_.has_join_token()) {
             reset_session_security();
+            spdlog::warn("Media key requires a signed join token");
             return;
         }
 
-        const auto derived =
-            session_crypto::derive_key_from_join_token_string(
-                join_session_.join_token());
-        if (!derived.has_value()) {
+        std::string reason;
+        const auto token =
+            performer_join_token::parse_unverified(join_session_.join_token(), reason);
+        if (!token.has_value() || token->claims.room_id != join_session_.room_id()) {
             reset_session_security();
-            spdlog::warn("Join token is not usable for secure audio key derivation");
+            spdlog::warn("Join token is not usable for E2E media key derivation: {}",
+                         reason.empty() ? "room claims unavailable" : reason);
             return;
         }
 
-        if (!session_key_.has_value() || *session_key_ != *derived) {
-            server_audio_replay_window_.reset();
-            secure_audio_send_nonce_.store(1, std::memory_order_release);
+        const auto derived = session_crypto::derive_media_key_from_secret(
+            token->claims.room_id, token->claims.room_instance_id,
+            join_session_.media_secret());
+
+        session_key_.store(
+            std::make_shared<const session_crypto::SessionKey>(derived),
+            std::memory_order_release);
+    }
+
+    bool rotate_media_key(const std::string& media_secret) {
+        auto completed = std::make_shared<std::promise<bool>>();
+        auto future = completed->get_future();
+        asio::post(io_context_, [this, media_secret, completed]() {
+            completed->set_value(rotate_media_key_on_io_context(media_secret));
+        });
+        return future.get();
+    }
+
+    bool has_media_key() const {
+        return current_session_key() != nullptr && join_session_.has_media_secret();
+    }
+
+    std::string current_media_secret() const {
+        return join_session_.media_secret();
+    }
+
+    void set_room_access_mode(uint8_t access_mode) {
+        asio::post(io_context_, [this, access_mode]() {
+            join_session_.set_access_mode(access_mode);
+            if (access_mode != ROOM_ACCESS_APPROVE) {
+                std::vector<uint32_t> pending_ids;
+                {
+                    std::lock_guard<std::mutex> lock(access_request_mutex_);
+                    pending_ids.reserve(pending_access_requests_.size());
+                    for (const auto& [participant_id, _]: pending_access_requests_) {
+                        pending_ids.push_back(participant_id);
+                    }
+                }
+                for (uint32_t participant_id: pending_ids) {
+                    if (send_media_key_envelope_to_participant_on_io(participant_id)) {
+                        remove_pending_access_request(participant_id);
+                    }
+                }
+            }
+        });
+    }
+
+    bool approve_waiting_participant(uint32_t participant_id) {
+        auto completed = std::make_shared<std::promise<bool>>();
+        auto future = completed->get_future();
+        asio::post(io_context_, [this, participant_id, completed]() {
+            const bool ok = send_media_key_envelope_to_participant_on_io(participant_id);
+            if (ok) {
+                remove_pending_access_request(participant_id);
+            }
+            completed->set_value(ok);
+        });
+        return future.get();
+    }
+
+    std::vector<ParticipantInfo> get_waiting_participant_info() const {
+        std::lock_guard<std::mutex> lock(access_request_mutex_);
+        std::vector<ParticipantInfo> result;
+        result.reserve(pending_access_requests_.size());
+        for (const auto& [_, info]: pending_access_requests_) {
+            result.push_back(info);
         }
-        session_key_ = *derived;
+        std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+            return left.display_name < right.display_name;
+        });
+        return result;
     }
 
     void clear_room_session_state() {
         join_session_.configure({});
         participant_manager_.clear();
+        clear_access_request_state();
         reset_session_security();
         reset_server_clock_and_ping_state();
         audio_path_interval_received_.store(0, std::memory_order_relaxed);
@@ -1332,9 +1416,15 @@ public:
             handle_ping_message(bytes, state->buffer.data());
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
             handle_ctrl_message(bytes, state->buffer.data());
+        } else if (hdr.magic == SECURE_CONTROL_MAGIC &&
+                   bytes >= SECURE_CONTROL_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
+            handle_secure_control_message(bytes, state->buffer.data());
         } else if (hdr.magic == SECURE_AUDIO_MAGIC &&
                    bytes >= SECURE_PACKET_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
             handle_secure_audio_message(bytes, state->buffer.data());
+        } else if (hdr.magic == E2E_KEY_ENVELOPE_MAGIC &&
+                   bytes >= sizeof(E2EKeyEnvelopeHdr)) {
+            handle_e2e_key_envelope(bytes, state->buffer.data());
         } else if (hdr.magic == AUDIO_REDUNDANT_MAGIC &&
                    bytes >= sizeof(AudioRedundantHdr)) {
             handle_audio_message(bytes, state->buffer.data());
@@ -1436,16 +1526,270 @@ public:
     }
 
 private:
-    bool should_secure_audio_packet(const unsigned char* data, std::size_t len) const {
-        if (!session_key_.has_value() ||
+    static Bytes<E2E_PUBLIC_KEY_BYTES> to_protocol_public_key(
+        const session_crypto::E2EPublicKey& key) {
+        Bytes<E2E_PUBLIC_KEY_BYTES> out{};
+        std::memcpy(out.data(), key.data(), out.size());
+        return out;
+    }
+
+    static session_crypto::E2EPublicKey to_crypto_public_key(
+        const Bytes<E2E_PUBLIC_KEY_BYTES>& key) {
+        session_crypto::E2EPublicKey out{};
+        std::memcpy(out.data(), key.data(), out.size());
+        return out;
+    }
+
+    void initialize_e2e_keypair() {
+        e2e_keypair_ready_ =
+            session_crypto::make_e2e_keypair(e2e_public_key_, e2e_secret_key_);
+        if (!e2e_keypair_ready_) {
+            spdlog::warn("Could not generate E2E keypair; room key handoff disabled");
+            e2e_key_public_bytes_ = {};
+            return;
+        }
+        e2e_key_public_bytes_ = to_protocol_public_key(e2e_public_key_);
+        join_session_.set_key_public(e2e_key_public_bytes_);
+    }
+
+    void clear_access_request_state() {
+        std::lock_guard<std::mutex> lock(access_request_mutex_);
+        participant_key_public_.clear();
+        pending_access_requests_.clear();
+    }
+
+    void remove_pending_access_request(uint32_t participant_id) {
+        std::lock_guard<std::mutex> lock(access_request_mutex_);
+        pending_access_requests_.erase(participant_id);
+    }
+
+    void remember_participant_key(uint32_t participant_id,
+                                  const std::string& profile_id,
+                                  const std::string& display_name,
+                                  Bytes<E2E_PUBLIC_KEY_BYTES> key_public,
+                                  bool has_key_public) {
+        if (participant_id == 0) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(access_request_mutex_);
+        if (has_key_public) {
+            participant_key_public_[participant_id] = key_public;
+        } else {
+            participant_key_public_.erase(participant_id);
+        }
+
+        if (participant_id == join_session_.participant_id()) {
+            pending_access_requests_.erase(participant_id);
+            return;
+        }
+
+        if (join_session_.access_mode() == ROOM_ACCESS_APPROVE &&
+            join_session_.has_media_secret()) {
+            ParticipantInfo info{};
+            info.id = participant_id;
+            info.profile_id = profile_id;
+            info.display_name = display_name.empty() ? "Player" : display_name;
+            info.key_public = key_public;
+            info.has_key_public = has_key_public;
+            pending_access_requests_[participant_id] = info;
+        }
+    }
+
+    bool send_media_key_envelope_to_participant_on_io(uint32_t participant_id) {
+        if (!e2e_keypair_ready_ || participant_id == 0 ||
+            participant_id == join_session_.participant_id() ||
+            !join_session_.has_media_secret() ||
+            join_session_.participant_id() == 0 ||
+            !outbound_enabled_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        Bytes<E2E_PUBLIC_KEY_BYTES> target_public_key{};
+        {
+            std::lock_guard<std::mutex> lock(access_request_mutex_);
+            const auto it = participant_key_public_.find(participant_id);
+            if (it == participant_key_public_.end()) {
+                return false;
+            }
+            target_public_key = it->second;
+        }
+
+        const std::string& media_secret = join_session_.media_secret();
+        if (media_secret.empty() || media_secret.size() > MEDIA_SECRET_MAX_BYTES) {
+            return false;
+        }
+
+        E2EKeyEnvelopePayload payload{};
+        payload.media_secret_bytes =
+            static_cast<uint16_t>(std::min(media_secret.size(),
+                                           payload.media_secret.size()));
+        if (payload.media_secret_bytes != media_secret.size()) {
+            return false;
+        }
+        std::copy_n(media_secret.begin(), media_secret.size(),
+                    payload.media_secret.begin());
+
+        E2EKeyEnvelopeHdr envelope{};
+        envelope.magic = E2E_KEY_ENVELOPE_MAGIC;
+        envelope.sender_id = join_session_.participant_id();
+        envelope.target_id = participant_id;
+
+        size_t encrypted_bytes = 0;
+        const auto crypto_public_key = to_crypto_public_key(target_public_key);
+        if (!session_crypto::seal_key_envelope(
+                crypto_public_key,
+                reinterpret_cast<const unsigned char*>(&payload), sizeof(payload),
+                reinterpret_cast<unsigned char*>(envelope.encrypted.data()),
+                envelope.encrypted.size(), encrypted_bytes) ||
+            encrypted_bytes == 0 ||
+            encrypted_bytes > std::numeric_limits<uint16_t>::max()) {
+            return false;
+        }
+        envelope.encrypted_bytes = static_cast<uint16_t>(encrypted_bytes);
+
+        auto packet = std::make_shared<std::vector<unsigned char>>(
+            sizeof(E2EKeyEnvelopeHdr));
+        std::memcpy(packet->data(), &envelope, sizeof(envelope));
+        send(packet->data(), packet->size(), packet);
+        spdlog::info("Sent encrypted room key to participant {}", participant_id);
+        return true;
+    }
+
+    void maybe_auto_share_media_key(uint32_t participant_id) {
+        if (join_session_.access_mode() == ROOM_ACCESS_APPROVE) {
+            return;
+        }
+        if (send_media_key_envelope_to_participant_on_io(participant_id)) {
+            spdlog::info("Auto-shared encrypted room key with participant {}",
+                         participant_id);
+        }
+    }
+
+    std::shared_ptr<const session_crypto::SessionKey> current_session_key() const {
+        return session_key_.load(std::memory_order_acquire);
+    }
+
+    bool accept_secure_control_sequence(uint32_t sender_id, uint32_t sequence) {
+        if (sender_id == 0 || sequence == 0) {
+            return false;
+        }
+        auto [it, inserted] = secure_control_highest_sequence_.emplace(sender_id, sequence);
+        if (inserted) {
+            return true;
+        }
+        if (sequence <= it->second) {
+            return false;
+        }
+        it->second = sequence;
+        return true;
+    }
+
+    void apply_media_secret_rotation(std::string media_secret) {
+        join_session_.set_media_secret(std::move(media_secret));
+        update_media_key_from_secret();
+    }
+
+    bool rotate_media_key_on_io_context(const std::string& media_secret) {
+        const auto key = current_session_key();
+        if (media_secret.empty() || key == nullptr ||
             !join_session_.server_supports(AUDIO_CAP_SECURE_AUDIO) ||
-            data == nullptr || len < sizeof(MsgHdr)) {
+            join_session_.participant_id() == 0 ||
+            !outbound_enabled_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        MediaKeyRotationPayload payload{};
+        payload.command = SECURE_CONTROL_ROTATE_MEDIA_KEY;
+        payload.media_secret_bytes = static_cast<uint16_t>(
+            std::min(media_secret.size(), payload.media_secret.size()));
+        if (payload.media_secret_bytes == 0 ||
+            payload.media_secret_bytes != media_secret.size()) {
+            return false;
+        }
+        std::copy_n(media_secret.begin(), media_secret.size(),
+                    payload.media_secret.begin());
+
+        session_crypto::SecureControlMetadata metadata;
+        metadata.sender_id = join_session_.participant_id();
+        metadata.sequence =
+            secure_control_sequence_.fetch_add(1, std::memory_order_acq_rel);
+        metadata.plaintext_bytes = sizeof(payload);
+
+        std::array<unsigned char, 512> sealed{};
+        size_t sealed_bytes = 0;
+        if (!session_crypto::seal_control_packet(
+                *key, metadata,
+                reinterpret_cast<const unsigned char*>(&payload), sizeof(payload),
+                sealed.data(), sealed.size(), sealed_bytes)) {
+            return false;
+        }
+
+        auto packet = std::make_shared<std::vector<unsigned char>>(
+            sealed.begin(), sealed.begin() + static_cast<std::ptrdiff_t>(sealed_bytes));
+        send(packet->data(), packet->size(), packet);
+        apply_media_secret_rotation(media_secret);
+        spdlog::info("Rotated local E2E media key and sent encrypted room rotation");
+        return true;
+    }
+
+    bool should_secure_audio_packet(const unsigned char* data, std::size_t len) const {
+        if (!join_session_.server_supports(AUDIO_CAP_SECURE_AUDIO) ||
+            join_session_.participant_id() == 0 ||
+            data == nullptr || len < sizeof(MsgHdr) ||
+            len > std::numeric_limits<uint16_t>::max() - SECURE_PACKET_TAG_BYTES) {
             return false;
         }
 
         MsgHdr hdr{};
         std::memcpy(&hdr, data, sizeof(hdr));
         return hdr.magic == AUDIO_V3_MAGIC || hdr.magic == AUDIO_REDUNDANT_MAGIC;
+    }
+
+    bool secure_audio_metadata_for_packet(const unsigned char* data, std::size_t len,
+                                          session_crypto::SecureAudioMetadata& metadata) const {
+        metadata = {};
+        if (!should_secure_audio_packet(data, len)) {
+            return false;
+        }
+
+        const auto use_child_header = [&](const unsigned char* child, size_t child_len) {
+            const auto parsed = audio_packet::parse_audio_header(child, child_len);
+            if (!parsed.valid) {
+                return false;
+            }
+            metadata.sender_id = join_session_.participant_id();
+            metadata.sequence = parsed.sequence;
+            metadata.sample_rate = parsed.sample_rate;
+            metadata.frame_count = parsed.frame_count;
+            metadata.plaintext_bytes = static_cast<uint16_t>(len);
+            metadata.channels = parsed.channels;
+            metadata.codec = parsed.codec;
+            metadata.capture_server_time_ns = parsed.capture_server_time_ns;
+            return true;
+        };
+
+        MsgHdr hdr{};
+        std::memcpy(&hdr, data, sizeof(hdr));
+        if (hdr.magic == AUDIO_V3_MAGIC) {
+            return use_child_header(data, len);
+        }
+
+        if (hdr.magic != AUDIO_REDUNDANT_MAGIC) {
+            return false;
+        }
+
+        bool ok = false;
+        std::string reason;
+        audio_packet::for_each_redundant_audio_child(
+            data, len,
+            [&](const unsigned char* child, size_t child_len, uint8_t index) {
+                if (index == 0) {
+                    ok = use_child_header(child, child_len);
+                }
+            },
+            &reason);
+        return ok;
     }
 
     void send_audio_packet_sync(const unsigned char* data, std::size_t len) {
@@ -1462,11 +1806,12 @@ private:
         std::size_t send_len = len;
         std::array<unsigned char, 2048> secure_packet{};
         size_t secure_bytes = 0;
-        if (should_secure_audio_packet(data, len)) {
-            const uint64_t nonce =
-                secure_audio_send_nonce_.fetch_add(1, std::memory_order_acq_rel);
+        session_crypto::SecureAudioMetadata secure_metadata;
+        const auto key = current_session_key();
+        if (key != nullptr &&
+            secure_audio_metadata_for_packet(data, len, secure_metadata)) {
             if (!session_crypto::seal_audio_packet(
-                    *session_key_, nonce, data, len, secure_packet.data(),
+                    *key, secure_metadata, data, len, secure_packet.data(),
                     secure_packet.size(), secure_bytes)) {
                 outbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
                 return;
@@ -2019,6 +2364,15 @@ private:
                             opus_frame.capture_time)) {
                         opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
                         continue;
+                    }
+                    if (current_session_key() != nullptr &&
+                        join_session_.server_supports(AUDIO_CAP_SECURE_AUDIO)) {
+                        const uint32_t participant_id = join_session_.participant_id();
+                        if (participant_id == 0) {
+                            opus_send_drops_.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        packet_builder::embed_sender_id(packet->data(), participant_id);
                     }
 
                     consume_recent_opus_audio_packets_reset_request_on_sender_thread();
@@ -3043,18 +3397,27 @@ private:
                 ParticipantInfoHdr info{};
                 std::memcpy(&info, recv_data, sizeof(ParticipantInfoHdr));
                 uint32_t participant_capabilities = 0;
+                Bytes<E2E_PUBLIC_KEY_BYTES> key_public{};
+                bool has_key_public = false;
                 if (bytes >= sizeof(ParticipantInfoCapsHdr)) {
                     ParticipantInfoCapsHdr caps_info{};
                     std::memcpy(&caps_info, recv_data, sizeof(ParticipantInfoCapsHdr));
                     participant_capabilities =
                         caps_info.capabilities & AUDIO_SUPPORTED_CAPABILITIES;
+                    key_public = caps_info.key_public;
+                    has_key_public = std::any_of(key_public.begin(), key_public.end(),
+                                                 [](char value) { return value != 0; });
                 }
                 const auto profile_id = fixed_string(info.profile_id);
                 const auto display_name = fixed_string(info.display_name);
                 participant_manager_.set_participant_metadata(info.participant_id, profile_id,
-                                                              display_name);
+                                                              display_name, key_public,
+                                                              has_key_public);
                 media_state_.set_participant_metadata(info.participant_id, profile_id,
                                                       display_name);
+                remember_participant_key(info.participant_id, profile_id, display_name,
+                                         key_public, has_key_public);
+                maybe_auto_share_media_key(info.participant_id);
                 spdlog::info("Participant {} metadata: user='{}' display='{}' capabilities=0x{:08x}",
                           info.participant_id, profile_id, display_name,
                           participant_capabilities);
@@ -3071,7 +3434,6 @@ private:
                 join_session_.mark_join_ack(chdr.participant_id, server_capabilities);
                 if (!was_confirmed) {
                     reset_ping_path_feedback_to_current_sequence();
-                    server_audio_replay_window_.reset();
                 }
                 spdlog::info("JOIN acknowledged by server (participant ID: {}, capabilities=0x{:08x})",
                           chdr.participant_id, server_capabilities);
@@ -3120,6 +3482,9 @@ private:
 
     void remove_participant(uint32_t participant_id) {
         participant_manager_.remove_participant(participant_id);
+        std::lock_guard<std::mutex> lock(access_request_mutex_);
+        participant_key_public_.erase(participant_id);
+        pending_access_requests_.erase(participant_id);
     }
 
     void log_rt_callback_diagnostics() {
@@ -3311,18 +3676,124 @@ private:
         // spdlog::debug("seq {} RTT {:.5f} ms | offset {:.5f} ms", hdr.seq, rtt_ms, offset_ms);
     }
 
+    void handle_secure_control_message(std::size_t bytes, const char* recv_data) {
+        const auto key = current_session_key();
+        if (key == nullptr) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        std::array<unsigned char, 512> plaintext{};
+        session_crypto::SecureControlMetadata metadata;
+        size_t plaintext_bytes = 0;
+        if (!session_crypto::open_control_packet(
+                *key, reinterpret_cast<const unsigned char*>(recv_data), bytes,
+                metadata, plaintext.data(), plaintext.size(), plaintext_bytes)) {
+            const uint64_t count =
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count % 100 == 0) {
+                spdlog::warn("Dropping secure control with invalid auth tag (drops={})",
+                             count);
+            }
+            return;
+        }
+        if (!accept_secure_control_sequence(metadata.sender_id, metadata.sequence)) {
+            const uint64_t count =
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count % 100 == 0) {
+                spdlog::warn("Dropping replayed secure control sender={} seq={} drops={}",
+                             metadata.sender_id, metadata.sequence, count);
+            }
+            return;
+        }
+        if (plaintext_bytes != sizeof(MediaKeyRotationPayload)) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        MediaKeyRotationPayload payload{};
+        std::memcpy(&payload, plaintext.data(), sizeof(payload));
+        if (payload.command != SECURE_CONTROL_ROTATE_MEDIA_KEY ||
+            payload.reserved8 != 0 ||
+            payload.media_secret_bytes == 0 ||
+            payload.media_secret_bytes > payload.media_secret.size()) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        const std::string media_secret(
+            payload.media_secret.begin(),
+            payload.media_secret.begin() + payload.media_secret_bytes);
+        apply_media_secret_rotation(media_secret);
+        spdlog::info("Applied encrypted E2E media key rotation from participant {}",
+                     metadata.sender_id);
+    }
+
+    void handle_e2e_key_envelope(std::size_t bytes, const char* recv_data) {
+        if (!e2e_keypair_ready_ || recv_data == nullptr ||
+            bytes < sizeof(E2EKeyEnvelopeHdr)) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        E2EKeyEnvelopeHdr envelope{};
+        std::memcpy(&envelope, recv_data, sizeof(envelope));
+        if (envelope.magic != E2E_KEY_ENVELOPE_MAGIC ||
+            envelope.target_id != join_session_.participant_id() ||
+            envelope.sender_id == 0 ||
+            envelope.encrypted_bytes <= crypto_box_SEALBYTES ||
+            envelope.encrypted_bytes > E2E_KEY_ENVELOPE_MAX_BYTES ||
+            envelope.reserved != 0) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        std::array<unsigned char, sizeof(E2EKeyEnvelopePayload)> plaintext{};
+        size_t plaintext_bytes = 0;
+        if (!session_crypto::open_key_envelope(
+                e2e_public_key_, e2e_secret_key_,
+                reinterpret_cast<const unsigned char*>(envelope.encrypted.data()),
+                envelope.encrypted_bytes, plaintext.data(), plaintext.size(),
+                plaintext_bytes) ||
+            plaintext_bytes != sizeof(E2EKeyEnvelopePayload)) {
+            const uint64_t count =
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || count % 100 == 0) {
+                spdlog::warn("Dropping E2E key envelope with invalid seal (drops={})",
+                             count);
+            }
+            return;
+        }
+
+        E2EKeyEnvelopePayload payload{};
+        std::memcpy(&payload, plaintext.data(), sizeof(payload));
+        if (payload.media_secret_bytes == 0 ||
+            payload.media_secret_bytes > payload.media_secret.size()) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        const std::string media_secret(
+            payload.media_secret.begin(),
+            payload.media_secret.begin() + payload.media_secret_bytes);
+        apply_media_secret_rotation(media_secret);
+        spdlog::info("Received encrypted room key from participant {}",
+                     envelope.sender_id);
+    }
+
     void handle_secure_audio_message(std::size_t bytes, const char* recv_data) {
-        if (!session_key_.has_value()) {
+        const auto key = current_session_key();
+        if (key == nullptr) {
             inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
         std::array<unsigned char, 2048> plaintext{};
-        uint64_t nonce = 0;
+        session_crypto::SecureAudioMetadata metadata;
         size_t plaintext_bytes = 0;
         if (!session_crypto::open_audio_packet(
-                *session_key_, reinterpret_cast<const unsigned char*>(recv_data), bytes,
-                nonce, plaintext.data(), plaintext.size(), plaintext_bytes)) {
+                *key, reinterpret_cast<const unsigned char*>(recv_data), bytes,
+                metadata, plaintext.data(), plaintext.size(), plaintext_bytes)) {
             const uint64_t count =
                 inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
@@ -3331,11 +3802,39 @@ private:
             return;
         }
 
-        if (!server_audio_replay_window_.accept(nonce)) {
+        bool metadata_matches = false;
+        MsgHdr plaintext_magic{};
+        if (plaintext_bytes >= sizeof(MsgHdr)) {
+            std::memcpy(&plaintext_magic, plaintext.data(), sizeof(plaintext_magic));
+        }
+        auto metadata_matches_child = [&](const unsigned char* child, size_t child_len) {
+            const auto parsed = audio_packet::parse_audio_header(child, child_len);
+            return parsed.valid && parsed.sender_id == metadata.sender_id &&
+                   parsed.sequence == metadata.sequence &&
+                   parsed.sample_rate == metadata.sample_rate &&
+                   parsed.frame_count == metadata.frame_count &&
+                   parsed.channels == metadata.channels && parsed.codec == metadata.codec &&
+                   parsed.capture_server_time_ns == metadata.capture_server_time_ns;
+        };
+        if (plaintext_magic.magic == AUDIO_V3_MAGIC) {
+            metadata_matches = metadata_matches_child(plaintext.data(), plaintext_bytes);
+        } else if (plaintext_magic.magic == AUDIO_REDUNDANT_MAGIC) {
+            std::string reason;
+            audio_packet::for_each_redundant_audio_child(
+                plaintext.data(), plaintext_bytes,
+                [&](const unsigned char* child, size_t child_len, uint8_t index) {
+                    if (index == 0) {
+                        metadata_matches = metadata_matches_child(child, child_len);
+                    }
+                },
+                &reason);
+        }
+        if (!metadata_matches) {
             const uint64_t count =
                 inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
-                spdlog::warn("Dropping replayed secure audio nonce={} drops={}", nonce, count);
+                spdlog::warn("Dropping secure audio with mismatched metadata (drops={})",
+                             count);
             }
             return;
         }
@@ -4120,9 +4619,16 @@ private:
     ClientMediaState media_state_;
     ClientMetronome metronome_;
     std::filesystem::path audio_preferences_path_;
-    std::optional<session_crypto::SessionKey> session_key_;
-    session_crypto::ReplayWindow              server_audio_replay_window_;
-    std::atomic<uint64_t>                     secure_audio_send_nonce_{1};
+    std::atomic<std::shared_ptr<const session_crypto::SessionKey>> session_key_{nullptr};
+    std::atomic<uint32_t> secure_control_sequence_{1};
+    std::unordered_map<uint32_t, uint32_t> secure_control_highest_sequence_;
+    session_crypto::E2EPublicKey e2e_public_key_{};
+    session_crypto::E2ESecretKey e2e_secret_key_{};
+    Bytes<E2E_PUBLIC_KEY_BYTES> e2e_key_public_bytes_{};
+    bool e2e_keypair_ready_ = false;
+    mutable std::mutex access_request_mutex_;
+    std::unordered_map<uint32_t, Bytes<E2E_PUBLIC_KEY_BYTES>> participant_key_public_;
+    std::unordered_map<uint32_t, ParticipantInfo> pending_access_requests_;
 
     AudioStream              audio_;
     OpusEncoderWrapper       audio_encoder_;
@@ -4288,9 +4794,35 @@ public:
     void join_room(const std::string& server_address, uint16_t server_port,
                    const std::string& room_id, const std::string& profile_id,
                    const std::string& display_name,
-                   const std::string& join_token) override {
+                   const std::string& join_token,
+                   const std::string& media_secret = {},
+                   uint8_t access_mode = ROOM_ACCESS_OPEN) override {
         client_.join_room(server_address, server_port, room_id, profile_id,
-                          display_name, join_token);
+                          display_name, join_token, media_secret, access_mode);
+    }
+
+    bool rotate_media_key(const std::string& media_secret) override {
+        return client_.rotate_media_key(media_secret);
+    }
+
+    bool has_media_key() const override {
+        return client_.has_media_key();
+    }
+
+    std::string current_media_secret() const override {
+        return client_.current_media_secret();
+    }
+
+    void set_room_access_mode(uint8_t access_mode) override {
+        client_.set_room_access_mode(access_mode);
+    }
+
+    bool approve_waiting_participant(uint32_t participant_id) override {
+        return client_.approve_waiting_participant(participant_id);
+    }
+
+    std::vector<ParticipantInfo> get_waiting_participant_info() const override {
+        return client_.get_waiting_participant_info();
     }
 
     bool is_join_confirmed() const override {

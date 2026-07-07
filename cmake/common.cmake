@@ -39,14 +39,6 @@ FetchContent_Declare(
 )
 
 FetchContent_Declare(
-    concurrentqueue_src
-    GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
-    GIT_TAG        v1.0.4
-    GIT_SHALLOW    TRUE
-    GIT_PROGRESS   TRUE
-)
-
-FetchContent_Declare(
     spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG        v1.16.0
@@ -72,7 +64,7 @@ set(BUILD_TESTING OFF)
 set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(SODIUM_DISABLE_TESTS ON CACHE BOOL "Disable libsodium tests" FORCE)
 set(SODIUM_MINIMAL ON CACHE BOOL "Build only the libsodium high-level API set" FORCE)
-FetchContent_MakeAvailable(asio_src opus concurrentqueue_src spdlog libsodium_cmake)
+FetchContent_MakeAvailable(asio_src opus spdlog libsodium_cmake)
 if(DEFINED opus_BINARY_DIR AND NOT OPUS_BUILD_TESTING)
     # Opus leaves old CTest metadata behind when an existing build tree is
     # reconfigured with tests disabled. Remove it so `ctest` only runs jam tests.
@@ -97,6 +89,11 @@ target_include_directories(asio INTERFACE
     ${asio_src_SOURCE_DIR}/asio/include
 )
 target_link_libraries(asio INTERFACE asio_config)
+
+add_library(concurrentqueue INTERFACE)
+target_include_directories(concurrentqueue INTERFACE
+    ${CMAKE_CURRENT_LIST_DIR}/../third_party/concurrentqueue
+)
 
 add_library(token_crypto INTERFACE)
 target_link_libraries(token_crypto INTERFACE sodium)

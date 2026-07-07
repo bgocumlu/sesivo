@@ -8,6 +8,7 @@ This file is an inventory and notice summary. It is not a substitute for preserv
 
 JUCE is used for cross-platform audio device access.
 
+- Version: 8.0.10.
 - Project: https://juce.com/
 - Source: https://github.com/juce-framework/JUCE
 - License: AGPLv3 or commercial JUCE license, depending on distribution terms.
@@ -18,6 +19,7 @@ This project uses JUCE under AGPLv3-compatible public open-source terms.
 
 ASIO is a Steinberg audio driver technology. This task does not directly bundle ASIO SDK source. JUCE may expose ASIO devices when ASIO support is configured and user-installed ASIO drivers are available.
 
+- Version: not bundled or pinned by this repository.
 - Steinberg developer information: https://www.steinberg.net/developers/
 - ASIO open-source information: https://www.steinberg.net/developers/asiosdk-open/
 
@@ -29,6 +31,7 @@ If ASIO SDK or source is bundled later, that distribution must follow Steinberg'
 
 Asio is used as a standalone C++ networking library.
 
+- Version: asio-1-36-0.
 - Source: https://github.com/chriskohlhoff/asio
 - License: Boost Software License 1.0.
 
@@ -36,6 +39,7 @@ Asio is used as a standalone C++ networking library.
 
 Opus is used for compressed audio mode.
 
+- Version: v1.5.2.
 - Project: https://opus-codec.org/
 - Source: https://github.com/xiph/opus
 - License: BSD 3-Clause.
@@ -44,6 +48,7 @@ Opus is used for compressed audio mode.
 
 concurrentqueue is used for lock-free concurrent queue data structures.
 
+- Version: v1.0.5.
 - Source: https://github.com/cameron314/concurrentqueue
 - License: Simplified BSD.
 
@@ -51,27 +56,16 @@ concurrentqueue is used for lock-free concurrent queue data structures.
 
 libsodium is used for cryptographic hashing, authentication, key exchange, and encryption.
 
+- Version: 1.0.20.
 - Project: https://libsodium.org/
 - Source: https://github.com/jedisct1/libsodium
+- Build wrapper: https://github.com/robinlinden/libsodium-cmake at commit 9b2848dfc1b917a9410f0de9d81059b26cbfaa8d.
 - License: ISC.
-
-## Dear ImGui
-
-Dear ImGui is used for the native client UI.
-
-- Source: https://github.com/ocornut/imgui
-- License: MIT.
-
-## GLFW
-
-GLFW is used for window and OpenGL context management.
-
-- Source: https://github.com/glfw/glfw
-- License: zlib/libpng.
 
 ## spdlog
 
 spdlog is used for logging.
 
+- Version: v1.16.0.
 - Source: https://github.com/gabime/spdlog
 - License: MIT.

@@ -124,6 +124,7 @@ private:
         bool joined = false;
         bool waiting_for_room_key = false;
         std::string joined_room_id;
+        std::string display_name;
         std::string media_secret;
         uint8_t access_mode = ROOM_ACCESS_OPEN;
         std::string message;
@@ -162,6 +163,7 @@ private:
     void poll_job_result();
     void apply_status(BrowserJobResult result);
     void apply_ticket_result(const BrowserJobResult& result);
+    void remember_display_name(const std::string& display_name);
     void show_waiting_for_room_key(JoinLaunch launch);
     void finish_waiting_join();
     void cancel_waiting_join();

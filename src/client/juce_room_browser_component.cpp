@@ -815,6 +815,11 @@ JuceRoomBrowserComponent::JuceRoomBrowserComponent(
       joined_callback_(std::move(joined_callback)),
       local_profile_id_(make_local_profile_id()) {
     configure_controls();
+    const auto saved_display_name =
+        load_client_display_name(startup_options_.config_path);
+    if (!saved_display_name.empty()) {
+        last_display_name_ = saved_display_name;
+    }
     client_.set_self_monitor_enabled(false);
     if (client_.is_audio_stream_active()) {
         client_.stop_audio_stream();
@@ -1849,6 +1854,7 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                           result_value.server_index = server_index;
                           result_value.server_address = server.address;
                           result_value.server_port = server.port;
+                          result_value.display_name = display_name;
 
                           RoomJoinTokenRequestHdr request{};
                           request.magic = CTRL_MAGIC;
@@ -2020,6 +2026,7 @@ void JuceRoomBrowserComponent::start_create_flow() {
                     result_value.server_index = server_index;
                     result_value.server_address = server.address;
                     result_value.server_port = server.port;
+                    result_value.display_name = display_name;
 
                     RoomCreateRequestHdr request{};
                     request.magic = CTRL_MAGIC;
@@ -2349,10 +2356,12 @@ void JuceRoomBrowserComponent::apply_ticket_result(const BrowserJobResult& resul
                               : result.access_mode};
     };
     if (result.waiting_for_room_key) {
+        remember_display_name(result.display_name);
         show_waiting_for_room_key(make_launch());
         return;
     }
     if (result.joined) {
+        remember_display_name(result.display_name);
         status_text_ = "Joined";
         if (joined_callback_) {
             auto callback = joined_callback_;
@@ -2366,6 +2375,15 @@ void JuceRoomBrowserComponent::apply_ticket_result(const BrowserJobResult& resul
     }
     status_text_ = result.message.empty() ? "Join failed" : result.message;
     repaint();
+}
+
+void JuceRoomBrowserComponent::remember_display_name(const std::string& display_name) {
+    const auto name = trim_copy(display_name);
+    if (name.empty()) {
+        return;
+    }
+    last_display_name_ = name;
+    save_client_display_name(startup_options_.config_path, name);
 }
 
 void JuceRoomBrowserComponent::show_waiting_for_room_key(JoinLaunch launch) {

@@ -33,6 +33,9 @@ bool save_audio_device_preferences(const std::filesystem::path& path,
 std::vector<SavedRoomServer> load_saved_room_servers(const std::filesystem::path& path);
 bool save_saved_room_servers(const std::filesystem::path& path,
                              const std::vector<SavedRoomServer>& servers);
+std::string load_client_display_name(const std::filesystem::path& path);
+bool save_client_display_name(const std::filesystem::path& path,
+                              const std::string& display_name);
 
 AudioStream::DeviceIndex find_preferred_audio_device(
     const std::vector<AudioStream::DeviceInfo>& devices,

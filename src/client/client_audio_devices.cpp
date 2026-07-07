@@ -204,6 +204,46 @@ bool save_saved_room_servers(const std::filesystem::path& path,
     return saved;
 }
 
+std::string load_client_display_name(const std::filesystem::path& path) {
+    auto root = read_config_root(path);
+    const auto* root_obj = root.getDynamicObject();
+    if (root_obj == nullptr) {
+        return {};
+    }
+
+    const auto profile_value = root_obj->getProperty("profile");
+    auto* profile = profile_value.getDynamicObject();
+    if (profile == nullptr) {
+        return {};
+    }
+    return trim_copy(string_property(*profile, "displayName"));
+}
+
+bool save_client_display_name(const std::filesystem::path& path,
+                              const std::string& display_name) {
+    const auto name = trim_copy(display_name);
+    if (path.empty() || name.empty()) {
+        return false;
+    }
+
+    auto root = read_config_root(path);
+    auto* object = root_object(root);
+
+    const auto profile_value = object->getProperty("profile");
+    auto* profile = profile_value.getDynamicObject();
+    if (profile == nullptr) {
+        profile = new juce::DynamicObject();
+        object->setProperty("profile", juce::var(profile));
+    }
+    profile->setProperty("displayName", juce::String(name));
+
+    const bool saved = write_config_root(path, root);
+    if (saved) {
+        spdlog::info("Saved client display name: {}", path.string());
+    }
+    return saved;
+}
+
 AudioStream::DeviceIndex find_preferred_audio_device(
     const std::vector<AudioStream::DeviceInfo>& devices,
     const std::string& preferred_device,

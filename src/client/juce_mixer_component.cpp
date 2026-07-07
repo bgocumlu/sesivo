@@ -2138,7 +2138,11 @@ std::string JuceMixerComponent::password_hash(const std::string& password) const
         return {};
     }
     const std::vector<unsigned char> bytes(password.begin(), password.end());
-    return performer_join_token::hex(performer_join_token::sha256(bytes));
+    const auto digest = performer_join_token::try_sha256(bytes);
+    if (!digest.has_value()) {
+        return {};
+    }
+    return performer_join_token::hex(*digest);
 }
 
 juce::String JuceMixerComponent::invite_text() const {

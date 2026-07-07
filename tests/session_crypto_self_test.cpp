@@ -19,6 +19,21 @@ void require(bool condition, const char* message) {
     }
 }
 
+void test_libsodium_sha256_and_hmac_vectors() {
+    const std::vector<unsigned char> abc{'a', 'b', 'c'};
+    const auto sha = performer_join_token::try_sha256(abc);
+    require(sha.has_value(), "sha256 should succeed");
+    require(performer_join_token::hex(*sha) ==
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "sha256 vector should match");
+    const auto hmac = performer_join_token::try_hmac_sha256_hex(
+        "key", "The quick brown fox jumps over the lazy dog");
+    require(hmac.has_value(), "hmac-sha256 should succeed");
+    require(*hmac ==
+                "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+            "hmac-sha256 vector should match");
+}
+
 bool same_metadata(const session_crypto::SecureAudioMetadata& lhs,
                    const session_crypto::SecureAudioMetadata& rhs) {
     return lhs.sender_id == rhs.sender_id &&
@@ -43,16 +58,24 @@ void test_key_derivation_is_stable() {
     const auto other_secret_key = session_crypto::derive_media_key_from_secret(
         "secure.room", "room.instance.a", "other-media-secret");
 
-    require(key == same_key, "same media secret and room should produce same key");
-    require(key != other_room_key, "different room should produce different media key");
-    require(key != other_instance_key,
+    require(key.has_value(), "media key derivation should succeed");
+    require(same_key.has_value(), "same media key derivation should succeed");
+    require(other_room_key.has_value(), "other room media key derivation should succeed");
+    require(other_instance_key.has_value(),
+            "other instance media key derivation should succeed");
+    require(other_secret_key.has_value(),
+            "other secret media key derivation should succeed");
+    require(*key == *same_key, "same media secret and room should produce same key");
+    require(*key != *other_room_key, "different room should produce different media key");
+    require(*key != *other_instance_key,
             "different room instance should produce different media key");
-    require(key != other_secret_key, "different secret should produce different media key");
+    require(*key != *other_secret_key, "different secret should produce different media key");
 }
 
 void test_seal_open_round_trip_and_tamper_rejection() {
     const auto key = session_crypto::derive_media_key_from_secret(
         "secure.room", "room.instance.a", "test-media-secret");
+    require(key.has_value(), "media key derivation should succeed");
 
     const std::array<unsigned char, 4> payload{0x11, 0x22, 0x33, 0x44};
     const auto audio = audio_packet::create_audio_packet_v3(
@@ -73,7 +96,7 @@ void test_seal_open_round_trip_and_tamper_rejection() {
 
     std::array<unsigned char, 2048> sealed{};
     size_t sealed_bytes = 0;
-    require(session_crypto::seal_audio_packet(key, metadata, audio->data(), audio->size(),
+    require(session_crypto::seal_audio_packet(*key, metadata, audio->data(), audio->size(),
                                               sealed.data(), sealed.size(), sealed_bytes),
             "seal should succeed");
     require(sealed_bytes == SECURE_PACKET_HEADER_BYTES + audio->size() +
@@ -96,7 +119,7 @@ void test_seal_open_round_trip_and_tamper_rejection() {
     std::array<unsigned char, 2048> opened{};
     size_t opened_bytes = 0;
     session_crypto::SecureAudioMetadata opened_metadata;
-    require(session_crypto::open_audio_packet(key, sealed.data(), sealed_bytes,
+    require(session_crypto::open_audio_packet(*key, sealed.data(), sealed_bytes,
                                               opened_metadata, opened.data(),
                                               opened.size(), opened_bytes),
             "open should succeed");
@@ -106,7 +129,7 @@ void test_seal_open_round_trip_and_tamper_rejection() {
             "opened plaintext should match");
 
     std::array<unsigned char, 2048> wrong_key_opened{};
-    auto wrong_key = key;
+    auto wrong_key = *key;
     wrong_key[0] ^= 0x80;
     require(!session_crypto::open_audio_packet(wrong_key, sealed.data(), sealed_bytes,
                                                opened_metadata, wrong_key_opened.data(),
@@ -115,7 +138,7 @@ void test_seal_open_round_trip_and_tamper_rejection() {
 
     auto tampered_ciphertext = sealed;
     tampered_ciphertext[SECURE_PACKET_HEADER_BYTES] ^= 0x01;
-    require(!session_crypto::open_audio_packet(key, tampered_ciphertext.data(), sealed_bytes,
+    require(!session_crypto::open_audio_packet(*key, tampered_ciphertext.data(), sealed_bytes,
                                                opened_metadata, opened.data(), opened.size(),
                                                opened_bytes),
             "ciphertext tamper should fail");
@@ -125,7 +148,7 @@ void test_seal_open_round_trip_and_tamper_rejection() {
     std::memcpy(&header, tampered_header.data(), sizeof(header));
     header.reserved = 1;
     std::memcpy(tampered_header.data(), &header, sizeof(header));
-    require(!session_crypto::open_audio_packet(key, tampered_header.data(), sealed_bytes,
+    require(!session_crypto::open_audio_packet(*key, tampered_header.data(), sealed_bytes,
                                                opened_metadata, opened.data(), opened.size(),
                                                opened_bytes),
             "reserved header tamper should fail");
@@ -134,19 +157,19 @@ void test_seal_open_round_trip_and_tamper_rejection() {
     std::memcpy(&header, tampered_nonce.data(), sizeof(header));
     header.nonce[0] ^= 0x01;
     std::memcpy(tampered_nonce.data(), &header, sizeof(header));
-    require(!session_crypto::open_audio_packet(key, tampered_nonce.data(), sealed_bytes,
+    require(!session_crypto::open_audio_packet(*key, tampered_nonce.data(), sealed_bytes,
                                                opened_metadata, opened.data(), opened.size(),
                                                opened_bytes),
             "nonce tamper should fail");
 
     auto tampered_tag = sealed;
     tampered_tag[sealed_bytes - 1] ^= 0x01;
-    require(!session_crypto::open_audio_packet(key, tampered_tag.data(), sealed_bytes,
+    require(!session_crypto::open_audio_packet(*key, tampered_tag.data(), sealed_bytes,
                                                opened_metadata, opened.data(), opened.size(),
                                                opened_bytes),
             "tag tamper should fail");
 
-    require(!session_crypto::open_audio_packet(key, sealed.data(), sealed_bytes - 1,
+    require(!session_crypto::open_audio_packet(*key, sealed.data(), sealed_bytes - 1,
                                                opened_metadata, opened.data(), opened.size(),
                                                opened_bytes),
             "truncated packet should fail");
@@ -155,6 +178,7 @@ void test_seal_open_round_trip_and_tamper_rejection() {
 void test_secure_control_round_trip_and_tamper_rejection() {
     const auto key = session_crypto::derive_media_key_from_secret(
         "secure.room", "room.instance.a", "test-media-secret");
+    require(key.has_value(), "media key derivation should succeed");
 
     MediaKeyRotationPayload payload{};
     const std::string next_secret = "next-media-secret";
@@ -169,7 +193,7 @@ void test_secure_control_round_trip_and_tamper_rejection() {
     std::array<unsigned char, 512> sealed{};
     size_t sealed_bytes = 0;
     require(session_crypto::seal_control_packet(
-                key, metadata, reinterpret_cast<const unsigned char*>(&payload),
+                *key, metadata, reinterpret_cast<const unsigned char*>(&payload),
                 sizeof(payload), sealed.data(), sealed.size(), sealed_bytes),
             "control seal should succeed");
     require(sealed_bytes == SECURE_CONTROL_HEADER_BYTES + sizeof(payload) +
@@ -190,7 +214,7 @@ void test_secure_control_round_trip_and_tamper_rejection() {
     size_t opened_bytes = 0;
     session_crypto::SecureControlMetadata opened_metadata;
     require(session_crypto::open_control_packet(
-                key, sealed.data(), sealed_bytes, opened_metadata, opened.data(),
+                *key, sealed.data(), sealed_bytes, opened_metadata, opened.data(),
                 opened.size(), opened_bytes),
             "control open should succeed");
     require(opened_bytes == sizeof(payload), "opened control size should match");
@@ -213,14 +237,14 @@ void test_secure_control_round_trip_and_tamper_rejection() {
     header.sequence ^= 0x01;
     std::memcpy(tampered_header.data(), &header, sizeof(header));
     require(!session_crypto::open_control_packet(
-                key, tampered_header.data(), sealed_bytes, opened_metadata,
+                *key, tampered_header.data(), sealed_bytes, opened_metadata,
                 opened.data(), opened.size(), opened_bytes),
             "control header tamper should fail");
 
     auto tampered_ciphertext = sealed;
     tampered_ciphertext[SECURE_CONTROL_HEADER_BYTES] ^= 0x01;
     require(!session_crypto::open_control_packet(
-                key, tampered_ciphertext.data(), sealed_bytes, opened_metadata,
+                *key, tampered_ciphertext.data(), sealed_bytes, opened_metadata,
                 opened.data(), opened.size(), opened_bytes),
             "control ciphertext tamper should fail");
 }
@@ -228,6 +252,7 @@ void test_secure_control_round_trip_and_tamper_rejection() {
 }  // namespace
 
 int main() {
+    test_libsodium_sha256_and_hmac_vectors();
     test_key_derivation_is_stable();
     test_seal_open_round_trip_and_tamper_rejection();
     test_secure_control_round_trip_and_tamper_rejection();

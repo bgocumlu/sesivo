@@ -263,9 +263,14 @@ public:
         const auto derived = session_crypto::derive_media_key_from_secret(
             token->claims.room_id, token->claims.room_instance_id,
             join_session_.media_secret());
+        if (!derived.has_value()) {
+            reset_session_security();
+            spdlog::warn("Could not derive E2E media key: crypto unavailable");
+            return;
+        }
 
         session_key_.store(
-            std::make_shared<const session_crypto::SessionKey>(derived),
+            std::make_shared<const session_crypto::SessionKey>(*derived),
             std::memory_order_release);
     }
 

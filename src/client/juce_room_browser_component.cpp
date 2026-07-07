@@ -2624,7 +2624,11 @@ std::string JuceRoomBrowserComponent::password_hash(const std::string& password)
         return {};
     }
     const std::vector<unsigned char> bytes(password.begin(), password.end());
-    return performer_join_token::hex(performer_join_token::sha256(bytes));
+    const auto digest = performer_join_token::try_sha256(bytes);
+    if (!digest.has_value()) {
+        return {};
+    }
+    return performer_join_token::hex(*digest);
 }
 
 std::string JuceRoomBrowserComponent::profile_id_for_display_name(

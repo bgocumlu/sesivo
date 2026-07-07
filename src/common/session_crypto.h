@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,41 +32,35 @@ inline void append_string(std::vector<unsigned char>& out, const std::string& va
     out.insert(out.end(), value.begin(), value.end());
 }
 
-inline std::vector<unsigned char> hmac_sha256_bytes(
-    const std::vector<unsigned char>& key_input,
-    const std::vector<unsigned char>& message) {
-    constexpr size_t block_size = 64;
-    std::vector<unsigned char> key = key_input;
-    if (key.size() > block_size) {
-        key = performer_join_token::sha256(key);
-    }
-    key.resize(block_size, 0);
-
-    std::vector<unsigned char> outer_key_pad(block_size);
-    std::vector<unsigned char> inner_key_pad(block_size);
-    for (size_t i = 0; i < block_size; ++i) {
-        outer_key_pad[i] = key[i] ^ 0x5c;
-        inner_key_pad[i] = key[i] ^ 0x36;
-    }
-
-    std::vector<unsigned char> inner(inner_key_pad);
-    inner.insert(inner.end(), message.begin(), message.end());
-    const auto inner_hash = performer_join_token::sha256(inner);
-
-    std::vector<unsigned char> outer(outer_key_pad);
-    outer.insert(outer.end(), inner_hash.begin(), inner_hash.end());
-    return performer_join_token::sha256(outer);
-}
-
-inline SessionKey session_key_from_digest(const std::vector<unsigned char>& digest) {
-    SessionKey key{};
-    const size_t copy_bytes = std::min(key.size(), digest.size());
-    std::copy_n(digest.begin(), copy_bytes, key.begin());
-    return key;
-}
-
 inline bool ensure_sodium_initialized() {
     return sodium_init() >= 0;
+}
+
+inline std::optional<std::vector<unsigned char>> hmac_sha256_bytes(
+    const std::vector<unsigned char>& key_input,
+    const std::vector<unsigned char>& message) {
+    if (!ensure_sodium_initialized()) {
+        return std::nullopt;
+    }
+    std::vector<unsigned char> digest(crypto_auth_hmacsha256_BYTES);
+    crypto_auth_hmacsha256_state state{};
+    crypto_auth_hmacsha256_init(&state, performer_join_token::sodium_input_data(key_input),
+                                key_input.size());
+    crypto_auth_hmacsha256_update(
+        &state, performer_join_token::sodium_input_data(message),
+        static_cast<unsigned long long>(message.size()));
+    crypto_auth_hmacsha256_final(&state, digest.data());
+    return digest;
+}
+
+inline std::optional<SessionKey> session_key_from_digest(
+    const std::vector<unsigned char>& digest) {
+    if (digest.size() != SessionKey{}.size()) {
+        return std::nullopt;
+    }
+    SessionKey key{};
+    std::copy_n(digest.begin(), key.size(), key.begin());
+    return key;
 }
 
 }  // namespace detail
@@ -197,9 +192,10 @@ inline std::string nonce_replay_key(const performer_join_token::Claims& claims) 
            std::to_string(claims.nonce.size()) + ":" + claims.nonce;
 }
 
-inline SessionKey derive_media_key_from_secret(const std::string& room_id,
-                                               const std::string& room_instance_id,
-                                               const std::string& media_secret) {
+inline std::optional<SessionKey> derive_media_key_from_secret(
+    const std::string& room_id,
+    const std::string& room_instance_id,
+    const std::string& media_secret) {
     std::vector<unsigned char> message;
     detail::append_string(message, "sesivo-e2e-media-v3|");
     detail::append_string(message, room_id);
@@ -207,7 +203,10 @@ inline SessionKey derive_media_key_from_secret(const std::string& room_id,
     detail::append_string(message, room_instance_id);
     const auto digest = detail::hmac_sha256_bytes(
         detail::bytes_from_string(media_secret), message);
-    return detail::session_key_from_digest(digest);
+    if (!digest.has_value()) {
+        return std::nullopt;
+    }
+    return detail::session_key_from_digest(*digest);
 }
 
 inline bool make_e2e_keypair(E2EPublicKey& public_key, E2ESecretKey& secret_key) {

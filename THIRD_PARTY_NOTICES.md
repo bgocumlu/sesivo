@@ -47,12 +47,13 @@ concurrentqueue is used for lock-free concurrent queue data structures.
 - Source: https://github.com/cameron314/concurrentqueue
 - License: Simplified BSD.
 
-## PicoSHA2
+## libsodium
 
-PicoSHA2 is used for SHA-256 hashing.
+libsodium is used for cryptographic hashing, authentication, key exchange, and encryption.
 
-- Source: https://github.com/okdshin/PicoSHA2
-- License: MIT.
+- Project: https://libsodium.org/
+- Source: https://github.com/jedisct1/libsodium
+- License: ISC.
 
 ## Dear ImGui
 

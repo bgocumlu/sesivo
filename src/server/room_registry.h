@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cctype>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -49,9 +50,13 @@ struct AuthorizeResult {
     RoomSnapshot room;
 };
 
-inline std::string sha256_hex(const std::string& value) {
+inline std::optional<std::string> sha256_hex(const std::string& value) {
     const std::vector<unsigned char> bytes(value.begin(), value.end());
-    return performer_join_token::hex(performer_join_token::sha256(bytes));
+    const auto digest = performer_join_token::try_sha256(bytes);
+    if (!digest.has_value()) {
+        return std::nullopt;
+    }
+    return performer_join_token::hex(*digest);
 }
 
 inline std::string make_secret_token() {
@@ -104,7 +109,12 @@ public:
         room.room_instance_id = performer_join_token::random_nonce();
         room.password_hash = std::move(password_hash);
         room.access_mode = access_mode;
-        room.admin_token_hash = sha256_hex(admin_token);
+        auto admin_token_hash = sha256_hex(admin_token);
+        if (!admin_token_hash.has_value()) {
+            result.reason = "crypto unavailable";
+            return result;
+        }
+        room.admin_token_hash = std::move(*admin_token_hash);
         room.created_at = now;
         room.last_activity = now;
         result.room = snapshot_for(room);
@@ -184,9 +194,9 @@ public:
                                     const std::string& admin_token,
                                     std::string password_hash,
                                     time_point now) {
-        return change_access_mode(room_id, admin_token,
-                                  password_hash.empty() ? ROOM_ACCESS_OPEN
-                                                        : ROOM_ACCESS_PASSWORD,
+        const uint8_t access_mode =
+            password_hash.empty() ? ROOM_ACCESS_OPEN : ROOM_ACCESS_PASSWORD;
+        return change_access_mode(room_id, admin_token, access_mode,
                                   std::move(password_hash), now);
     }
 
@@ -256,8 +266,12 @@ public:
             result.reason = "room not found";
             return result;
         }
-        if (admin_token.empty() ||
-            sha256_hex(admin_token) != it->second.admin_token_hash) {
+        const auto token_hash = sha256_hex(admin_token);
+        if (!token_hash.has_value()) {
+            result.reason = "crypto unavailable";
+            return result;
+        }
+        if (admin_token.empty() || *token_hash != it->second.admin_token_hash) {
             result.reason = "invalid room admin token";
             return result;
         }

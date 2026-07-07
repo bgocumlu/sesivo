@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include <picosha2.h>
+#include <sodium.h>
 
 namespace performer_join_token {
 
@@ -108,34 +108,45 @@ inline std::optional<std::string> base64url_decode(const std::string& input) {
     return output;
 }
 
-inline std::vector<unsigned char> sha256(const std::vector<unsigned char>& bytes) {
-    std::vector<unsigned char> digest(picosha2::k_digest_size);
-    picosha2::hash256(bytes.begin(), bytes.end(), digest.begin(), digest.end());
+inline bool ensure_sodium_initialized() {
+    return sodium_init() >= 0;
+}
+
+inline const unsigned char* sodium_input_data(const std::vector<unsigned char>& bytes) {
+    static constexpr unsigned char empty = 0;
+    return bytes.empty() ? &empty : bytes.data();
+}
+
+inline const unsigned char* sodium_input_data(const std::string& text) {
+    static constexpr unsigned char empty = 0;
+    return text.empty() ? &empty : reinterpret_cast<const unsigned char*>(text.data());
+}
+
+inline std::optional<std::vector<unsigned char>> try_sha256(
+    const std::vector<unsigned char>& bytes) {
+    std::vector<unsigned char> digest(crypto_hash_sha256_BYTES);
+    if (!ensure_sodium_initialized()) {
+        return std::nullopt;
+    }
+    crypto_hash_sha256(digest.data(), sodium_input_data(bytes),
+                       static_cast<unsigned long long>(bytes.size()));
     return digest;
 }
 
-inline std::string hmac_sha256_hex(const std::string& secret, const std::string& message) {
-    constexpr size_t block_size = 64;
-    std::vector<unsigned char> key(secret.begin(), secret.end());
-    if (key.size() > block_size) {
-        key = sha256(key);
+inline std::optional<std::string> try_hmac_sha256_hex(const std::string& secret,
+                                                      const std::string& message) {
+    if (!ensure_sodium_initialized()) {
+        return std::nullopt;
     }
-    key.resize(block_size, 0);
-
-    std::vector<unsigned char> outer_key_pad(block_size);
-    std::vector<unsigned char> inner_key_pad(block_size);
-    for (size_t i = 0; i < block_size; ++i) {
-        outer_key_pad[i] = key[i] ^ 0x5c;
-        inner_key_pad[i] = key[i] ^ 0x36;
-    }
-
-    std::vector<unsigned char> inner(inner_key_pad);
-    inner.insert(inner.end(), message.begin(), message.end());
-    const auto inner_hash = sha256(inner);
-
-    std::vector<unsigned char> outer(outer_key_pad);
-    outer.insert(outer.end(), inner_hash.begin(), inner_hash.end());
-    return hex(sha256(outer));
+    std::array<unsigned char, crypto_auth_hmacsha256_BYTES> digest{};
+    crypto_auth_hmacsha256_state state{};
+    const auto* key = sodium_input_data(secret);
+    const auto* data = sodium_input_data(message);
+    crypto_auth_hmacsha256_init(&state, key, secret.size());
+    crypto_auth_hmacsha256_update(&state, data,
+                                  static_cast<unsigned long long>(message.size()));
+    crypto_auth_hmacsha256_final(&state, digest.data());
+    return hex(std::vector<unsigned char>(digest.begin(), digest.end()));
 }
 
 inline void append_claim_field(std::string& payload, const std::string& value) {
@@ -241,12 +252,17 @@ inline std::string random_nonce() {
     return nonce;
 }
 
-inline std::string sign(const Claims& claims, const std::string& secret) {
-    return hmac_sha256_hex(secret, signing_message(claims));
+inline std::optional<std::string> try_sign(const Claims& claims,
+                                           const std::string& secret) {
+    return try_hmac_sha256_hex(secret, signing_message(claims));
 }
 
-inline std::string create(const Claims& claims, const std::string& secret) {
-    return "v2." + base64url_encode(claims_payload(claims)) + "." + sign(claims, secret);
+inline std::optional<std::string> create(const Claims& claims, const std::string& secret) {
+    auto signature = try_sign(claims, secret);
+    if (!signature.has_value()) {
+        return std::nullopt;
+    }
+    return "v2." + base64url_encode(claims_payload(claims)) + "." + *signature;
 }
 
 inline std::vector<std::string> split(const std::string& value, char delimiter) {
@@ -347,8 +363,12 @@ inline ValidatedToken validate_with_claims(const std::string& token, const std::
         detailed.reason = "wrong room access epoch";
         return detailed;
     }
-    const std::string expected_signature = sign(claims, secret);
-    if (!constant_time_equal(expected_signature, parsed->signature_hex)) {
+    const auto expected_signature = try_sign(claims, secret);
+    if (!expected_signature.has_value()) {
+        detailed.reason = "crypto unavailable";
+        return detailed;
+    }
+    if (!constant_time_equal(*expected_signature, parsed->signature_hex)) {
         detailed.reason = "invalid signature";
         return detailed;
     }

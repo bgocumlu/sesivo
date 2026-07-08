@@ -192,8 +192,11 @@ public:
     void initialise(const juce::String& command_line) override {
         try {
             startup_options_ = parse_current_command_line();
+            const auto log_level = startup_options_.log_file_path.empty()
+                                       ? logging::default_level()
+                                       : spdlog::level::info;
             logging::init(true, true, !startup_options_.log_file_path.empty(),
-                          startup_options_.log_file_path, logging::default_level());
+                          startup_options_.log_file_path, log_level);
             if (!startup_options_.log_file_path.empty()) {
                 spdlog::info("Logging to {}", startup_options_.log_file_path);
             }

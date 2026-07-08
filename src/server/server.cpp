@@ -2072,8 +2072,11 @@ int main(int argc, char** argv) {
         asio::io_context io_context;
         auto             options = parse_server_options(argc, argv);
 
+        const auto log_level = options.log_file_path.empty()
+                                   ? logging::default_level()
+                                   : spdlog::level::info;
         logging::init(true, false, !options.log_file_path.empty(), options.log_file_path,
-                      logging::default_level(), options.log_max_bytes, options.log_max_files);
+                      log_level, options.log_max_bytes, options.log_max_files);
 
         if (options.crash_reports_enabled) {
             crash_reporter::Options crash_options;

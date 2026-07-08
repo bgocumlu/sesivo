@@ -1,0 +1,10 @@
+{
+  "name": "sesivo",
+  "short_name": "sesivo",
+  "description": "sesivo project website.",
+  "start_url": "https://sesivo.app/",
+  "scope": "https://sesivo.app/",
+  "display": "browser",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff"
+}

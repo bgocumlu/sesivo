@@ -1,0 +1,14 @@
+# sesivo
+
+> Blank canvas project website for sesivo.
+
+## Pages
+
+- [Home](https://sesivo.app/)
+- [Docs](https://sesivo.app/docs.html)
+- [GitHub repository](https://github.com/bgocumlu/sesivo)
+
+## Notes
+
+- This is a placeholder site scaffold.
+- Use the GitHub repository for the latest source code and project details.

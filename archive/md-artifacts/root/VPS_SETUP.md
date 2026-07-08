@@ -17,8 +17,10 @@ set VPS_HOST=your.vps.ip.or.dns
 set VPS_SSH_PORT=2222
 set LOCAL_KEY=%USERPROFILE%\.ssh\jam_vps_ed25519
 set SERVER_ID=istanbul-test
-set JOIN_SECRET=replace-with-a-long-random-secret
 ```
+
+Do not set a join secret for this runbook. The server will generate an
+ephemeral join secret at startup when `--join-secret` is omitted.
 
 Also choose a strong Linux password for the `jam` user. This password is for `sudo` on the VPS, not for SSH login.
 
@@ -155,7 +157,7 @@ Option A: clone from git on the VPS as `jam`:
 
 ```bash
 cd /home/jam
-git clone https://github.com/MiamiMetro/jam.git jam
+git clone https://github.com/bgocumlu/sesivo.git jam
 cd /home/jam/jam
 ```
 
@@ -179,7 +181,7 @@ cmake --build build --target server
 Verify the binary exists:
 
 ```bash
-ls -lh /home/jam/jam/build/server
+ls -lh /home/jam/jam/build/sesivo-server
 ```
 
 ## 5. Create the systemd service
@@ -188,13 +190,11 @@ Run on the VPS as `jam` or root:
 
 ```bash
 export SERVER_ID="istanbul-test"
-export JOIN_SECRET="replace-with-a-long-random-secret"
 
 sudo install -d -m 750 -o jam -g jam /etc/jam
 
 sudo tee /etc/jam/server.env >/dev/null <<EOF
 SERVER_ID=${SERVER_ID}
-JOIN_SECRET=${JOIN_SECRET}
 EOF
 
 sudo chown root:jam /etc/jam/server.env
@@ -212,7 +212,7 @@ User=jam
 Group=jam
 WorkingDirectory=/home/jam/jam
 EnvironmentFile=/etc/jam/server.env
-ExecStart=/home/jam/jam/build/server --port 9999 --server-id ${SERVER_ID} --join-secret ${JOIN_SECRET}
+ExecStart=/home/jam/jam/build/sesivo-server --port 9999 --server-id ${SERVER_ID}
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true
@@ -239,18 +239,19 @@ journalctl -u jam-server -f
 Expected log line:
 
 ```text
-Starting SFU server on 0.0.0.0:9999
+No --join-secret supplied; generated ephemeral join secret for this server process
 ```
 
-## 6. Generate friend join commands
+## 6. Invite friends
 
-Run locally from this project folder. Use the VPS public IP/DNS and the same `SERVER_ID` / `JOIN_SECRET` used in `/etc/jam/server.env`:
+Do not use `tools\dev-join-token.mjs` for this setup. That tool mints tokens
+from a shared join secret, and this VPS service intentionally does not expose
+one.
 
-```bat
-node tools\dev-join-token.mjs --secret "%JOIN_SECRET%" --server-id "%SERVER_ID%" --server "%VPS_HOST%" --port 9999 --room room1 --user friend1 --display-name Friend1
-```
-
-Share only the generated client command with that friend.
+Share the VPS host, UDP port, and room details instead. Clients should create or
+join rooms through the current app flow so the server issues short-lived join
+tickets internally. Restarting the server rotates the ephemeral secret and
+invalidates outstanding tickets.
 
 ## 7. Update after code changes
 
@@ -387,103 +388,21 @@ ssh -t -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "cd /home/jam/jam && gi
 
 The commands with `sudo` use `-t` because they may need the `jam` password.
 
-Verify the deployed production-auth UDP path from your Windows machine:
+Verify the deployed path with normal clients using the room browser flow. The
+old command-line probes that accepted `--join-secret` are not valid for this
+setup because the secret is generated inside the server process and is never
+printed or stored. If command-line probes are needed later, add a probe that
+requests a server-issued room ticket instead of minting a token from a shared
+secret.
+
+When testing, compare the client behavior with recent server logs:
 
 ```bat
-cmake --build build --config Release --target latency_probe
-build\Release\latency_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room room1 --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
+ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "journalctl -u jam-server -n 120 --no-pager"
 ```
 
-Then run the same check with malformed public-UDP noise mixed in:
-
-```bat
-build\Release\latency_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room room1 --codec opus --frames 240 --jitter 6 --seconds 20 --invalid-flood-packets 2000 --require-clean
-```
-
-This probe creates two short-lived performer clients with valid join tokens and
-sends sequenced Opus through the public VPS. A healthy run should show
-`received_packets` equal to `sent_packets`, `decoded_packets` equal to
-`sent_packets`, `missing_packets: 0`, `undecoded_packets: 0`,
-`decode_failures: 0`, `decoded_size_mismatches: 0`, `non_finite_samples: 0`,
-`underruns: 0`, and `plc_frames: 0`. With `--require-clean`, the command exits
-nonzero if any of those checks fail. The malformed-packet flood checks that
-random public UDP noise does not corrupt the server receive loop. If either
-probe fails while server/client logs show `seq_recovered`, the remaining
-problem is real packet loss/backlog rather than reordering.
-
-If the Windows-to-VPS probe is intermittent, split the path before changing
-server/client code again:
-
-1. Run the probe on the VPS against loopback. This proves the deployed server
-   binary and Linux UDP socket path:
-
-   ```bash
-   cd /home/jam/jam
-   set -a
-   . /etc/jam/server.env
-   set +a
-   cmake --build build --target latency_probe
-   ./build/latency_probe --server 127.0.0.1 --port 9999 --server-id "$SERVER_ID" --join-secret "$JOIN_SECRET" --room vps-loopback --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
-   ```
-
-2. Run the probe on the VPS against its own public IP. This proves provider
-   public-IP routing/firewall without your home ISP/router:
-
-   ```bash
-   VPS_HOST=your.vps.ip.or.dns
-   ./build/latency_probe --server "$VPS_HOST" --port 9999 --server-id "$SERVER_ID" --join-secret "$JOIN_SECRET" --room vps-public-self --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
-   ```
-
-3. Run the Windows public probe and compare it with the server log:
-
-   ```bat
-   build\Release\latency_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room room1 --codec opus --frames 240 --jitter 6 --seconds 20 --require-clean
-   ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "journalctl -u jam-server -n 80 --no-pager"
-   ```
-
-4. Run the single-endpoint UDP path probe. This avoids the two-local-client
-   relay shape and tests one joined UDP socket with audio-rate PING round trips
-   while sending normal `ALIVE` keepalives:
-
-   ```bat
-   cmake --build build --config Release --target udp_path_probe
-   build\Release\udp_path_probe.exe --server %VPS_HOST% --port 9999 --server-id "%SERVER_ID%" --join-secret "%JOIN_SECRET%" --room path-probe --seconds 20 --rate-pps 200 --payload-bytes 240 --require-clean
-   ssh -i "%LOCAL_KEY%" -p %VPS_SSH_PORT% jam@%VPS_HOST% "journalctl -u jam-server -n 120 --no-pager | grep 'Ping diag interval'"
-   ```
-
-5. Optional server binary smoke before restarting the service:
-
-   ```bash
-   ./build/server --redundancy-relay-smoke
-   ```
-
-   This starts an ephemeral local server in-process and verifies that a current
-   server relays `AURD` redundant audio to current clients while falling back to
-   plain V2 audio for legacy clients.
-
-Interpretation:
-
-- If `udp_path_probe` prints `joined: 0`, the JOIN/JOIN_ACK handshake itself
-  failed. Check `SERVER_ID`, `JOIN_SECRET`, firewall rules, and the server log
-  before interpreting packet-rate loss.
-- If VPS loopback and VPS public-self pass but Windows public fails, the server
-  code is not the failing component.
-- If Windows `raw_audio_packets` is far below `sent_packets` and the server log
-  also shows sender `seq_gap`, packets are being lost before they reach the VPS.
-- If the server log shows clean ingress/forward counts but Windows
-  `raw_audio_packets` is low, packets are being lost on the VPS-to-client return
-  path or at the client/router receive path.
-- If `raw_audio_packets == sent_packets` but `receiver_queue_drops > 0`, the
-  receiver queue is the bottleneck.
-- If `raw_audio_packets == sent_packets`, `receiver_queue_drops == 0`, but
-  `gap_plc_frames > 0`, the path delivered all packets but with reordering/jitter
-  beyond the configured jitter wait.
-- If `udp_path_probe` loses replies and the server `Ping diag interval` line
-  also shows `seq_gap`, packets are being lost before they reach the VPS.
-- If `udp_path_probe` loses replies but the server `Ping diag interval` line
-  shows `received` and `reply_queued` near the sent count with no `seq_gap`,
-  packets reached the VPS and were queued back out; the loss is on the
-  VPS-to-client return path or at the client/router receive path.
+If clients cannot join, check `SERVER_ID`, room/password input, firewall rules,
+and the server log before interpreting packet-rate loss.
 
 ## Audio redundancy
 
@@ -502,6 +421,7 @@ buffers.
 ## Notes
 
 - Do not use `--allow-insecure-dev-joins` on a public VPS.
-- Rotate `JOIN_SECRET` for each serious test session.
+- Restarting the server rotates the ephemeral join secret and invalidates
+  outstanding join tickets.
 - AWS, Hetzner, OVH, Vultr, and similar providers may also have provider-level firewalls. Open UDP `9999` there too.
 - If you change `VPS_SSH_PORT`, update both `/etc/ssh/sshd_config.d/99-jam.conf` and the VPS/provider firewall rules.

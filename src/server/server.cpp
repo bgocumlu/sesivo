@@ -37,6 +37,7 @@
 #include "protocol.h"
 #include "room_registry.h"
 #include "sequence_tracker.h"
+#include "server_options.h"
 #include "server_rate_limiter.h"
 #include "server_config.h"
 #include "server_metrics.h"
@@ -74,19 +75,6 @@ static const char* runtime_arch_name() {
     return "unknown";
 #endif
 }
-
-struct ServerOptions {
-    uint16_t    port = 9999;
-    bool        allow_insecure_dev_joins = false;
-    std::string server_id = "local-dev";
-    std::string join_secret;
-    std::string log_file_path;
-    size_t      log_max_bytes = logging::DEFAULT_ROTATING_LOG_MAX_BYTES;
-    size_t      log_max_files = logging::DEFAULT_ROTATING_LOG_MAX_FILES;
-    std::string metrics_jsonl_path;
-    bool        crash_reports_enabled = true;
-    std::string crash_report_dir = "crash_reports/server";
-};
 
 template <size_t N>
 std::string fixed_string(const Bytes<N>& bytes) {
@@ -2024,49 +2012,6 @@ private:
     PeriodicTimer alive_check_timer_;
 };
 
-size_t parse_positive_size_arg(const std::string& value, const char* option_name) {
-    try {
-        size_t consumed = 0;
-        const auto parsed = std::stoull(value, &consumed, 10);
-        if (consumed != value.size() || parsed == 0 ||
-            parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
-            throw std::invalid_argument("out of range");
-        }
-        return static_cast<size_t>(parsed);
-    } catch (const std::exception&) {
-        throw std::invalid_argument(std::string("Invalid ") + option_name + ": " + value);
-    }
-}
-
-ServerOptions parse_server_options(int argc, char** argv) {
-    ServerOptions options;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--port" && i + 1 < argc) {
-            options.port = parse_udp_port(argv[++i], "--port");
-        } else if (arg == "--server-id" && i + 1 < argc) {
-            options.server_id = argv[++i];
-        } else if (arg == "--join-secret" && i + 1 < argc) {
-            options.join_secret = argv[++i];
-        } else if (arg == "--log-file" && i + 1 < argc) {
-            options.log_file_path = argv[++i];
-        } else if (arg == "--log-max-bytes" && i + 1 < argc) {
-            options.log_max_bytes = parse_positive_size_arg(argv[++i], "--log-max-bytes");
-        } else if (arg == "--log-max-files" && i + 1 < argc) {
-            options.log_max_files = parse_positive_size_arg(argv[++i], "--log-max-files");
-        } else if (arg == "--metrics-jsonl" && i + 1 < argc) {
-            options.metrics_jsonl_path = argv[++i];
-        } else if (arg == "--crash-report-dir" && i + 1 < argc) {
-            options.crash_report_dir = argv[++i];
-        } else if (arg == "--disable-crash-reports") {
-            options.crash_reports_enabled = false;
-        } else if (arg == "--allow-insecure-dev-joins") {
-            options.allow_insecure_dev_joins = true;
-        }
-    }
-    return options;
-}
-
 int main(int argc, char** argv) {
     try {
         asio::io_context io_context;
@@ -2100,12 +2045,14 @@ int main(int argc, char** argv) {
             spdlog::info("Server metrics JSONL export: {}", options.metrics_jsonl_path);
         }
         spdlog::info("Forwarding audio packets between clients");
+        if (options.join_secret_ephemeral) {
+            spdlog::warn("No --join-secret supplied; generated ephemeral join secret "
+                         "for this server process");
+        } else {
+            spdlog::info("Join secret configured; distribute join tokens out-of-band");
+        }
         if (options.allow_insecure_dev_joins) {
             spdlog::warn("Insecure performer dev joins enabled");
-        } else if (!options.join_secret.empty()) {
-            spdlog::info("Join secret configured; distribute join tokens out-of-band");
-        } else if (options.join_secret.empty()) {
-            spdlog::warn("Join secret is not configured; JOIN packets will be rejected unless insecure dev joins are enabled");
         }
 
         Server server(io_context, options);

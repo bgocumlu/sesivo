@@ -11,7 +11,7 @@ namespace audio_backend {
 enum class Platform {
     windows,
     macos,
-    linux,
+    linux_os,
 };
 
 inline int rank_api_for_platform(Platform platform, const std::string& api_name) {
@@ -36,7 +36,7 @@ inline int rank_api_for_platform(Platform platform, const std::string& api_name)
             return 0;
         }
         return 100;
-    case Platform::linux:
+    case Platform::linux_os:
         if (api_name == "JACK") {
             return 0;
         }
@@ -55,7 +55,7 @@ inline int rank_api_for_platform(const std::string& api_name) {
 #elif defined(__APPLE__)
     return rank_api_for_platform(Platform::macos, api_name);
 #else
-    return rank_api_for_platform(Platform::linux, api_name);
+    return rank_api_for_platform(Platform::linux_os, api_name);
 #endif
 }
 
@@ -87,7 +87,7 @@ inline AudioDeviceId choose_default_input_device(const std::vector<AudioDeviceIn
 #elif defined(__APPLE__)
     return choose_default_input_device_for_platform(devices, Platform::macos);
 #else
-    return choose_default_input_device_for_platform(devices, Platform::linux);
+    return choose_default_input_device_for_platform(devices, Platform::linux_os);
 #endif
 }
 
@@ -119,7 +119,7 @@ inline AudioDeviceId choose_default_output_device(const std::vector<AudioDeviceI
 #elif defined(__APPLE__)
     return choose_default_output_device_for_platform(devices, Platform::macos);
 #else
-    return choose_default_output_device_for_platform(devices, Platform::linux);
+    return choose_default_output_device_for_platform(devices, Platform::linux_os);
 #endif
 }
 

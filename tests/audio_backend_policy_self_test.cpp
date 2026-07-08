@@ -94,11 +94,11 @@ int main() {
             "CoreAudio must be preferred on macOS");
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::macos, "ASIO") == 100,
             "non-CoreAudio APIs must be fallback-ranked on macOS");
-    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux, "JACK") == 0,
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux_os, "JACK") == 0,
             "JACK must be preferred on Linux");
-    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux, "ALSA") == 1,
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux_os, "ALSA") == 1,
             "ALSA must be second on Linux");
-    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux, "PulseAudio") == 100,
+    require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux_os, "PulseAudio") == 100,
             "other APIs must be fallback-ranked on Linux");
 
     std::vector<AudioDeviceInfo> windows_devices{

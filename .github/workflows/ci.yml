@@ -6,20 +6,48 @@ on:
   pull_request:
 
 jobs:
-  windows-release:
-    runs-on: windows-latest
+  release:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows Release
+            os: windows-latest
+          - name: Ubuntu Release
+            os: ubuntu-latest
+          - name: macOS Release
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Linux JUCE dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxcomposite-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            libxrender-dev
 
       - name: Cache FetchContent dependencies
         uses: actions/cache@v4
         with:
           path: build/_deps
-          key: deps-windows-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
 
       - name: Configure
-        run: cmake -B build -DJAM_BUILD_TESTS=ON
+        run: cmake -B build -DJAM_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release --parallel 8

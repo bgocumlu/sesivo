@@ -48,12 +48,13 @@ public:
     }
 
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters) - Parameters are semantically distinct
-    bool create(SampleRate sample_rate, Channels channels, opus_int32 application, Bitrate bitrate,
+    bool create(SampleRate sample_rate, Channels channels, Bitrate bitrate,
                 Complexity complexity) {
         destroy();  // Clean up any existing encoder
 
         int err;
-        encoder_ = opus_encoder_create(sample_rate, channels, application, &err);
+        encoder_ = opus_encoder_create(sample_rate, channels,
+                                       OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err);
         if (err != OPUS_OK) {
             spdlog::error("Failed to create Opus encoder: {}", opus_strerror(err));
             return false;
@@ -66,7 +67,6 @@ public:
         opus_encoder_ctl(encoder_, OPUS_SET_COMPLEXITY(complexity));
         opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(bitrate));
         opus_encoder_ctl(encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
-        opus_encoder_ctl(encoder_, OPUS_SET_APPLICATION(OPUS_APPLICATION_RESTRICTED_LOWDELAY));
         opus_encoder_ctl(encoder_, OPUS_SET_VBR(0));  // CBR-style pacing for jamming
         opus_encoder_ctl(encoder_, OPUS_SET_VBR_CONSTRAINT(1));
         opus_encoder_ctl(encoder_, OPUS_SET_INBAND_FEC(0));  // Avoid extra FEC delay/bit use

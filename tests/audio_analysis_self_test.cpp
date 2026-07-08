@@ -40,6 +40,35 @@ bool monitor_mixes_mono_input_to_mono_output() {
            expect_equal(output[1], -0.7F, "mono frame 1");
 }
 
+bool panned_stereo_mix_keeps_center_at_existing_level() {
+    const std::array<float, 2> input{0.25F, -0.5F};
+    std::array<float, 4> output{0.1F, 0.2F, 0.3F, 0.4F};
+
+    audio_analysis::mix_mono_to_stereo_panned(output.data(), input.data(), input.size(), 2,
+                                             0.5F, 0.5F);
+
+    return expect_equal(output[0], 0.225F, "center left frame 0") &&
+           expect_equal(output[1], 0.325F, "center right frame 0") &&
+           expect_equal(output[2], 0.05F, "center left frame 1") &&
+           expect_equal(output[3], 0.15F, "center right frame 1");
+}
+
+bool panned_stereo_mix_supports_hard_left_and_right() {
+    const std::array<float, 1> input{0.25F};
+    std::array<float, 2> left_output{0.1F, 0.2F};
+    std::array<float, 2> right_output{0.1F, 0.2F};
+
+    audio_analysis::mix_mono_to_stereo_panned(left_output.data(), input.data(), input.size(), 2,
+                                             2.0F, 0.0F);
+    audio_analysis::mix_mono_to_stereo_panned(right_output.data(), input.data(), input.size(), 2,
+                                             2.0F, 1.0F);
+
+    return expect_equal(left_output[0], 0.6F, "hard-left left channel") &&
+           expect_equal(left_output[1], 0.2F, "hard-left right channel") &&
+           expect_equal(right_output[0], 0.1F, "hard-right left channel") &&
+           expect_equal(right_output[1], 0.7F, "hard-right right channel");
+}
+
 bool normalization_target_keeps_single_source_at_unity() {
     return expect_equal(audio_analysis::mix_normalization_target_gain(0), 1.0F,
                         "zero source gain") &&
@@ -83,6 +112,12 @@ int main() {
         return 1;
     }
     if (!monitor_mixes_mono_input_to_mono_output()) {
+        return 1;
+    }
+    if (!panned_stereo_mix_keeps_center_at_existing_level()) {
+        return 1;
+    }
+    if (!panned_stereo_mix_supports_hard_left_and_right()) {
         return 1;
     }
     if (!normalization_target_keeps_single_source_at_unity()) {

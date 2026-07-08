@@ -441,7 +441,7 @@ public:
 
         // Initialize Opus encoder for sending own audio BEFORE starting stream
         // This prevents data race where callback might access encoder during initialization
-        if (!audio_encoder_.create(runtime_config.sample_rate, input_channels, OPUS_APPLICATION_VOIP,
+        if (!audio_encoder_.create(runtime_config.sample_rate, input_channels,
                                    runtime_config.bitrate, runtime_config.complexity)) {
             spdlog::error("Failed to create Opus encoder");
             return false;
@@ -2664,11 +2664,16 @@ private:
 
     static size_t mix_resampled_opus_pcm(ParticipantData& participant, float* output_buffer,
                                          unsigned long output_frames, size_t output_channels,
-                                         float gain, double ratio) {
+                                         float gain, float pan, double ratio) {
         if (output_frames == 0 || output_buffer == nullptr) {
             return 0;
         }
 
+        const bool panned = output_channels > 1 && !audio_analysis::is_center_pan(pan);
+        audio_analysis::StereoPanGains pan_gains{};
+        if (panned) {
+            pan_gains = audio_analysis::stereo_pan_gains(pan);
+        }
         const double start_phase = participant.opus_resample_phase;
         for (unsigned long i = 0; i < output_frames; ++i) {
             const double source_pos = start_phase + (static_cast<double>(i) * ratio);
@@ -2685,8 +2690,8 @@ private:
                 output_buffer[i] += sample;
             } else {
                 const size_t base = static_cast<size_t>(i) * output_channels;
-                output_buffer[base] += sample;
-                output_buffer[base + 1] += sample;
+                output_buffer[base] += sample * (panned ? pan_gains.left : 1.0F);
+                output_buffer[base + 1] += sample * (panned ? pan_gains.right : 1.0F);
             }
         }
 
@@ -2702,12 +2707,17 @@ private:
                                                    float* output_buffer,
                                                    unsigned long output_frames,
                                                    size_t output_channels, float gain,
-                                                   double ratio) {
+                                                   float pan, double ratio) {
         if (output_frames == 0 || output_buffer == nullptr ||
             participant.opus_pcm_buffered_frames == 0) {
             return 0;
         }
 
+        const bool panned = output_channels > 1 && !audio_analysis::is_center_pan(pan);
+        audio_analysis::StereoPanGains pan_gains{};
+        if (panned) {
+            pan_gains = audio_analysis::stereo_pan_gains(pan);
+        }
         const double start_phase = participant.opus_resample_phase;
         const size_t last_index = participant.opus_pcm_buffered_frames - 1;
         for (unsigned long i = 0; i < output_frames; ++i) {
@@ -2728,8 +2738,8 @@ private:
                 output_buffer[i] += sample;
             } else {
                 const size_t base = static_cast<size_t>(i) * output_channels;
-                output_buffer[base] += sample;
-                output_buffer[base + 1] += sample;
+                output_buffer[base] += sample * (panned ? pan_gains.left : 1.0F);
+                output_buffer[base + 1] += sample * (panned ? pan_gains.right : 1.0F);
             }
         }
 
@@ -4124,7 +4134,7 @@ private:
 
 #ifdef _WIN32
         // Boost thread priority on Windows for minimal audio latency
-        static bool priority_set = false;
+        thread_local bool priority_set = false;
         if (!priority_set) {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             priority_set = true;
@@ -4170,6 +4180,7 @@ private:
             }
 
             const float participant_gain = participant.gain.load(std::memory_order_relaxed);
+            const float participant_pan = participant.pan.load(std::memory_order_relaxed);
             double playout_ratio = opus_playout_rate_ratio(participant);
             if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::Opus &&
                 participant.opus_pcm_buffered_frames >=
@@ -4179,7 +4190,7 @@ private:
                     client->server_time_for_steady_time_ns_if_ready(playout_start);
                 const size_t consumed_frames = mix_resampled_opus_pcm(
                     participant, output_buffer, frame_count, out_channels,
-                    participant_gain, playout_ratio);
+                    participant_gain, participant_pan, playout_ratio);
                 observe_and_consume_opus_capture_chunks(participant, consumed_frames,
                                                         playout_server_time_ns);
                 observe_opus_pcm_depth(participant);
@@ -4402,7 +4413,7 @@ private:
                             client->server_time_for_steady_time_ns_if_ready(playout_start);
                         const size_t consumed_frames = mix_resampled_opus_pcm(
                             participant, output_buffer, frame_count, out_channels,
-                            participant_gain, playout_ratio);
+                            participant_gain, participant_pan, playout_ratio);
                         observe_and_consume_opus_capture_chunks(participant, consumed_frames,
                                                                 playout_server_time_ns);
                         observe_opus_pcm_depth(participant);
@@ -4415,7 +4426,7 @@ private:
                             client->server_time_for_steady_time_ns_if_ready(playout_start);
                         const size_t consumed_frames = mix_available_opus_pcm_with_tail(
                             participant, output_buffer, frame_count, out_channels,
-                            participant_gain, playout_ratio);
+                            participant_gain, participant_pan, playout_ratio);
                         observe_and_consume_opus_capture_chunks(participant, consumed_frames,
                                                                 playout_server_time_ns);
                         observe_opus_pcm_depth(participant);
@@ -4444,7 +4455,7 @@ private:
                             client->server_time_for_steady_time_ns_if_ready(playout_start);
                         const size_t consumed_frames = mix_available_opus_pcm_with_tail(
                             participant, output_buffer, frame_count, out_channels,
-                            participant_gain, playout_ratio);
+                            participant_gain, participant_pan, playout_ratio);
                         observe_and_consume_opus_capture_chunks(participant, consumed_frames,
                                                                 playout_server_time_ns);
                         observe_opus_pcm_depth(participant);
@@ -4462,7 +4473,7 @@ private:
                         client->server_time_for_steady_time_ns_if_ready(playout_start);
                     const size_t consumed_frames = mix_available_opus_pcm_with_tail(
                         participant, output_buffer, frame_count, out_channels, participant_gain,
-                        playout_ratio);
+                        participant_pan, playout_ratio);
                     observe_and_consume_opus_capture_chunks(participant, consumed_frames,
                                                             playout_server_time_ns);
                     observe_opus_pcm_depth(participant);
@@ -4487,10 +4498,9 @@ private:
                         audio_analysis::mix_with_gain(output_buffer, participant.pcm_buffer.data(),
                                                       plc_samples, participant_gain);
                     } else if (static_cast<size_t>(plc_samples) == frame_count) {
-                        // Mono PLC, stereo output - duplicate channel
-                        audio_analysis::mix_mono_to_stereo(
+                        audio_analysis::mix_mono_to_stereo_panned(
                             output_buffer, participant.pcm_buffer.data(), frame_count, out_channels,
-                            participant_gain);
+                            participant_gain, participant_pan);
                     }
                     participant.plc_count.fetch_add(1, std::memory_order_relaxed);
                     observe_auto_jitter_instability(participant);

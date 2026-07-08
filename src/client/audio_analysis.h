@@ -8,6 +8,11 @@
 // Audio analysis utilities
 namespace audio_analysis {
 
+struct StereoPanGains {
+    float left = 1.0F;
+    float right = 1.0F;
+};
+
 // Calculate RMS (Root Mean Square) audio level
 inline float calculate_rms(const float* samples, size_t count) {
     if (count == 0) {
@@ -58,6 +63,34 @@ inline void mix_mono_to_stereo(float* output, const float* input, size_t frame_c
         if (out_channels > 1) {
             output[(i * out_channels) + 1] += sample;  // Right
         }
+    }
+}
+
+inline bool is_center_pan(float pan) {
+    return std::fabs(std::clamp(pan, 0.0F, 1.0F) - 0.5F) <= 0.0001F;
+}
+
+inline StereoPanGains stereo_pan_gains(float pan) {
+    pan = std::clamp(pan, 0.0F, 1.0F);
+    if (pan < 0.5F) {
+        return {1.0F, pan * 2.0F};
+    }
+    return {(1.0F - pan) * 2.0F, 1.0F};
+}
+
+inline void mix_mono_to_stereo_panned(float* output, const float* input, size_t frame_count,
+                                      size_t out_channels, float gain, float pan) {
+    if (out_channels == 1 || is_center_pan(pan)) {
+        mix_mono_to_stereo(output, input, frame_count, out_channels, gain);
+        return;
+    }
+
+    const auto gains = stereo_pan_gains(pan);
+    for (size_t i = 0; i < frame_count; ++i) {
+        const float sample = input[i] * gain;
+        const size_t base = i * out_channels;
+        output[base] += sample * gains.left;
+        output[base + 1] += sample * gains.right;
     }
 }
 

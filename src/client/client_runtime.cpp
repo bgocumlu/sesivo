@@ -3345,7 +3345,7 @@ private:
 
             spdlog::info(
                 "Participant diag {}: ready={} q={} q_avg={} q_max={} q_drift={:.2f} "
-                "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} e2e_avg_ms={:.1f} e2e_max_ms={:.1f} drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/recovered/unresolved/late={}/{}/{}/{} "
+                "jitter_buffer={} queue_limit={} frames pkt/cb={}/{} decoded_frames={} decoded_packets={} age_avg_ms={:.1f} e2e_avg_ms={:.1f} e2e_max_ms={:.1f} e2e_samples={} drift_ppm last/avg/max={:.1f}/{:.1f}/{:.1f} underruns={} plc={} drops q/age={}/{} drop_detail limit/age/overflow={}/{}/{} seq gap/recovered/unresolved/late={}/{}/{}/{} "
                 "target_trim={} drop_rate opus/q/age={:.1f}/{:.1f}/{:.1f}/s",
                 p.id, p.buffer_ready, p.queue_size, p.queue_size_avg, p.queue_size_max,
                 p.queue_drift_packets, p.jitter_buffer_min_packets,
@@ -3354,9 +3354,10 @@ private:
                 p.opus_packets_decoded_in_callback, p.packet_age_avg_ms,
                 p.capture_to_playout_latency_avg_ms,
                 p.capture_to_playout_latency_max_ms,
+                p.capture_to_playout_latency_samples,
                 p.receiver_drift_ppm_last, p.receiver_drift_ppm_avg,
                 p.receiver_drift_ppm_abs_max,
-                p.underrun_count, p.jitter_depth_drops, p.jitter_age_drops,
+                p.underrun_count, p.plc_count, p.jitter_depth_drops, p.jitter_age_drops,
                 p.opus_queue_limit_drops,
                 p.opus_age_limit_drops, p.opus_decode_buffer_overflow_drops,
                 p.sequence_gaps, p.sequence_gap_recoveries, p.sequence_unresolved_gaps,

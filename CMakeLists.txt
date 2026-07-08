@@ -119,6 +119,8 @@ if(JAM_BUILD_TESTS)
 endif()
 
 if(JAM_BUILD_TESTS)
+    find_program(NODE_EXECUTABLE NAMES node node.exe)
+
     enable_testing()
 
     function(jam_add_executable_test target_name)
@@ -148,6 +150,15 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(audio_analysis_self_test)
     jam_add_executable_test(audio_backend_policy_self_test)
     jam_add_executable_test(juce_audio_adapter_self_test)
+
+    if(NODE_EXECUTABLE)
+        add_test(NAME latency_measurement_tool_self_test
+            COMMAND "${NODE_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/latency-measurement.mjs"
+                    self-test)
+    else()
+        message(WARNING "Node.js was not found; skipping latency measurement tool self-test")
+    endif()
 endif()
 
 include(cmake/packaging.cmake)

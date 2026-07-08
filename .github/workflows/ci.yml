@@ -19,10 +19,10 @@ jobs:
           key: deps-windows-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}
 
       - name: Configure
-        run: cmake -B build
+        run: cmake -B build -DJAM_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build --config Release --parallel 8
 
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error

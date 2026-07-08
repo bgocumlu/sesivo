@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.25)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
+# Windows release artifacts must run on machines without the Visual C++
+# Redistributable installed. Use /MT for release-like configs and /MTd for Debug.
+set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    CACHE STRING "Use the static MSVC runtime" FORCE
+)
+
 project(jam LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)

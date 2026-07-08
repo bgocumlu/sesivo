@@ -1,10 +1,26 @@
 {
-  "name": "sesivo",
-  "short_name": "sesivo",
-  "description": "sesivo project website.",
+  "name": "Sesivo",
+  "short_name": "Sesivo",
+  "description": "Sesivo is a low-latency audio collaboration app for musicians, creators, and live remote audio.",
   "start_url": "https://sesivo.app/",
   "scope": "https://sesivo.app/",
   "display": "browser",
   "background_color": "#ffffff",
-  "theme_color": "#ffffff"
+  "theme_color": "#ffffff",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "1024x1024",
+      "type": "image/svg+xml"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "assets/session.png",
+      "sizes": "1180x720",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "Sesivo room session"
+    }
+  ]
 }

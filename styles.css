@@ -1,0 +1,8 @@
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+.app-screenshot {
+  width: min(720px, 100%);
+}

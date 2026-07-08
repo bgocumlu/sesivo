@@ -3,27 +3,44 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>sesivo</title>
-    <meta name="description" content="sesivo project website.">
+    <title>Sesivo - Low-Latency Audio Collaboration App</title>
+    <meta name="description" content="Sesivo is a low-latency audio collaboration app for musicians, creators, and live remote audio.">
     <meta name="robots" content="index, follow, max-image-preview:large">
     <link rel="canonical" href="https://sesivo.app/">
     <link rel="sitemap" type="application/xml" href="https://sesivo.app/sitemap.xml">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="manifest" href="site.webmanifest">
+    <link rel="stylesheet" href="styles.css">
+    <meta property="og:image" content="https://sesivo.app/assets/session.png">
     <meta property="og:type" content="website">
-    <meta property="og:site_name" content="sesivo">
-    <meta property="og:title" content="sesivo">
-    <meta property="og:description" content="sesivo project website.">
+    <meta property="og:site_name" content="Sesivo">
+    <meta property="og:title" content="Sesivo - Low-Latency Audio Collaboration App">
+    <meta property="og:description" content="Sesivo is a low-latency audio collaboration app for musicians, creators, and live remote audio.">
     <meta property="og:url" content="https://sesivo.app/">
-    <meta name="twitter:card" content="summary">
-    <meta name="twitter:title" content="sesivo">
-    <meta name="twitter:description" content="sesivo project website.">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Sesivo - Low-Latency Audio Collaboration App">
+    <meta name="twitter:description" content="Sesivo is a low-latency audio collaboration app for musicians, creators, and live remote audio.">
+    <meta name="twitter:image" content="https://sesivo.app/assets/session.png">
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
-        "@type": "WebSite",
-        "name": "sesivo",
-        "url": "https://sesivo.app/",
-        "description": "sesivo project website."
+        "@graph": [
+          {
+            "@type": "WebSite",
+            "name": "Sesivo",
+            "url": "https://sesivo.app/",
+            "description": "Sesivo is a low-latency audio collaboration app for musicians, creators, and live remote audio."
+          },
+          {
+            "@type": "SoftwareApplication",
+            "name": "Sesivo",
+            "applicationCategory": "MultimediaApplication",
+            "operatingSystem": "macOS, Windows",
+            "downloadUrl": "https://sesivo.app/downloads.html",
+            "screenshot": "https://sesivo.app/assets/session.png",
+            "description": "Low-latency audio collaboration app for musicians, creators, and live remote audio."
+          }
+        ]
       }
     </script>
   </head>
@@ -31,12 +48,16 @@
     <header>
       <nav>
         <a href="./">Home</a>
+        <a href="downloads.html">Download</a>
         <a href="docs.html">Docs</a>
       </nav>
     </header>
     <main>
-      <h1>sesivo</h1>
-      <p>Blank canvas home page.</p>
+      <h1>Sesivo</h1>
+      <p>Low-latency audio collaboration for musicians, creators, and live remote audio.</p>
+      <p><a href="downloads.html">Download Sesivo</a></p>
+      <p><a href="docs.html">Read the docs</a></p>
+      <img class="app-screenshot" src="assets/session.png" alt="Sesivo app room view." width="720" height="439">
     </main>
   </body>
 </html>

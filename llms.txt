@@ -1,14 +1,19 @@
-# sesivo
+# Sesivo
 
-> Blank canvas project website for sesivo.
+> Sesivo is a low-latency audio collaboration app for musicians, creators, and live remote audio.
 
 ## Pages
 
 - [Home](https://sesivo.app/)
+- [Downloads](https://sesivo.app/downloads.html)
 - [Docs](https://sesivo.app/docs.html)
+- [Static API example](https://sesivo.app/api/example.json)
+- [Latest downloads](https://github.com/bgocumlu/sesivo/releases/latest)
 - [GitHub repository](https://github.com/bgocumlu/sesivo)
 
 ## Notes
 
-- This is a placeholder site scaffold.
+- The downloads page provides the latest macOS and Windows app downloads.
+- Current direct downloads are `sesivo-0.1.0-macos-arm64.dmg` and `sesivo-0.1.0-windows-x64-portable.zip`.
+- The homepage uses `assets/session.png` as the current app screenshot.
 - Use the GitHub repository for the latest source code and project details.

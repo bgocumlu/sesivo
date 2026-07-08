@@ -215,7 +215,8 @@ void draw_toolbar_button(juce::Graphics& g, juce::Rectangle<int> bounds,
                          const juce::String& label, Icon icon) {
     fill_button(g, bounds);
     const auto label_font = font(14.0f);
-    const int label_width = label_font.getStringWidth(label);
+    const int label_width =
+        juce::GlyphArrangement::getStringWidthInt(label_font, label);
     constexpr int icon_size = 22;
     constexpr int gap = 7;
     const int group_width = icon_size + gap + label_width;

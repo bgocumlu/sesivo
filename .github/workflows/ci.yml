@@ -21,7 +21,7 @@ jobs:
           - name: macOS Release
             os: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux JUCE dependencies
         if: runner.os == 'Linux'
@@ -42,7 +42,7 @@ jobs:
             libxrender-dev
 
       - name: Cache FetchContent dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build/_deps
           key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}

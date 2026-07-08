@@ -54,6 +54,10 @@ if(JAM_BUILD_TESTS)
         ${JAM_CLIENT_DIR}/client_config_path.cpp
     )
     jam_add_project_includes(client_startup_self_test)
+    target_compile_definitions(client_startup_self_test PRIVATE
+        JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1
+        JUCE_USE_CURL=0
+    )
     target_link_libraries(client_startup_self_test PRIVATE asio concurrentqueue spdlog::spdlog opus juce::juce_core)
 
     jam_add_self_test(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)

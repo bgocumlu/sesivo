@@ -160,4 +160,6 @@ if (releaseExists) {
   ]);
 }
 
+run(gh, ["workflow", "run", "update-pages-downloads.yml", "--ref", "main"]);
+
 console.log(`Published ${artifacts.length} artifact(s) to ${tag}.`);

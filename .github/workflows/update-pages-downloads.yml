@@ -1,0 +1,165 @@
+name: Update Pages Downloads
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-pages-downloads:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Pages branch
+        uses: actions/checkout@v7
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Update download links
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const https = require("node:https");
+
+          const repo = process.env.GITHUB_REPOSITORY;
+          const eventPath = process.env.GITHUB_EVENT_PATH;
+          const token = process.env.GITHUB_TOKEN;
+          const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
+          const releaseUrl = event.release?.url ?? `https://api.github.com/repos/${repo}/releases/latest`;
+
+          function getJson(url) {
+            return new Promise((resolve, reject) => {
+              const request = https.request(
+                url,
+                {
+                  headers: {
+                    Accept: "application/vnd.github+json",
+                    Authorization: `Bearer ${token}`,
+                    "User-Agent": "sesivo-pages-download-updater",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                  },
+                },
+                (response) => {
+                  let body = "";
+                  response.setEncoding("utf8");
+                  response.on("data", (chunk) => {
+                    body += chunk;
+                  });
+                  response.on("end", () => {
+                    if (response.statusCode < 200 || response.statusCode >= 300) {
+                      reject(new Error(`GitHub API ${response.statusCode}: ${body}`));
+                      return;
+                    }
+                    resolve(JSON.parse(body));
+                  });
+                },
+              );
+              request.on("error", reject);
+              request.end();
+            });
+          }
+
+          function findAsset(assets, patterns, platform) {
+            const asset = assets.find((candidate) =>
+              patterns.some((pattern) => pattern.test(candidate.name)),
+            );
+            if (!asset) {
+              console.log(`Could not find ${platform} asset in latest release`);
+            }
+            return asset;
+          }
+
+          function replaceDownloadLink(html, label, url) {
+            const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const pattern = new RegExp(
+              `<a href="[^"]*" rel="noreferrer">${escapedLabel}</a>`,
+              "g",
+            );
+            if (!pattern.test(html)) {
+              throw new Error(`Could not find download link: ${label}`);
+            }
+            return html.replace(
+              pattern,
+              `<a href="${url}" rel="noreferrer">${label}</a>`,
+            );
+          }
+
+          async function main() {
+            const release = await getJson(releaseUrl);
+            const assets = release.assets ?? [];
+            const macosAsset = findAsset(
+              assets,
+              [/macos.*\.dmg$/i, /mac.*\.dmg$/i, /darwin.*\.dmg$/i],
+              "macOS",
+            );
+            const windowsAsset = findAsset(
+              assets,
+              [/windows.*\.zip$/i, /win.*\.zip$/i, /windows.*\.exe$/i, /windows.*\.msi$/i],
+              "Windows",
+            );
+
+            if (!macosAsset || !windowsAsset) {
+              console.log("Skipping Pages update until both macOS and Windows assets are available.");
+              return;
+            }
+
+            let downloadsHtml = fs.readFileSync("downloads.html", "utf8");
+            downloadsHtml = replaceDownloadLink(
+              downloadsHtml,
+              "Download Sesivo for macOS",
+              macosAsset.browser_download_url,
+            );
+            downloadsHtml = replaceDownloadLink(
+              downloadsHtml,
+              "Download Sesivo for Windows",
+              windowsAsset.browser_download_url,
+            );
+            fs.writeFileSync("downloads.html", downloadsHtml);
+
+            if (fs.existsSync("llms.txt")) {
+              let llms = fs.readFileSync("llms.txt", "utf8");
+              const directDownloads =
+                `- Current direct downloads are \`${macosAsset.name}\` and \`${windowsAsset.name}\`.`;
+              llms = llms.replace(
+                /^- Current direct downloads are .*$/m,
+                directDownloads,
+              );
+              fs.writeFileSync("llms.txt", llms);
+            }
+
+            if (fs.existsSync("api/example.json")) {
+              const api = JSON.parse(fs.readFileSync("api/example.json", "utf8"));
+              api.version = String(release.tag_name ?? "").replace(/^v/i, "") || api.version;
+              api.updated = String(
+                release.published_at ?? release.created_at ?? new Date().toISOString(),
+              ).slice(0, 10);
+              api.downloads_macos = macosAsset.browser_download_url;
+              api.downloads_windows = windowsAsset.browser_download_url;
+              fs.writeFileSync("api/example.json", `${JSON.stringify(api, null, 2)}\n`);
+            }
+
+            console.log(`Updated downloads for ${release.tag_name}`);
+            console.log(`macOS: ${macosAsset.name}`);
+            console.log(`Windows: ${windowsAsset.name}`);
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Commit Pages updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloads.html llms.txt api/example.json
+          if git diff --cached --quiet; then
+            echo "Download links are already current."
+            exit 0
+          fi
+          git commit -m "Update Pages download links"
+          git push origin gh-pages

@@ -81,6 +81,11 @@ private:
     void start_or_stop_audio();
     void reset_audio_path();
     void commit_metronome_bpm();
+    void handle_record_button();
+    void request_recording_destination(const juce::File& recording_folder);
+    void save_recording_to_destination(const juce::File& recording_folder,
+                                       const juce::File& destination_root);
+    void show_recording_saved_tick();
     void load_wav_file();
     void load_wav_path(const juce::File& file);
     void refresh_room_admin_controls(const std::vector<ParticipantInfo>& participants);
@@ -147,7 +152,10 @@ private:
     std::thread room_admin_job_thread_;
     std::optional<RoomAdminResult> room_admin_job_result_;
     std::unique_ptr<juce::FileChooser> wav_file_chooser_;
+    std::unique_ptr<juce::FileChooser> recording_folder_chooser_;
     juce::File last_wav_file_;
+    bool recording_save_pending_ = false;
+    double recording_saved_until_ms_ = 0.0;
 
     std::vector<AudioStream::DeviceInfo> input_devices_;
     std::vector<AudioStream::DeviceInfo> output_devices_;
@@ -199,6 +207,7 @@ private:
     juce::TextButton metronome_start_stop_button_;
     juce::TextButton metronome_tap_button_;
     juce::TextButton record_button_;
+    juce::Label recording_saved_label_;
 
     juce::TextEditor wav_path_editor_;
     juce::TextButton wav_load_button_;

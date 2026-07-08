@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -193,6 +194,78 @@ void add_all(juce::Component& parent, std::initializer_list<juce::Component*> ch
     for (auto* child: children) {
         parent.addAndMakeVisible(child);
     }
+}
+
+std::filesystem::path unique_child_path(const std::filesystem::path& parent,
+                                        const std::filesystem::path& source) {
+    const auto base = source.filename().string();
+    std::filesystem::path candidate = parent / source.filename();
+    std::error_code ec;
+    if (!std::filesystem::exists(candidate, ec)) {
+        return candidate;
+    }
+
+    for (int suffix = 1; suffix < 1000; ++suffix) {
+        candidate = parent / (base + "_" + std::to_string(suffix));
+        ec.clear();
+        if (!std::filesystem::exists(candidate, ec)) {
+            return candidate;
+        }
+    }
+    return parent / (base + "_copy");
+}
+
+bool save_recording_folder(const juce::File& recording_folder,
+                           const juce::File& destination_root,
+                           juce::File& saved_folder,
+                           juce::String& error) {
+    const auto source = std::filesystem::path{
+        recording_folder.getFullPathName().toStdString()};
+    const auto parent = std::filesystem::path{
+        destination_root.getFullPathName().toStdString()};
+
+    std::error_code ec;
+    if (!std::filesystem::is_directory(source, ec)) {
+        error = "Recording folder is missing";
+        return false;
+    }
+    ec.clear();
+    if (!std::filesystem::is_directory(parent, ec)) {
+        error = "Choose an existing destination folder";
+        return false;
+    }
+
+    auto target = unique_child_path(parent, source);
+    ec.clear();
+    if (std::filesystem::equivalent(source, target, ec)) {
+        saved_folder = juce::File(target.string());
+        return true;
+    }
+
+    ec.clear();
+    std::filesystem::rename(source, target, ec);
+    if (ec) {
+        ec.clear();
+        std::filesystem::copy(source, target,
+                              std::filesystem::copy_options::recursive |
+                                  std::filesystem::copy_options::copy_symlinks,
+                              ec);
+        if (ec) {
+            error = "Could not copy recording";
+            return false;
+        }
+
+        ec.clear();
+        std::filesystem::remove_all(source, ec);
+        if (ec) {
+            error = "Saved copy, but could not remove temp recording";
+            saved_folder = juce::File(target.string());
+            return false;
+        }
+    }
+
+    saved_folder = juce::File(target.string());
+    return true;
 }
 
 template <size_t N>
@@ -792,6 +865,12 @@ void JuceMixerComponent::configure_controls() {
     room_admin_status_label_.setText(room_admin_status_, juce::dontSendNotification);
     juce_theme::style_label(room_admin_status_label_, juce_theme::colour::text_dim(),
                             12.0F);
+    recording_saved_label_.setText(juce::String(juce::CharPointer_UTF8("\xe2\x9c\x93")),
+                                   juce::dontSendNotification);
+    juce_theme::style_label(recording_saved_label_, juce_theme::colour::success(), 16.0F,
+                            true);
+    recording_saved_label_.setJustificationType(juce::Justification::centred);
+    recording_saved_label_.setVisible(false);
 
     leave_button_.setButtonText("Leave");
     mic_mute_button_.setButtonText("Mute mic");
@@ -836,9 +915,9 @@ void JuceMixerComponent::configure_controls() {
                     &mic_mute_button_, &monitor_toggle_,
                     &bpm_editor_,
                     &metronome_start_stop_button_, &metronome_tap_button_,
-                    &record_button_, &wav_path_editor_, &wav_load_button_,
-                    &wav_play_button_, &wav_position_slider_, &wav_gain_slider_,
-                    &wav_mute_toggle_});
+                    &record_button_, &recording_saved_label_, &wav_path_editor_,
+                    &wav_load_button_, &wav_play_button_, &wav_position_slider_,
+                    &wav_gain_slider_, &wav_mute_toggle_});
     add_all(network_content_, {&network_label_, &packet_label_, &jitter_label_, &queue_label_,
                                &age_limit_label_, &opus_packet_combo_, &jitter_ms_slider_,
                                &queue_limit_slider_, &age_limit_slider_,
@@ -910,13 +989,7 @@ void JuceMixerComponent::configure_controls() {
         }
     };
     metronome_tap_button_.onClick = [this]() { client_.tap_metronome_tempo(); };
-    record_button_.onClick = [this]() {
-        if (client_.get_recording_state().active) {
-            client_.stop_recording();
-        } else {
-            client_.start_recording();
-        }
-    };
+    record_button_.onClick = [this]() { handle_record_button(); };
     wav_load_button_.onClick = [this]() { load_wav_file(); };
     wav_play_button_.onClick = [this]() {
         if (client_.get_wav_state().is_playing) {
@@ -1106,7 +1179,10 @@ void JuceMixerComponent::resized() {
     metronome_tap_button_.setBounds(tools.removeFromTop(ROW).reduced(2));
     tools.removeFromTop(12);
     set_title(recording_label_, tools);
-    record_button_.setBounds(tools.removeFromTop(ROW).removeFromLeft(86).reduced(2));
+    auto record_row = tools.removeFromTop(ROW);
+    record_button_.setBounds(record_row.removeFromLeft(86).reduced(2));
+    record_row.removeFromLeft(control_gap);
+    recording_saved_label_.setBounds(record_row.removeFromLeft(24).reduced(2));
 
     auto wav = dock.wav.reduced(12, 10);
     set_title(wav_label_, wav);
@@ -1245,6 +1321,7 @@ void JuceMixerComponent::refresh_live_state() {
     const auto metronome = client_.get_metronome_state();
     const auto recording = client_.get_recording_state();
     const auto wav = client_.get_wav_state();
+    const double now_ms = juce::Time::getMillisecondCounterHiRes();
 
     status_bar_.refresh(client_, startup_options_, connection_status_);
 
@@ -1269,7 +1346,10 @@ void JuceMixerComponent::refresh_live_state() {
         bpm_editor_.setText(juce::String(metronome.bpm, 1), false);
     }
     metronome_start_stop_button_.setButtonText(metronome.running ? "Stop" : "Start");
-    record_button_.setButtonText(recording.active ? "Stop" : "Record");
+    record_button_.setButtonText(recording_save_pending_ ? "Saving"
+                                                         : (recording.active ? "Stop" : "Record"));
+    record_button_.setEnabled(!recording_save_pending_);
+    recording_saved_label_.setVisible(recording_saved_until_ms_ > now_ms);
     wav_play_button_.setButtonText(wav.is_playing ? "Pause" : "Play");
     wav_play_button_.setEnabled(wav.is_loaded);
     wav_position_slider_.setEnabled(wav.is_loaded);
@@ -1316,7 +1396,6 @@ void JuceMixerComponent::refresh_live_state() {
 
     updating_from_client_ = false;
 
-    const double now_ms = juce::Time::getMillisecondCounterHiRes();
     if (now_ms - last_participant_refresh_ms_ > 30.0) {
         last_participant_refresh_ms_ = now_ms;
         refresh_room_admin_controls(client_.get_participant_info());
@@ -1757,6 +1836,90 @@ void JuceMixerComponent::reset_audio_path() {
 void JuceMixerComponent::commit_metronome_bpm() {
     const float bpm = std::max(1.0F, bpm_editor_.getText().getFloatValue());
     client_.commit_metronome_bpm(bpm);
+}
+
+void JuceMixerComponent::handle_record_button() {
+    if (recording_save_pending_) {
+        return;
+    }
+
+    const auto recording = client_.get_recording_state();
+    if (recording.active) {
+        const juce::File recording_folder(recording.folder);
+        client_.stop_recording();
+        if (recording_folder.isDirectory()) {
+            request_recording_destination(recording_folder);
+        } else {
+            set_device_status("Recording stopped");
+        }
+        return;
+    }
+
+    recording_saved_until_ms_ = 0.0;
+    recording_saved_label_.setVisible(false);
+    if (client_.start_recording()) {
+        set_device_status("Recording started");
+    } else {
+        set_device_status("Recording failed");
+    }
+}
+
+void JuceMixerComponent::request_recording_destination(const juce::File& recording_folder) {
+    if (!recording_folder.isDirectory()) {
+        set_device_status("Recording folder is missing");
+        return;
+    }
+
+    recording_save_pending_ = true;
+    recording_saved_until_ms_ = 0.0;
+    recording_saved_label_.setVisible(false);
+    record_button_.setButtonText("Saving");
+    record_button_.setEnabled(false);
+    set_device_status("Choose where to save recording...");
+
+    const auto start_location = juce::File::getSpecialLocation(juce::File::userMusicDirectory);
+    recording_folder_chooser_ =
+        std::make_unique<juce::FileChooser>("Save recording to folder", start_location);
+    recording_folder_chooser_->launchAsync(
+        juce::FileBrowserComponent::openMode |
+            juce::FileBrowserComponent::canSelectDirectories,
+        [safe_this = juce::Component::SafePointer<JuceMixerComponent>(this),
+         recording_folder](const juce::FileChooser& chooser) {
+            if (auto* self = safe_this.getComponent()) {
+                const auto destination = chooser.getResult();
+                if (destination.isDirectory()) {
+                    self->save_recording_to_destination(recording_folder, destination);
+                } else {
+                    self->recording_save_pending_ = false;
+                    self->record_button_.setEnabled(true);
+                    self->set_device_status("Recording kept: " +
+                                            recording_folder.getFullPathName());
+                }
+            }
+        });
+}
+
+void JuceMixerComponent::save_recording_to_destination(
+    const juce::File& recording_folder,
+    const juce::File& destination_root) {
+    juce::File saved_folder;
+    juce::String error;
+    const bool saved =
+        save_recording_folder(recording_folder, destination_root, saved_folder, error);
+
+    recording_save_pending_ = false;
+    record_button_.setEnabled(true);
+    if (saved) {
+        set_device_status("Saved recording: " + saved_folder.getFullPathName());
+        show_recording_saved_tick();
+    } else {
+        set_device_status(error.isNotEmpty() ? error : "Could not save recording");
+    }
+}
+
+void JuceMixerComponent::show_recording_saved_tick() {
+    recording_saved_until_ms_ = juce::Time::getMillisecondCounterHiRes() + 2000.0;
+    recording_saved_label_.setVisible(true);
 }
 
 void JuceMixerComponent::load_wav_file() {

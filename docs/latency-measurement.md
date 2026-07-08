@@ -67,14 +67,31 @@ node tools/latency-measurement.mjs diagnostics `
 For a real 60 minute drift soak, run the clients for 60 minutes first, then add
 a minimum sample count and drift budget when checking the captured log:
 
+On Windows, start the server and two clients with Release binaries:
+
 ```powershell
+.\tools\start-latency-soak.ps1
+```
+
+The helper writes logs under `validation_logs/latency/`, prints `RUN_DIR=...`,
+and defaults to `dev-secret` / `dev-media-secret` for this local validation
+flow. It passes `--join-secret` explicitly, so this helper is unaffected if the
+server later supports auto-generating its own hidden join secret when no
+`--join-secret` is supplied. By default it runs for 3600 seconds, stops the
+server and clients, and runs the strict diagnostics check. Use `-Seconds 600`
+for a shorter debug run or `-Seconds 0` to start the processes without
+auto-stop. Shorter runs still use the strict 60 minute sample threshold and may
+fail diagnostics as expected.
+
+```powershell
+$run = "<RUN_DIR printed by tools\start-latency-soak.ps1>"
 node tools/latency-measurement.mjs diagnostics `
-  --log validation_logs/latency/soak/client-b.log `
+  --log "$run\client-b.log" `
   --assert `
   --min-e2e-samples 100000 `
   --max-drift-ppm-abs 5000 `
   --max-callback-over-deadline 0 `
-  --out validation_logs/latency/soak/report.json
+  --out "$run\soak-report.json"
 ```
 
 ## Impairment Matrix

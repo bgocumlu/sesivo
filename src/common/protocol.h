@@ -55,6 +55,9 @@ constexpr size_t MEDIA_SECRET_MAX_BYTES = 128;
 constexpr size_t E2E_PUBLIC_KEY_BYTES = 32;
 constexpr size_t E2E_SECRET_KEY_BYTES = 32;
 constexpr size_t E2E_KEY_ENVELOPE_MAX_BYTES = 256;
+constexpr size_t ROOM_CHAT_RETAINED_MESSAGES = 10;
+constexpr size_t ROOM_CHAT_PLAINTEXT_MAX_BYTES = 512;
+constexpr size_t ROOM_CHAT_CIPHERTEXT_MAX_BYTES = 1024;
 
 // Type aliases
 template <size_t N>
@@ -93,6 +96,11 @@ struct CtrlHdr : MsgHdr {
         ROOM_ADMIN_REQUEST = 17, // Change password, kick participant, close room
         ROOM_ADMIN_RESPONSE = 18,
         ROOM_REMOVED = 19, // Server tells this client it was removed from the room
+        ROOM_CHAT_SEND = 20, // Client submits one encrypted room chat message
+        ROOM_CHAT_EVENT = 21, // Server broadcasts one accepted room chat message
+        ROOM_CHAT_SEND_REJECTED = 22, // Server rejects a chat send
+        ROOM_CHAT_HISTORY_REQUEST = 23, // Client asks for retained chat tail
+        ROOM_CHAT_HISTORY_RESPONSE = 24, // Server returns one retained chat message or done
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
@@ -131,6 +139,8 @@ struct E2EKeyEnvelopeHdr : MsgHdr {
 
 struct E2EKeyEnvelopePayload {
     uint16_t media_secret_bytes = 0;
+    uint16_t reserved = 0;
+    uint32_t access_epoch = 0;
     Bytes<MEDIA_SECRET_MAX_BYTES> media_secret;
 };
 
@@ -194,6 +204,7 @@ struct MediaKeyRotationPayload {
     uint8_t  command = SECURE_CONTROL_ROTATE_MEDIA_KEY;
     uint8_t  reserved8 = 0;
     uint16_t media_secret_bytes = 0;
+    uint32_t access_epoch = 0;
     Bytes<MEDIA_SECRET_MAX_BYTES> media_secret;
 };
 
@@ -230,6 +241,8 @@ constexpr uint8_t ROOM_ADMIN_KICK_PARTICIPANT = 2;
 constexpr uint8_t ROOM_ADMIN_CLOSE_ROOM = 3;
 constexpr uint8_t ROOM_ADMIN_ROTATE_MEDIA_KEY = 4;
 constexpr uint8_t ROOM_ADMIN_CHANGE_ACCESS = 5;
+constexpr uint8_t ROOM_CHAT_HISTORY_DONE = 1 << 0;
+constexpr uint8_t ROOM_CHAT_HISTORY_TRUNCATED = 1 << 1;
 constexpr size_t MAX_ROOM_STATUS_SUMMARIES = 8;
 
 struct RoomSummaryWire {
@@ -331,6 +344,63 @@ struct RoomAdminResponseHdr : CtrlHdr {
     uint32_t target_participant_id = 0;
     Bytes<64> room_id;
     Bytes<128> reason;
+};
+
+struct RoomChatSendHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint32_t access_epoch = 0;
+    uint16_t ciphertext_bytes = 0;
+    uint16_t reserved = 0;
+    Bytes<64> room_id;
+    Bytes<64> room_instance_id;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce;
+    Bytes<ROOM_CHAT_CIPHERTEXT_MAX_BYTES> ciphertext;
+};
+
+struct RoomChatEventHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint32_t access_epoch = 0;
+    uint64_t chat_sequence = 0;
+    int64_t server_time_ms = 0;
+    uint16_t ciphertext_bytes = 0;
+    uint16_t reserved = 0;
+    Bytes<64> room_id;
+    Bytes<64> room_instance_id;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce;
+    Bytes<ROOM_CHAT_CIPHERTEXT_MAX_BYTES> ciphertext;
+};
+
+struct RoomChatSendRejectedHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint8_t status = ROOM_STATUS_BAD_REQUEST;
+    uint8_t reserved8 = 0;
+    uint16_t reserved16 = 0;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce;
+    Bytes<128> reason;
+};
+
+struct RoomChatHistoryRequestHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint32_t access_epoch = 0;
+    uint64_t after_sequence = 0;
+    Bytes<64> room_id;
+    Bytes<64> room_instance_id;
+};
+
+struct RoomChatHistoryResponseHdr : CtrlHdr {
+    uint32_t request_id = 0;
+    uint8_t status = ROOM_STATUS_OK;
+    uint8_t flags = 0;
+    uint16_t reserved16 = 0;
+    uint32_t access_epoch = 0;
+    uint64_t chat_sequence = 0;
+    int64_t server_time_ms = 0;
+    uint16_t ciphertext_bytes = 0;
+    uint16_t reserved = 0;
+    Bytes<64> room_id;
+    Bytes<64> room_instance_id;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce;
+    Bytes<ROOM_CHAT_CIPHERTEXT_MAX_BYTES> ciphertext;
 };
 
 #pragma pack(pop)

@@ -54,12 +54,34 @@ struct ClientPathDiagnostics {
     uint32_t udp_rebind_count = 0;
 };
 
+struct ClientChatMessage {
+    uint64_t sequence = 0;
+    uint32_t sender_id = 0;
+    uint32_t access_epoch = 0;
+    int64_t server_time_ms = 0;
+    std::string sender_name;
+    std::string text;
+    bool local_sender = false;
+};
+
+struct ClientChatState {
+    std::vector<ClientChatMessage> messages;
+    size_t unread_count = 0;
+    bool dialog_open = false;
+    bool history_truncated = false;
+    bool available = false;
+    std::string status;
+    std::string retry_text;
+};
+
 class ClientAppFacade {
 public:
     using DeviceInfo = ClientDeviceInfo;
     using EncoderInfo = ClientEncoderInfo;
     using CallbackTimingInfo = ClientCallbackTimingInfo;
     using PathDiagnostics = ClientPathDiagnostics;
+    using ChatMessage = ClientChatMessage;
+    using ChatState = ClientChatState;
     using MetronomeState = ClientMetronomeState;
     using RecordingState = ClientRecordingState;
     using WavState = ClientWavState;
@@ -83,7 +105,8 @@ public:
                            const std::string& join_token,
                            const std::string& media_secret = {},
                            uint8_t access_mode = ROOM_ACCESS_OPEN) = 0;
-    virtual bool rotate_media_key(const std::string& media_secret) = 0;
+    virtual bool rotate_media_key(const std::string& media_secret,
+                                  uint32_t access_epoch) = 0;
     virtual bool has_media_key() const = 0;
     virtual std::string current_media_secret() const = 0;
     virtual void set_room_access_mode(uint8_t access_mode) = 0;
@@ -95,6 +118,10 @@ public:
     virtual unsigned short get_server_port() const = 0;
     virtual std::string get_room_id() const = 0;
     virtual std::vector<ParticipantInfo> get_participant_info() const = 0;
+    virtual ChatState get_chat_state() const = 0;
+    virtual void set_chat_dialog_open(bool open) = 0;
+    virtual bool send_chat_message(const std::string& text) = 0;
+    virtual void request_chat_history() = 0;
     virtual float get_own_audio_level() const = 0;
     virtual float get_own_audio_peak() const = 0;
     virtual double get_rtt_ms() const = 0;

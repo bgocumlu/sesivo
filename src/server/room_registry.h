@@ -3,6 +3,7 @@
 #include "performer_join_token.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +49,33 @@ struct AuthorizeResult {
     bool ok = false;
     std::string reason;
     RoomSnapshot room;
+};
+
+struct ChatMessage {
+    std::string room_id;
+    std::string room_instance_id;
+    uint32_t access_epoch = 0;
+    uint32_t sender_participant_id = 0;
+    uint64_t sequence = 0;
+    int64_t server_time_ms = 0;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce{};
+    uint16_t ciphertext_bytes = 0;
+    Bytes<ROOM_CHAT_CIPHERTEXT_MAX_BYTES> ciphertext{};
+};
+
+struct StoreChatResult {
+    bool ok = false;
+    uint8_t status = ROOM_STATUS_BAD_REQUEST;
+    std::string reason;
+    ChatMessage message;
+};
+
+struct ChatHistoryResult {
+    bool ok = false;
+    uint8_t status = ROOM_STATUS_BAD_REQUEST;
+    bool truncated = false;
+    std::string reason;
+    std::vector<ChatMessage> messages;
 };
 
 inline std::optional<std::string> sha256_hex(const std::string& value) {
@@ -281,6 +309,130 @@ public:
         return result;
     }
 
+    StoreChatResult store_chat_message(const std::string& room_id,
+                                       const std::string& room_instance_id,
+                                       uint32_t access_epoch,
+                                       uint32_t sender_participant_id,
+                                       const Bytes<SECURE_PACKET_NONCE_BYTES>& nonce,
+                                       const Bytes<ROOM_CHAT_CIPHERTEXT_MAX_BYTES>& ciphertext,
+                                       uint16_t ciphertext_bytes,
+                                       int64_t server_time_ms,
+                                       time_point now) {
+        StoreChatResult result;
+        auto it = rooms_.find(room_id);
+        if (it == rooms_.end()) {
+            result.status = ROOM_STATUS_FORBIDDEN;
+            result.reason = "room not found";
+            return result;
+        }
+        auto& room = it->second;
+        if (room.room_instance_id != room_instance_id) {
+            result.status = ROOM_STATUS_FORBIDDEN;
+            result.reason = "wrong room instance";
+            return result;
+        }
+        if (room.access_epoch != access_epoch) {
+            result.status = ROOM_STATUS_FORBIDDEN;
+            result.reason = "wrong room access epoch";
+            return result;
+        }
+        if (sender_participant_id == 0 || ciphertext_bytes == 0 ||
+            ciphertext_bytes > ROOM_CHAT_CIPHERTEXT_MAX_BYTES) {
+            result.status = ROOM_STATUS_BAD_REQUEST;
+            result.reason = "malformed chat message";
+            return result;
+        }
+        const bool nonce_empty = std::all_of(nonce.begin(), nonce.end(),
+                                            [](char value) { return value == 0; });
+        if (nonce_empty) {
+            result.status = ROOM_STATUS_BAD_REQUEST;
+            result.reason = "empty chat nonce";
+            return result;
+        }
+        const auto duplicate = std::find_if(
+            room.chat_messages.begin(), room.chat_messages.end(),
+            [&](const ChatMessage& message) {
+                return message.sender_participant_id == sender_participant_id &&
+                       message.access_epoch == access_epoch &&
+                       message.nonce == nonce;
+            });
+        if (duplicate != room.chat_messages.end()) {
+            result.status = ROOM_STATUS_CONFLICT;
+            result.reason = "duplicate chat nonce";
+            return result;
+        }
+
+        ChatMessage message;
+        message.room_id = room.room_id;
+        message.room_instance_id = room.room_instance_id;
+        message.access_epoch = access_epoch;
+        message.sender_participant_id = sender_participant_id;
+        message.sequence = room.next_chat_sequence++;
+        message.server_time_ms = server_time_ms;
+        message.nonce = nonce;
+        message.ciphertext_bytes = ciphertext_bytes;
+        message.ciphertext = ciphertext;
+        room.chat_messages.push_back(message);
+        if (room.chat_messages.size() > ROOM_CHAT_RETAINED_MESSAGES) {
+            room.chat_messages.erase(room.chat_messages.begin());
+        }
+        room.last_activity = now;
+
+        result.ok = true;
+        result.status = ROOM_STATUS_OK;
+        result.reason = "ok";
+        result.message = std::move(message);
+        return result;
+    }
+
+    ChatHistoryResult chat_history_since(const std::string& room_id,
+                                         const std::string& room_instance_id,
+                                         uint32_t access_epoch,
+                                         uint64_t after_sequence,
+                                         time_point now) {
+        ChatHistoryResult result;
+        auto it = rooms_.find(room_id);
+        if (it == rooms_.end()) {
+            result.status = ROOM_STATUS_FORBIDDEN;
+            result.reason = "room not found";
+            return result;
+        }
+        auto& room = it->second;
+        if (room.room_instance_id != room_instance_id) {
+            result.status = ROOM_STATUS_FORBIDDEN;
+            result.reason = "wrong room instance";
+            return result;
+        }
+        if (room.access_epoch != access_epoch) {
+            result.status = ROOM_STATUS_FORBIDDEN;
+            result.reason = "wrong room access epoch";
+            return result;
+        }
+
+        uint64_t oldest_retained_sequence = 0;
+        for (const auto& message: room.chat_messages) {
+            if (message.access_epoch != access_epoch) {
+                continue;
+            }
+            if (oldest_retained_sequence == 0 ||
+                message.sequence < oldest_retained_sequence) {
+                oldest_retained_sequence = message.sequence;
+            }
+            if (message.sequence > after_sequence) {
+                result.messages.push_back(message);
+            }
+        }
+        result.truncated =
+            oldest_retained_sequence != 0 &&
+            after_sequence + 1 < oldest_retained_sequence;
+        room.last_activity = now;
+
+        result.ok = true;
+        result.status = ROOM_STATUS_OK;
+        result.reason = "ok";
+        return result;
+    }
+
     void mark_joined(const std::string& room_id, time_point now) {
         auto it = rooms_.find(room_id);
         if (it == rooms_.end()) {
@@ -339,6 +491,8 @@ private:
         bool ever_joined = false;
         time_point created_at{};
         time_point last_activity{};
+        uint64_t next_chat_sequence = 1;
+        std::vector<ChatMessage> chat_messages;
     };
 
     static RoomSnapshot snapshot_for(const Room& room) {

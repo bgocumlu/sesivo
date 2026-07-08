@@ -18,9 +18,12 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -346,6 +349,36 @@ juce::String room_admin_status_text(uint8_t status, const std::string& reason) {
         default:
             return "Request failed";
     }
+}
+
+juce::String chat_time_label(int64_t server_time_ms) {
+    if (server_time_ms <= 0) {
+        return "--:--";
+    }
+    const std::time_t seconds = static_cast<std::time_t>(server_time_ms / 1000);
+    std::tm local_time{};
+#ifdef _WIN32
+    localtime_s(&local_time, &seconds);
+#else
+    localtime_r(&seconds, &local_time);
+#endif
+    std::ostringstream out;
+    out << std::setfill('0') << std::setw(2) << local_time.tm_hour << ":"
+        << std::setfill('0') << std::setw(2) << local_time.tm_min;
+    return juce::String(out.str());
+}
+
+juce::String chat_state_text(const ClientAppFacade::ChatState& state) {
+    if (state.messages.empty()) {
+        return "No messages";
+    }
+    juce::String text;
+    for (const auto& message: state.messages) {
+        text += "[" + chat_time_label(message.server_time_ms) + "] ";
+        text += juce::String(message.sender_name) + ": ";
+        text += juce::String(message.text) + "\n";
+    }
+    return text.trimEnd();
 }
 
 juce::String admin_participant_label(const ParticipantInfo& participant) {
@@ -725,6 +758,112 @@ private:
     std::vector<std::unique_ptr<ParticipantAdminRow>> participant_rows_;
 };
 
+class RoomChatDialog final : public juce::Component, private juce::Timer {
+public:
+    explicit RoomChatDialog(ClientAppFacade& client)
+        : client_(client) {
+        setSize(520, 360);
+        title_.setText("Chat", juce::dontSendNotification);
+        juce_theme::style_label(title_, juce_theme::colour::text(), 16.0F, true);
+        juce_theme::style_label(status_label_, juce_theme::colour::text_dim(), 12.0F);
+
+        juce_theme::style_editor(messages_, 13.0F);
+        messages_.setMultiLine(true);
+        messages_.setReadOnly(true);
+        messages_.setScrollbarsShown(true);
+        messages_.setCaretVisible(false);
+        messages_.setJustification(juce::Justification::topLeft);
+        messages_.setIndents(8, 8);
+
+        juce_theme::style_editor(composer_, 14.0F);
+        composer_.setMultiLine(false);
+        composer_.setReturnKeyStartsNewLine(false);
+        composer_.setTextToShowWhenEmpty("Message", juce_theme::colour::text_faint());
+        composer_.setInputRestrictions(static_cast<int>(ROOM_CHAT_PLAINTEXT_MAX_BYTES));
+        composer_.onReturnKey = [this]() { send_message(); };
+
+        send_button_.setButtonText("Send");
+        send_button_.onClick = [this]() { send_message(); };
+
+        addAndMakeVisible(title_);
+        addAndMakeVisible(messages_);
+        addAndMakeVisible(status_label_);
+        addAndMakeVisible(composer_);
+        addAndMakeVisible(send_button_);
+
+        client_.set_chat_dialog_open(true);
+        client_.request_chat_history();
+        refresh();
+        startTimerHz(4);
+    }
+
+    ~RoomChatDialog() override {
+        client_.set_chat_dialog_open(false);
+    }
+
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce_theme::colour::panel_bottom());
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(20, 16);
+        auto title_row = area.removeFromTop(24);
+        title_.setBounds(title_row);
+        area.removeFromTop(10);
+        auto composer_row = area.removeFromBottom(34);
+        send_button_.setBounds(composer_row.removeFromRight(86).reduced(2));
+        composer_row.removeFromRight(8);
+        composer_.setBounds(composer_row.reduced(2));
+        area.removeFromBottom(6);
+        status_label_.setBounds(area.removeFromBottom(22));
+        area.removeFromBottom(8);
+        messages_.setBounds(area);
+    }
+
+private:
+    void timerCallback() override {
+        refresh();
+    }
+
+    void refresh() {
+        const auto state = client_.get_chat_state();
+        const auto text = chat_state_text(state);
+        if (text != messages_.getText()) {
+            messages_.setText(text, false);
+            messages_.moveCaretToEnd();
+        }
+        send_button_.setEnabled(state.available);
+        status_label_.setText(state.status.empty()
+                                  ? (state.available
+                                         ? ""
+                                         : "Chat unavailable until the room key is present")
+                                  : juce::String(state.status),
+                              juce::dontSendNotification);
+        if (!state.retry_text.empty() && composer_.getText().isEmpty()) {
+            composer_.setText(juce::String(state.retry_text), false);
+        }
+    }
+
+    void send_message() {
+        const auto text = composer_.getText().trim();
+        if (text.isEmpty()) {
+            status_label_.setText("Message is empty", juce::dontSendNotification);
+            return;
+        }
+        if (client_.send_chat_message(text.toStdString())) {
+            composer_.clear();
+        }
+        refresh();
+    }
+
+    ClientAppFacade& client_;
+    juce::Label title_;
+    juce::TextEditor messages_;
+    juce::Label status_label_;
+    juce::TextEditor composer_;
+    juce::TextButton send_button_;
+};
+
 bool matches_api(const AudioStream::DeviceInfo& device, const std::string& api_name) {
     return api_name.empty() || api_name == "All" || device.api_name == api_name;
 }
@@ -854,7 +993,7 @@ void JuceMixerComponent::configure_controls() {
     configure_section(metronome_label_, "Metronome");
     configure_section(recording_label_, "Record");
     configure_section(wav_label_, "WAV");
-    configure_section(room_admin_label_, "Room Admin");
+    configure_section(room_admin_label_, "Room");
     configure_caption(packet_label_, "Packet");
     configure_caption(jitter_label_, "Jitter");
     configure_caption(queue_label_, "Queue");
@@ -904,6 +1043,7 @@ void JuceMixerComponent::configure_controls() {
     room_participants_button_.setButtonText("Participants");
     room_close_button_.setButtonText("Close room");
     room_copy_invite_button_.setButtonText("Copy invite");
+    room_chat_button_.setButtonText("Chat");
 
     add_all(*this, {&status_bar_, &leave_button_, &participants_component_,
                     &local_audio_label_, &network_viewport_,
@@ -911,7 +1051,7 @@ void JuceMixerComponent::configure_controls() {
                     &room_admin_label_, &room_admin_status_label_,
                     &wav_position_label_, &wav_gain_label_,
                     &room_settings_button_, &room_participants_button_,
-                    &room_close_button_, &room_copy_invite_button_,
+                    &room_close_button_, &room_copy_invite_button_, &room_chat_button_,
                     &mic_mute_button_, &monitor_toggle_,
                     &bpm_editor_,
                     &metronome_start_stop_button_, &metronome_tap_button_,
@@ -926,6 +1066,7 @@ void JuceMixerComponent::configure_controls() {
 
     leave_button_.onClick = [this]() { leave_room(); };
     room_settings_button_.onClick = [this]() { request_room_settings_dialog(); };
+    room_chat_button_.onClick = [this]() { request_room_chat_dialog(); };
     room_participants_button_.onClick = [this]() { request_participants_dialog(); };
     room_close_button_.onClick = [this]() { request_room_close(); };
     room_copy_invite_button_.onClick = [this]() { request_copy_invite(); };
@@ -1206,24 +1347,25 @@ void JuceMixerComponent::resized() {
     wav_gain_slider_.setBounds(wav_gain.reduced(2, 6));
 
     const bool admin_visible = has_room_admin();
-    for (auto* component: {static_cast<juce::Component*>(&room_admin_label_),
-                           static_cast<juce::Component*>(&room_admin_status_label_),
-                           static_cast<juce::Component*>(&room_settings_button_),
-                           static_cast<juce::Component*>(&room_participants_button_),
-                           static_cast<juce::Component*>(&room_close_button_),
-                           static_cast<juce::Component*>(&room_copy_invite_button_)}) {
-        component->setVisible(admin_visible);
-    }
+    room_admin_label_.setVisible(true);
+    room_copy_invite_button_.setVisible(true);
+    room_chat_button_.setVisible(true);
+    room_admin_status_label_.setVisible(admin_visible);
+    room_settings_button_.setVisible(admin_visible);
+    room_participants_button_.setVisible(admin_visible);
+    room_close_button_.setVisible(admin_visible);
 
     auto participants_area = area.reduced(12, 10);
-    if (admin_visible) {
-        auto admin_row = participants_area.removeFromTop(34);
-        participants_area.removeFromTop(10);
+    auto admin_row = participants_area.removeFromTop(34);
+    participants_area.removeFromTop(10);
 
-        room_admin_label_.setBounds(admin_row.removeFromLeft(96));
-        admin_row.removeFromLeft(control_gap);
-        room_copy_invite_button_.setBounds(admin_row.removeFromLeft(104).reduced(2));
-        admin_row.removeFromLeft(control_gap);
+    room_admin_label_.setBounds(admin_row.removeFromLeft(58));
+    admin_row.removeFromLeft(control_gap);
+    room_copy_invite_button_.setBounds(admin_row.removeFromLeft(104).reduced(2));
+    admin_row.removeFromLeft(control_gap);
+    room_chat_button_.setBounds(admin_row.removeFromLeft(88).reduced(2));
+    admin_row.removeFromLeft(control_gap);
+    if (admin_visible) {
         room_settings_button_.setBounds(admin_row.removeFromLeft(92).reduced(2));
         admin_row.removeFromLeft(control_gap);
         room_participants_button_.setBounds(admin_row.removeFromLeft(128).reduced(2));
@@ -1972,7 +2114,15 @@ void JuceMixerComponent::refresh_room_admin_controls(
             ? "Participants"
             : "Participants (" + juce::String(static_cast<int>(waiting.size())) + ")");
     room_participants_button_.setToggleState(!waiting.empty(), juce::dontSendNotification);
-    room_copy_invite_button_.setEnabled(admin);
+    room_copy_invite_button_.setEnabled(true);
+    const auto chat_state = client_.get_chat_state();
+    room_chat_button_.setEnabled(true);
+    room_chat_button_.setButtonText(
+        chat_state.unread_count == 0
+            ? "Chat"
+            : "Chat (" + juce::String(static_cast<int>(chat_state.unread_count)) + ")");
+    room_chat_button_.setToggleState(chat_state.unread_count != 0,
+                                     juce::dontSendNotification);
 }
 
 void JuceMixerComponent::request_room_settings_dialog() {
@@ -1991,6 +2141,19 @@ void JuceMixerComponent::request_room_settings_dialog() {
         });
     juce::DialogWindow::LaunchOptions options;
     options.dialogTitle = "Room Settings";
+    options.content.setOwned(content);
+    options.componentToCentreAround = this;
+    options.dialogBackgroundColour = juce_theme::colour::panel_bottom();
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = false;
+    options.resizable = false;
+    options.launchAsync();
+}
+
+void JuceMixerComponent::request_room_chat_dialog() {
+    auto* content = new RoomChatDialog(client_);
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "Chat";
     options.content.setOwned(content);
     options.componentToCentreAround = this;
     options.dialogBackgroundColour = juce_theme::colour::panel_bottom();
@@ -2105,11 +2268,6 @@ void JuceMixerComponent::request_room_close() {
 }
 
 void JuceMixerComponent::request_copy_invite() {
-    if (!has_room_admin()) {
-        set_room_admin_status("Only the room creator can copy invites");
-        return;
-    }
-
     juce::SystemClipboard::copyTextToClipboard(invite_text());
     set_room_admin_status("Invite copied");
 }
@@ -2218,7 +2376,7 @@ JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
         const auto current_secret = client_.current_media_secret();
         if (should_rotate_media_key && !current_secret.empty()) {
             const auto new_secret = make_media_secret();
-            if (client_.rotate_media_key(new_secret)) {
+            if (client_.rotate_media_key(new_secret, result.access_epoch)) {
                 result.media_key_rotated = true;
                 result.new_media_secret = new_secret;
                 if (command != ROOM_ADMIN_ROTATE_MEDIA_KEY) {

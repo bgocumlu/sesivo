@@ -1,17 +1,43 @@
 #include "client_join_session.h"
 
 #include "packet_builder.h"
+#include "performer_join_token.h"
 
 #include <utility>
+
+namespace {
+
+void apply_unverified_token_claims(PerformerJoinOptions& options) {
+    if (options.join_token.empty()) {
+        return;
+    }
+    std::string reason;
+    const auto parsed = performer_join_token::parse_unverified(options.join_token, reason);
+    if (!parsed.has_value()) {
+        return;
+    }
+    if (parsed->claims.room_id == options.room_id) {
+        options.room_instance_id = parsed->claims.room_instance_id;
+        options.access_epoch = parsed->claims.access_epoch;
+    }
+}
+
+}  // namespace
 
 ClientJoinSession::ClientJoinSession(
     PerformerJoinOptions options,
     std::chrono::steady_clock::duration retry_interval)
     : options_(std::move(options)),
-      state_(retry_interval) {}
+      state_(retry_interval) {
+    apply_unverified_token_claims(options_);
+}
 
 const std::string& ClientJoinSession::room_id() const {
     return options_.room_id;
+}
+
+const std::string& ClientJoinSession::room_instance_id() const {
+    return options_.room_instance_id;
 }
 
 const std::string& ClientJoinSession::user_id() const {
@@ -26,6 +52,10 @@ const std::string& ClientJoinSession::media_secret() const {
     return options_.media_secret;
 }
 
+uint32_t ClientJoinSession::access_epoch() const {
+    return options_.access_epoch;
+}
+
 bool ClientJoinSession::has_join_token() const {
     return !options_.join_token.empty();
 }
@@ -35,12 +65,17 @@ bool ClientJoinSession::has_media_secret() const {
 }
 
 void ClientJoinSession::configure(PerformerJoinOptions options) {
+    apply_unverified_token_claims(options);
     options_ = std::move(options);
     state_.reset();
 }
 
 void ClientJoinSession::set_media_secret(std::string media_secret) {
     options_.media_secret = std::move(media_secret);
+}
+
+void ClientJoinSession::set_access_epoch(uint32_t access_epoch) {
+    options_.access_epoch = access_epoch;
 }
 
 void ClientJoinSession::set_key_public(Bytes<E2E_PUBLIC_KEY_BYTES> key_public) {

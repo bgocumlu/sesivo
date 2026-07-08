@@ -77,6 +77,7 @@ using namespace std::chrono_literals;
 
 constexpr int OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS = 200;
 constexpr int OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE = 3;
+constexpr size_t CLIENT_CHAT_RETAINED_MESSAGES = 100;
 constexpr bool AUDIO_CALLBACK_NOTIFY_ENABLED = true;
 
 class Client {
@@ -93,7 +94,8 @@ public:
           ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
           join_retry_timer_(io_context, 1s, [this]() { join_retry_timer_callback(); }),
           alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
-          cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }) {
+          cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }),
+          chat_timer_(io_context, 500ms, [this]() { chat_timer_callback(); }) {
         initialize_e2e_keypair();
         std::error_code socket_error;
         const auto protocol =
@@ -158,6 +160,7 @@ public:
                 join_session_.configure(std::move(options));
                 participant_manager_.clear();
                 clear_access_request_state();
+                clear_chat_state();
                 start_connection_on_io_context(server_address, server_port);
                 started->set_value();
             } catch (...) {
@@ -277,11 +280,11 @@ public:
                                    std::memory_order_release);
     }
 
-    bool rotate_media_key(const std::string& media_secret) {
+    bool rotate_media_key(const std::string& media_secret, uint32_t access_epoch) {
         auto completed = std::make_shared<std::promise<bool>>();
         auto future = completed->get_future();
-        asio::post(io_context_, [this, media_secret, completed]() {
-            completed->set_value(rotate_media_key_on_io_context(media_secret));
+        asio::post(io_context_, [this, media_secret, access_epoch, completed]() {
+            completed->set_value(rotate_media_key_on_io_context(media_secret, access_epoch));
         });
         return future.get();
     }
@@ -345,6 +348,7 @@ public:
         join_session_.configure({});
         participant_manager_.clear();
         clear_access_request_state();
+        clear_chat_state();
         reset_session_security();
         reset_server_clock_and_ping_state();
         audio_path_interval_received_.store(0, std::memory_order_relaxed);
@@ -506,6 +510,49 @@ public:
 
     std::vector<ParticipantInfo> get_participant_info() const {
         return participant_manager_.get_all_info();
+    }
+
+    ClientChatState get_chat_state() const {
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        ClientChatState state;
+        state.messages = chat_messages_;
+        state.unread_count = chat_unread_count_;
+        state.dialog_open = chat_dialog_open_;
+        state.history_truncated = chat_history_truncated_;
+        state.available = chat_available_on_io_snapshot();
+        state.status = chat_status_;
+        state.retry_text = chat_retry_text_;
+        return state;
+    }
+
+    void set_chat_dialog_open(bool open) {
+        asio::post(io_context_, [this, open]() {
+            {
+                std::lock_guard<std::mutex> lock(chat_mutex_);
+                chat_dialog_open_ = open;
+                if (open) {
+                    chat_unread_count_ = 0;
+                }
+            }
+            if (open) {
+                request_chat_history_on_io(last_seen_chat_sequence_snapshot());
+            }
+        });
+    }
+
+    bool send_chat_message(const std::string& text) {
+        auto completed = std::make_shared<std::promise<bool>>();
+        auto future = completed->get_future();
+        asio::post(io_context_, [this, text, completed]() {
+            completed->set_value(send_chat_message_on_io(text));
+        });
+        return future.get();
+    }
+
+    void request_chat_history() {
+        asio::post(io_context_, [this]() {
+            request_chat_history_on_io(last_seen_chat_sequence_snapshot());
+        });
     }
 
     // Get own audio level (for displaying user's own microphone level)
@@ -1570,6 +1617,309 @@ private:
         pending_access_requests_.clear();
     }
 
+    struct PendingChatMessage {
+        Bytes<SECURE_PACKET_NONCE_BYTES> nonce{};
+        std::string text;
+        std::chrono::steady_clock::time_point sent_at{};
+        bool history_requested = false;
+    };
+
+    static std::string nonce_key(const Bytes<SECURE_PACKET_NONCE_BYTES>& nonce) {
+        return std::string(nonce.begin(), nonce.end());
+    }
+
+    void clear_chat_state() {
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        chat_messages_.clear();
+        pending_chat_messages_.clear();
+        last_seen_chat_sequence_ = 0;
+        chat_unread_count_ = 0;
+        chat_history_truncated_ = false;
+        chat_status_.clear();
+        chat_retry_text_.clear();
+    }
+
+    bool chat_available_on_io_snapshot() const {
+        return join_session_.is_join_confirmed() &&
+               join_session_.participant_id() != 0 &&
+               !join_session_.room_id().empty() &&
+               !join_session_.room_instance_id().empty() &&
+               join_session_.access_epoch() != 0 &&
+               join_session_.has_media_secret();
+    }
+
+    uint64_t last_seen_chat_sequence_snapshot() const {
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        return last_seen_chat_sequence_;
+    }
+
+    std::string chat_sender_name(uint32_t sender_id) const {
+        if (sender_id == join_session_.participant_id()) {
+            return "You";
+        }
+        for (const auto& participant: participant_manager_.get_all_info()) {
+            if (participant.id == sender_id) {
+                if (!participant.display_name.empty()) {
+                    return participant.display_name;
+                }
+                if (!participant.profile_id.empty()) {
+                    return participant.profile_id;
+                }
+            }
+        }
+        return "Participant " + std::to_string(sender_id);
+    }
+
+    std::optional<session_crypto::SessionKey> current_chat_key_on_io() const {
+        if (!chat_available_on_io_snapshot()) {
+            return std::nullopt;
+        }
+        return session_crypto::derive_chat_key_from_secret(
+            join_session_.room_id(), join_session_.room_instance_id(),
+            join_session_.media_secret());
+    }
+
+    bool send_chat_message_on_io(const std::string& text) {
+        if (text.empty() || text.size() > ROOM_CHAT_PLAINTEXT_MAX_BYTES) {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            chat_status_ = text.empty() ? "Message is empty" : "Message is too long";
+            return false;
+        }
+        const auto key = current_chat_key_on_io();
+        if (!key.has_value()) {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            chat_status_ = "Chat unavailable until the room key is present";
+            return false;
+        }
+
+        RoomChatSendHdr request{};
+        request.magic = CTRL_MAGIC;
+        request.type = CtrlHdr::Cmd::ROOM_CHAT_SEND;
+        request.participant_id = join_session_.participant_id();
+        request.request_id = chat_request_id_.fetch_add(1, std::memory_order_relaxed);
+        request.access_epoch = join_session_.access_epoch();
+        packet_builder::write_fixed(request.room_id, join_session_.room_id());
+        packet_builder::write_fixed(request.room_instance_id, join_session_.room_instance_id());
+        if (!session_crypto::make_chat_nonce(request.nonce)) {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            chat_status_ = "Could not create chat nonce";
+            return false;
+        }
+
+        session_crypto::ChatMetadata metadata;
+        metadata.room_id = join_session_.room_id();
+        metadata.room_instance_id = join_session_.room_instance_id();
+        metadata.sender_id = join_session_.participant_id();
+        metadata.access_epoch = join_session_.access_epoch();
+        metadata.nonce = request.nonce;
+
+        size_t ciphertext_bytes = 0;
+        if (!session_crypto::seal_chat_message(
+                *key, metadata, reinterpret_cast<const unsigned char*>(text.data()),
+                text.size(), reinterpret_cast<unsigned char*>(request.ciphertext.data()),
+                request.ciphertext.size(), ciphertext_bytes) ||
+            ciphertext_bytes == 0 ||
+            ciphertext_bytes > std::numeric_limits<uint16_t>::max()) {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            chat_status_ = "Could not encrypt chat message";
+            return false;
+        }
+        request.ciphertext_bytes = static_cast<uint16_t>(ciphertext_bytes);
+
+        {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            pending_chat_messages_[nonce_key(request.nonce)] =
+                PendingChatMessage{request.nonce, text, std::chrono::steady_clock::now(), false};
+            chat_status_ = "Sending...";
+            chat_retry_text_.clear();
+        }
+
+        auto packet = std::make_shared<std::vector<unsigned char>>(sizeof(request));
+        std::memcpy(packet->data(), &request, sizeof(request));
+        send(packet->data(), packet->size(), packet);
+        return true;
+    }
+
+    void request_chat_history_on_io(uint64_t after_sequence) {
+        if (!chat_available_on_io_snapshot()) {
+            return;
+        }
+        RoomChatHistoryRequestHdr request{};
+        request.magic = CTRL_MAGIC;
+        request.type = CtrlHdr::Cmd::ROOM_CHAT_HISTORY_REQUEST;
+        request.request_id = chat_request_id_.fetch_add(1, std::memory_order_relaxed);
+        request.access_epoch = join_session_.access_epoch();
+        request.after_sequence = after_sequence;
+        packet_builder::write_fixed(request.room_id, join_session_.room_id());
+        packet_builder::write_fixed(request.room_instance_id, join_session_.room_instance_id());
+        auto packet = std::make_shared<std::vector<unsigned char>>(sizeof(request));
+        std::memcpy(packet->data(), &request, sizeof(request));
+        send(packet->data(), packet->size(), packet);
+    }
+
+    void accept_chat_message(const RoomChatEventHdr& event, const std::string& plaintext) {
+        const bool local_sender = event.participant_id == join_session_.participant_id();
+        bool request_history = false;
+        uint64_t history_after = 0;
+        {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            const auto duplicate = std::find_if(
+                chat_messages_.begin(), chat_messages_.end(),
+                [&](const ClientChatMessage& message) {
+                    return message.sequence == event.chat_sequence;
+                });
+            if (duplicate != chat_messages_.end()) {
+                pending_chat_messages_.erase(nonce_key(event.nonce));
+                return;
+            }
+            if (event.chat_sequence > last_seen_chat_sequence_ + 1 &&
+                last_seen_chat_sequence_ != 0) {
+                request_history = true;
+                history_after = last_seen_chat_sequence_;
+            }
+            last_seen_chat_sequence_ =
+                std::max(last_seen_chat_sequence_, event.chat_sequence);
+
+            ClientChatMessage message;
+            message.sequence = event.chat_sequence;
+            message.sender_id = event.participant_id;
+            message.access_epoch = event.access_epoch;
+            message.server_time_ms = event.server_time_ms;
+            message.sender_name = chat_sender_name(event.participant_id);
+            message.text = plaintext;
+            message.local_sender = local_sender;
+            chat_messages_.push_back(std::move(message));
+            std::sort(chat_messages_.begin(), chat_messages_.end(),
+                      [](const auto& left, const auto& right) {
+                          return left.sequence < right.sequence;
+                      });
+            if (chat_messages_.size() > CLIENT_CHAT_RETAINED_MESSAGES) {
+                chat_messages_.erase(chat_messages_.begin(),
+                                     chat_messages_.begin() +
+                                         static_cast<std::ptrdiff_t>(
+                                             chat_messages_.size() -
+                                             CLIENT_CHAT_RETAINED_MESSAGES));
+            }
+            pending_chat_messages_.erase(nonce_key(event.nonce));
+            if (!chat_dialog_open_ && !local_sender) {
+                ++chat_unread_count_;
+            }
+            chat_status_.clear();
+        }
+        if (request_history) {
+            request_chat_history_on_io(history_after);
+        }
+    }
+
+    void handle_chat_event_message(std::size_t bytes, const char* recv_data) {
+        if (bytes < sizeof(RoomChatEventHdr)) {
+            return;
+        }
+        RoomChatEventHdr event{};
+        std::memcpy(&event, recv_data, sizeof(event));
+        if (event.ciphertext_bytes == 0 ||
+            event.ciphertext_bytes > ROOM_CHAT_CIPHERTEXT_MAX_BYTES ||
+            fixed_string(event.room_id) != join_session_.room_id() ||
+            fixed_string(event.room_instance_id) != join_session_.room_instance_id() ||
+            event.access_epoch != join_session_.access_epoch()) {
+            return;
+        }
+        const auto key = current_chat_key_on_io();
+        if (!key.has_value()) {
+            return;
+        }
+        session_crypto::ChatMetadata metadata;
+        metadata.room_id = fixed_string(event.room_id);
+        metadata.room_instance_id = fixed_string(event.room_instance_id);
+        metadata.sender_id = event.participant_id;
+        metadata.access_epoch = event.access_epoch;
+        metadata.nonce = event.nonce;
+        std::array<unsigned char, ROOM_CHAT_PLAINTEXT_MAX_BYTES> plaintext{};
+        size_t plaintext_bytes = 0;
+        if (!session_crypto::open_chat_message(
+                *key, metadata,
+                reinterpret_cast<const unsigned char*>(event.ciphertext.data()),
+                event.ciphertext_bytes, plaintext.data(), plaintext.size(),
+                plaintext_bytes)) {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            chat_status_ = "Could not decrypt a chat message";
+            return;
+        }
+        accept_chat_message(
+            event, std::string(reinterpret_cast<const char*>(plaintext.data()),
+                               plaintext_bytes));
+    }
+
+    void handle_chat_rejected_message(std::size_t bytes, const char* recv_data) {
+        if (bytes < sizeof(RoomChatSendRejectedHdr)) {
+            return;
+        }
+        RoomChatSendRejectedHdr rejected{};
+        std::memcpy(&rejected, recv_data, sizeof(rejected));
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        const auto it = pending_chat_messages_.find(nonce_key(rejected.nonce));
+        if (it != pending_chat_messages_.end()) {
+            chat_retry_text_ = it->second.text;
+            pending_chat_messages_.erase(it);
+        }
+        const auto reason = fixed_string(rejected.reason);
+        chat_status_ = reason.empty() ? "Message rejected" : reason;
+    }
+
+    void handle_chat_history_response_message(std::size_t bytes, const char* recv_data) {
+        if (bytes < sizeof(RoomChatHistoryResponseHdr)) {
+            return;
+        }
+        RoomChatHistoryResponseHdr response{};
+        std::memcpy(&response, recv_data, sizeof(response));
+        if (response.status != ROOM_STATUS_OK) {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            chat_status_ = "Chat history unavailable";
+            return;
+        }
+        if ((response.flags & ROOM_CHAT_HISTORY_TRUNCATED) != 0) {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            chat_history_truncated_ = true;
+            chat_status_ = "Earlier chat messages are no longer available.";
+        }
+        if ((response.flags & ROOM_CHAT_HISTORY_DONE) != 0) {
+            confirm_stale_chat_pending_after_history();
+            return;
+        }
+
+        RoomChatEventHdr event{};
+        event.magic = CTRL_MAGIC;
+        event.type = CtrlHdr::Cmd::ROOM_CHAT_EVENT;
+        event.participant_id = response.participant_id;
+        event.request_id = response.request_id;
+        event.access_epoch = response.access_epoch;
+        event.chat_sequence = response.chat_sequence;
+        event.server_time_ms = response.server_time_ms;
+        event.ciphertext_bytes = response.ciphertext_bytes;
+        event.room_id = response.room_id;
+        event.room_instance_id = response.room_instance_id;
+        event.nonce = response.nonce;
+        event.ciphertext = response.ciphertext;
+        handle_chat_event_message(sizeof(event), reinterpret_cast<const char*>(&event));
+    }
+
+    void confirm_stale_chat_pending_after_history() {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(chat_mutex_);
+        for (auto it = pending_chat_messages_.begin(); it != pending_chat_messages_.end();) {
+            if (it->second.history_requested &&
+                now - it->second.sent_at > std::chrono::seconds(2)) {
+                if (chat_retry_text_.empty()) {
+                    chat_retry_text_ = it->second.text;
+                }
+                chat_status_ = "Message not confirmed";
+                it = pending_chat_messages_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     void remove_pending_access_request(uint32_t participant_id) {
         std::lock_guard<std::mutex> lock(access_request_mutex_);
         pending_access_requests_.erase(participant_id);
@@ -1633,10 +1983,12 @@ private:
         }
 
         E2EKeyEnvelopePayload payload{};
+        payload.access_epoch = join_session_.access_epoch();
         payload.media_secret_bytes =
             static_cast<uint16_t>(std::min(media_secret.size(),
                                            payload.media_secret.size()));
-        if (payload.media_secret_bytes != media_secret.size()) {
+        if (payload.access_epoch == 0 ||
+            payload.media_secret_bytes != media_secret.size()) {
             return false;
         }
         std::copy_n(media_secret.begin(), media_secret.size(),
@@ -1697,22 +2049,29 @@ private:
         return true;
     }
 
-    void apply_media_secret_rotation(std::string media_secret) {
+    void apply_media_secret_rotation(std::string media_secret, uint32_t access_epoch) {
         join_session_.set_media_secret(std::move(media_secret));
+        if (access_epoch != 0) {
+            join_session_.set_access_epoch(access_epoch);
+        }
+        clear_chat_state();
         update_media_key_from_secret();
     }
 
-    bool rotate_media_key_on_io_context(const std::string& media_secret) {
+    bool rotate_media_key_on_io_context(const std::string& media_secret,
+                                        uint32_t access_epoch) {
         const auto key = current_session_key();
         if (media_secret.empty() || key == nullptr ||
             !join_session_.server_supports(AUDIO_CAP_SECURE_AUDIO) ||
             join_session_.participant_id() == 0 ||
+            access_epoch == 0 ||
             !outbound_enabled_.load(std::memory_order_acquire)) {
             return false;
         }
 
         MediaKeyRotationPayload payload{};
         payload.command = SECURE_CONTROL_ROTATE_MEDIA_KEY;
+        payload.access_epoch = access_epoch;
         payload.media_secret_bytes = static_cast<uint16_t>(
             std::min(media_secret.size(), payload.media_secret.size()));
         if (payload.media_secret_bytes == 0 ||
@@ -1740,7 +2099,7 @@ private:
         auto packet = std::make_shared<std::vector<unsigned char>>(
             sealed.begin(), sealed.begin() + static_cast<std::ptrdiff_t>(sealed_bytes));
         send(packet->data(), packet->size(), packet);
-        apply_media_secret_rotation(media_secret);
+        apply_media_secret_rotation(media_secret, access_epoch);
         spdlog::info("Rotated local E2E media key and sent encrypted room rotation");
         return true;
     }
@@ -3244,6 +3603,29 @@ private:
         }
     }
 
+    void chat_timer_callback() {
+        if (!chat_available_on_io_snapshot()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        bool request_history = false;
+        uint64_t after_sequence = 0;
+        {
+            std::lock_guard<std::mutex> lock(chat_mutex_);
+            for (auto& [_, pending]: pending_chat_messages_) {
+                if (!pending.history_requested &&
+                    now - pending.sent_at > std::chrono::seconds(2)) {
+                    pending.history_requested = true;
+                    request_history = true;
+                    after_sequence = last_seen_chat_sequence_;
+                }
+            }
+        }
+        if (request_history) {
+            request_chat_history_on_io(after_sequence);
+        }
+    }
+
     void log_audio_diagnostics() {
         struct DropRate {
             double opus_send_per_sec;
@@ -3497,6 +3879,18 @@ private:
                           sync.sequence, sync.effective_server_time_ns);
                 break;
             }
+            case CtrlHdr::Cmd::ROOM_CHAT_EVENT: {
+                handle_chat_event_message(bytes, recv_data);
+                break;
+            }
+            case CtrlHdr::Cmd::ROOM_CHAT_SEND_REJECTED: {
+                handle_chat_rejected_message(bytes, recv_data);
+                break;
+            }
+            case CtrlHdr::Cmd::ROOM_CHAT_HISTORY_RESPONSE: {
+                handle_chat_history_response_message(bytes, recv_data);
+                break;
+            }
             default:
                 // Other CTRL messages (JOIN, LEAVE, ALIVE) are not handled by clients
                 break;
@@ -3738,6 +4132,7 @@ private:
         std::memcpy(&payload, plaintext.data(), sizeof(payload));
         if (payload.command != SECURE_CONTROL_ROTATE_MEDIA_KEY ||
             payload.reserved8 != 0 ||
+            payload.access_epoch == 0 ||
             payload.media_secret_bytes == 0 ||
             payload.media_secret_bytes > payload.media_secret.size()) {
             inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
@@ -3747,7 +4142,7 @@ private:
         const std::string media_secret(
             payload.media_secret.begin(),
             payload.media_secret.begin() + payload.media_secret_bytes);
-        apply_media_secret_rotation(media_secret);
+        apply_media_secret_rotation(media_secret, payload.access_epoch);
         spdlog::info("Applied encrypted E2E media key rotation from participant {}",
                      metadata.sender_id);
     }
@@ -3791,6 +4186,8 @@ private:
         E2EKeyEnvelopePayload payload{};
         std::memcpy(&payload, plaintext.data(), sizeof(payload));
         if (payload.media_secret_bytes == 0 ||
+            payload.reserved != 0 ||
+            payload.access_epoch == 0 ||
             payload.media_secret_bytes > payload.media_secret.size()) {
             inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -3799,7 +4196,7 @@ private:
         const std::string media_secret(
             payload.media_secret.begin(),
             payload.media_secret.begin() + payload.media_secret_bytes);
-        apply_media_secret_rotation(media_secret);
+        apply_media_secret_rotation(media_secret, payload.access_epoch);
         spdlog::info("Received encrypted room key from participant {}",
                      envelope.sender_id);
     }
@@ -4774,10 +5171,22 @@ private:
     uint64_t                                               last_outbound_malformed_audio_drops_ = 0;
     std::unordered_map<uint32_t, ParticipantDropSnapshot>  participant_drop_snapshots_;
 
+    mutable std::mutex chat_mutex_;
+    std::vector<ClientChatMessage> chat_messages_;
+    std::unordered_map<std::string, PendingChatMessage> pending_chat_messages_;
+    uint64_t last_seen_chat_sequence_ = 0;
+    size_t chat_unread_count_ = 0;
+    bool chat_dialog_open_ = false;
+    bool chat_history_truncated_ = false;
+    std::string chat_status_;
+    std::string chat_retry_text_;
+    std::atomic<uint32_t> chat_request_id_{1};
+
     PeriodicTimer ping_timer_;
     PeriodicTimer join_retry_timer_;
     PeriodicTimer alive_timer_;
     PeriodicTimer cleanup_timer_;
+    PeriodicTimer chat_timer_;
 };
 
 class ClientAppAdapter final : public ClientAppFacade {
@@ -4827,8 +5236,9 @@ public:
                           display_name, join_token, media_secret, access_mode);
     }
 
-    bool rotate_media_key(const std::string& media_secret) override {
-        return client_.rotate_media_key(media_secret);
+    bool rotate_media_key(const std::string& media_secret,
+                          uint32_t access_epoch) override {
+        return client_.rotate_media_key(media_secret, access_epoch);
     }
 
     bool has_media_key() const override {
@@ -4873,6 +5283,22 @@ public:
 
     std::vector<ParticipantInfo> get_participant_info() const override {
         return client_.get_participant_info();
+    }
+
+    ChatState get_chat_state() const override {
+        return client_.get_chat_state();
+    }
+
+    void set_chat_dialog_open(bool open) override {
+        client_.set_chat_dialog_open(open);
+    }
+
+    bool send_chat_message(const std::string& text) override {
+        return client_.send_chat_message(text);
+    }
+
+    void request_chat_history() override {
+        client_.request_chat_history();
     }
 
     float get_own_audio_level() const override {

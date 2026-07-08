@@ -67,6 +67,10 @@ public:
         return room_control_[ep].allow(now, 2.0, 8.0);
     }
 
+    bool allow_chat_send(const endpoint& ep, time_point now) {
+        return chat_send_[ep].allow(now, 5.0, 10.0);
+    }
+
     bool allow_authenticated_audio(const endpoint& ep, uint32_t sample_rate,
                                    uint16_t frame_count, time_point now) {
         if (sample_rate == 0 || frame_count == 0) {
@@ -85,6 +89,7 @@ public:
         control_.erase(ep);
         status_.erase(ep);
         room_control_.erase(ep);
+        chat_send_.erase(ep);
         audio_.erase(ep);
     }
 
@@ -94,6 +99,7 @@ private:
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> control_;
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> status_;
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> room_control_;
+    std::unordered_map<endpoint, TokenBucket, endpoint_hash> chat_send_;
     std::unordered_map<endpoint, TokenBucket, endpoint_hash> audio_;
 };
 

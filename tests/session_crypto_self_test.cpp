@@ -70,6 +70,15 @@ void test_key_derivation_is_stable() {
     require(*key != *other_instance_key,
             "different room instance should produce different media key");
     require(*key != *other_secret_key, "different secret should produce different media key");
+
+    const auto chat_key = session_crypto::derive_chat_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
+    const auto same_chat_key = session_crypto::derive_chat_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
+    require(chat_key.has_value(), "chat key derivation should succeed");
+    require(same_chat_key.has_value(), "same chat key derivation should succeed");
+    require(*chat_key == *same_chat_key, "same room chat key should be stable");
+    require(*chat_key != *key, "chat key should be domain-separated from media key");
 }
 
 void test_seal_open_round_trip_and_tamper_rejection() {
@@ -182,6 +191,7 @@ void test_secure_control_round_trip_and_tamper_rejection() {
 
     MediaKeyRotationPayload payload{};
     const std::string next_secret = "next-media-secret";
+    payload.access_epoch = 3;
     payload.media_secret_bytes = static_cast<uint16_t>(next_secret.size());
     std::copy_n(next_secret.begin(), next_secret.size(), payload.media_secret.begin());
 
@@ -225,6 +235,8 @@ void test_secure_control_round_trip_and_tamper_rejection() {
     std::memcpy(&opened_payload, opened.data(), sizeof(opened_payload));
     require(opened_payload.command == SECURE_CONTROL_ROTATE_MEDIA_KEY,
             "opened control command should match");
+    require(opened_payload.access_epoch == payload.access_epoch,
+            "opened access epoch should match");
     require(opened_payload.media_secret_bytes == next_secret.size(),
             "opened media secret size should match");
     require(std::equal(next_secret.begin(), next_secret.end(),
@@ -249,6 +261,63 @@ void test_secure_control_round_trip_and_tamper_rejection() {
             "control ciphertext tamper should fail");
 }
 
+void test_chat_seal_open_and_aad_rejection() {
+    const auto key = session_crypto::derive_chat_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
+    require(key.has_value(), "chat key derivation should succeed");
+
+    session_crypto::ChatMetadata metadata;
+    metadata.room_id = "secure.room";
+    metadata.room_instance_id = "room.instance.a";
+    metadata.sender_id = 7;
+    metadata.access_epoch = 3;
+    require(session_crypto::make_chat_nonce(metadata.nonce),
+            "chat nonce generation should succeed");
+
+    const std::string plaintext = "hello encrypted room";
+    std::array<unsigned char, ROOM_CHAT_CIPHERTEXT_MAX_BYTES> ciphertext{};
+    size_t ciphertext_bytes = 0;
+    require(session_crypto::seal_chat_message(
+                *key, metadata,
+                reinterpret_cast<const unsigned char*>(plaintext.data()),
+                plaintext.size(), ciphertext.data(), ciphertext.size(),
+                ciphertext_bytes),
+            "chat seal should succeed");
+    require(ciphertext_bytes == plaintext.size() + SECURE_PACKET_TAG_BYTES,
+            "chat ciphertext should include authentication tag");
+
+    std::array<unsigned char, ROOM_CHAT_PLAINTEXT_MAX_BYTES> opened{};
+    size_t opened_bytes = 0;
+    require(session_crypto::open_chat_message(
+                *key, metadata, ciphertext.data(), ciphertext_bytes,
+                opened.data(), opened.size(), opened_bytes),
+            "chat open should succeed");
+    require(opened_bytes == plaintext.size(), "chat plaintext size should match");
+    require(std::equal(plaintext.begin(), plaintext.end(), opened.begin()),
+            "chat plaintext should round trip");
+
+    auto wrong_epoch = metadata;
+    wrong_epoch.access_epoch += 1;
+    require(!session_crypto::open_chat_message(
+                *key, wrong_epoch, ciphertext.data(), ciphertext_bytes,
+                opened.data(), opened.size(), opened_bytes),
+            "chat AAD epoch tamper should fail");
+
+    auto wrong_sender = metadata;
+    wrong_sender.sender_id += 1;
+    require(!session_crypto::open_chat_message(
+                *key, wrong_sender, ciphertext.data(), ciphertext_bytes,
+                opened.data(), opened.size(), opened_bytes),
+            "chat AAD sender tamper should fail");
+
+    auto tampered_ciphertext = ciphertext;
+    tampered_ciphertext[0] ^= 0x01;
+    require(!session_crypto::open_chat_message(
+                *key, metadata, tampered_ciphertext.data(), ciphertext_bytes,
+                opened.data(), opened.size(), opened_bytes),
+            "chat ciphertext tamper should fail");
+}
+
 }  // namespace
 
 int main() {
@@ -256,6 +325,7 @@ int main() {
     test_key_derivation_is_stable();
     test_seal_open_round_trip_and_tamper_rejection();
     test_secure_control_round_trip_and_tamper_rejection();
+    test_chat_seal_open_and_aad_rejection();
     std::cout << "session crypto self-test passed\n";
     return 0;
 }

@@ -31,6 +31,7 @@ public:
     };
 
     RegistrationResult register_client(const endpoint& ep, time_point now, std::string room_id,
+                                       std::string room_instance_id, uint32_t access_epoch,
                                        std::string profile_id, std::string display_name,
                                        uint32_t capabilities = 0,
                                        Bytes<E2E_PUBLIC_KEY_BYTES> key_public = {},
@@ -42,11 +43,13 @@ public:
         auto existing = clients_.find(ep);
         const bool can_reuse_existing =
             existing != clients_.end() && existing->second.room_id == room_id &&
+            existing->second.room_instance_id == room_instance_id &&
             existing->second.profile_id == profile_id;
 
         if (can_reuse_existing) {
             auto& client = existing->second;
             client.last_alive           = now;
+            client.access_epoch         = access_epoch;
             client.display_name         = std::move(display_name);
             client.capabilities         = capabilities;
             client.key_public           = key_public;
@@ -64,6 +67,8 @@ public:
             client.joined_at = now;
             client.last_alive = now;
             client.room_id = room_id;
+            client.room_instance_id = std::move(room_instance_id);
+            client.access_epoch = access_epoch;
             client.profile_id = profile_id;
             client.display_name = std::move(display_name);
             client.capabilities = capabilities;
@@ -154,6 +159,15 @@ public:
         return it != clients_.end() ? it->second.capabilities : 0;
     }
 
+    std::optional<ClientInfo> get_client_info(const endpoint& ep) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = clients_.find(ep);
+        if (it == clients_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
     bool has_authenticated_session(const endpoint& ep) const {
         std::lock_guard<std::mutex> lock(mutex_);
         auto                        it = clients_.find(ep);
@@ -230,6 +244,31 @@ public:
             }
         }
         return clients;
+    }
+
+    std::vector<std::pair<endpoint, ClientInfo>> get_room_clients(
+        const std::string& room_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::pair<endpoint, ClientInfo>> clients;
+        clients.reserve(clients_.size());
+        for (const auto& [ep, info]: clients_) {
+            if (info.room_id == room_id) {
+                clients.emplace_back(ep, info);
+            }
+        }
+        return clients;
+    }
+
+    void set_room_access_epoch(const std::string& room_id,
+                               const std::string& room_instance_id,
+                               uint32_t access_epoch) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& [_, info]: clients_) {
+            if (info.room_id == room_id &&
+                info.room_instance_id == room_instance_id) {
+                info.access_epoch = access_epoch;
+            }
+        }
     }
 
     std::optional<endpoint> get_room_endpoint_by_client_id(

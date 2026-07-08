@@ -342,6 +342,12 @@ private:
             case CtrlHdr::Cmd::ROOM_ADMIN_REQUEST:
                 handle_room_admin_request(bytes, now);
                 break;
+            case CtrlHdr::Cmd::ROOM_CHAT_SEND:
+                handle_room_chat_send(bytes, now);
+                break;
+            case CtrlHdr::Cmd::ROOM_CHAT_HISTORY_REQUEST:
+                handle_room_chat_history_request(bytes, now);
+                break;
             case CtrlHdr::Cmd::LEAVE: {
                 spdlog::info("Client LEAVE: {}:{}", remote_endpoint_.address().to_string(),
                           remote_endpoint_.port());
@@ -678,8 +684,175 @@ private:
         response.flags = room_flags(authorized.room);
         response.access_mode = authorized.room.access_mode;
         response.access_epoch = authorized.room.access_epoch;
+        client_manager_.set_room_access_epoch(
+            authorized.room.room_id, authorized.room.room_instance_id,
+            authorized.room.access_epoch);
         packet_builder::write_fixed(response.reason, "ok");
         send_room_admin_response(response);
+    }
+
+    static int64_t system_epoch_ms() {
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    }
+
+    static void fill_chat_event(RoomChatEventHdr& event,
+                                const room_registry::ChatMessage& message,
+                                uint32_t request_id) {
+        event.magic = CTRL_MAGIC;
+        event.type = CtrlHdr::Cmd::ROOM_CHAT_EVENT;
+        event.participant_id = message.sender_participant_id;
+        event.request_id = request_id;
+        event.access_epoch = message.access_epoch;
+        event.chat_sequence = message.sequence;
+        event.server_time_ms = message.server_time_ms;
+        event.ciphertext_bytes = message.ciphertext_bytes;
+        packet_builder::write_fixed(event.room_id, message.room_id);
+        packet_builder::write_fixed(event.room_instance_id, message.room_instance_id);
+        event.nonce = message.nonce;
+        event.ciphertext = message.ciphertext;
+    }
+
+    void send_room_chat_rejected(uint32_t request_id,
+                                 const Bytes<SECURE_PACKET_NONCE_BYTES>& nonce,
+                                 uint8_t status,
+                                 const std::string& reason) {
+        RoomChatSendRejectedHdr response{};
+        response.magic = CTRL_MAGIC;
+        response.type = CtrlHdr::Cmd::ROOM_CHAT_SEND_REJECTED;
+        response.request_id = request_id;
+        response.status = status;
+        response.nonce = nonce;
+        packet_builder::write_fixed(response.reason, reason);
+        auto buf = std::make_shared<std::vector<unsigned char>>(sizeof(response));
+        std::memcpy(buf->data(), &response, sizeof(response));
+        send(buf->data(), buf->size(), remote_endpoint_, buf);
+    }
+
+    void handle_room_chat_send(std::size_t bytes,
+                               std::chrono::steady_clock::time_point now) {
+        if (bytes < sizeof(RoomChatSendHdr)) {
+            send_room_chat_rejected(0, {}, ROOM_STATUS_BAD_REQUEST,
+                                    "short chat message");
+            return;
+        }
+        if (!rate_limiter_.allow_chat_send(remote_endpoint_, now)) {
+            return;
+        }
+
+        RoomChatSendHdr request{};
+        std::memcpy(&request, recv_buf_.data(), sizeof(request));
+        const auto sender = client_manager_.get_client_info(remote_endpoint_);
+        if (!sender.has_value()) {
+            send_room_chat_rejected(request.request_id, request.nonce,
+                                    ROOM_STATUS_FORBIDDEN, "not joined");
+            return;
+        }
+        const std::string room_id = fixed_string(request.room_id);
+        const std::string room_instance_id = fixed_string(request.room_instance_id);
+        if (room_id != sender->room_id ||
+            room_instance_id != sender->room_instance_id ||
+            request.participant_id != sender->client_id ||
+            request.access_epoch != sender->access_epoch) {
+            send_room_chat_rejected(request.request_id, request.nonce,
+                                    ROOM_STATUS_FORBIDDEN, "wrong room chat sender");
+            return;
+        }
+
+        const auto stored = room_registry_.store_chat_message(
+            room_id, room_instance_id, request.access_epoch, request.participant_id,
+            request.nonce, request.ciphertext, request.ciphertext_bytes,
+            system_epoch_ms(), now);
+        if (!stored.ok) {
+            send_room_chat_rejected(request.request_id, request.nonce,
+                                    stored.status, stored.reason);
+            return;
+        }
+
+        client_manager_.update_alive(remote_endpoint_, now);
+        RoomChatEventHdr event{};
+        fill_chat_event(event, stored.message, request.request_id);
+        auto packet = std::make_shared<std::vector<unsigned char>>(sizeof(event));
+        std::memcpy(packet->data(), &event, sizeof(event));
+        for (const auto& [endpoint, _]: client_manager_.get_room_clients(room_id)) {
+            send(packet->data(), packet->size(), endpoint, packet);
+        }
+    }
+
+    void send_room_chat_history_done(uint32_t request_id,
+                                     const std::string& room_id,
+                                     const std::string& room_instance_id,
+                                     uint32_t access_epoch,
+                                     uint8_t status,
+                                     uint8_t flags) {
+        RoomChatHistoryResponseHdr response{};
+        response.magic = CTRL_MAGIC;
+        response.type = CtrlHdr::Cmd::ROOM_CHAT_HISTORY_RESPONSE;
+        response.request_id = request_id;
+        response.status = status;
+        response.flags = static_cast<uint8_t>(flags | ROOM_CHAT_HISTORY_DONE);
+        response.access_epoch = access_epoch;
+        packet_builder::write_fixed(response.room_id, room_id);
+        packet_builder::write_fixed(response.room_instance_id, room_instance_id);
+        auto packet = std::make_shared<std::vector<unsigned char>>(sizeof(response));
+        std::memcpy(packet->data(), &response, sizeof(response));
+        send(packet->data(), packet->size(), remote_endpoint_, packet);
+    }
+
+    void handle_room_chat_history_request(std::size_t bytes,
+                                          std::chrono::steady_clock::time_point now) {
+        if (bytes < sizeof(RoomChatHistoryRequestHdr)) {
+            send_room_chat_history_done(0, {}, {}, 0, ROOM_STATUS_BAD_REQUEST,
+                                        ROOM_CHAT_HISTORY_DONE);
+            return;
+        }
+
+        RoomChatHistoryRequestHdr request{};
+        std::memcpy(&request, recv_buf_.data(), sizeof(request));
+        const auto client = client_manager_.get_client_info(remote_endpoint_);
+        const std::string room_id = fixed_string(request.room_id);
+        const std::string room_instance_id = fixed_string(request.room_instance_id);
+        if (!client.has_value() ||
+            room_id != client->room_id ||
+            room_instance_id != client->room_instance_id ||
+            request.access_epoch != client->access_epoch) {
+            send_room_chat_history_done(request.request_id, room_id, room_instance_id,
+                                        request.access_epoch, ROOM_STATUS_FORBIDDEN, 0);
+            return;
+        }
+
+        const auto history = room_registry_.chat_history_since(
+            room_id, room_instance_id, request.access_epoch,
+            request.after_sequence, now);
+        if (!history.ok) {
+            send_room_chat_history_done(request.request_id, room_id, room_instance_id,
+                                        request.access_epoch, history.status, 0);
+            return;
+        }
+
+        client_manager_.update_alive(remote_endpoint_, now);
+        for (const auto& message: history.messages) {
+            RoomChatHistoryResponseHdr response{};
+            response.magic = CTRL_MAGIC;
+            response.type = CtrlHdr::Cmd::ROOM_CHAT_HISTORY_RESPONSE;
+            response.participant_id = message.sender_participant_id;
+            response.request_id = request.request_id;
+            response.status = ROOM_STATUS_OK;
+            response.access_epoch = message.access_epoch;
+            response.chat_sequence = message.sequence;
+            response.server_time_ms = message.server_time_ms;
+            response.ciphertext_bytes = message.ciphertext_bytes;
+            packet_builder::write_fixed(response.room_id, message.room_id);
+            packet_builder::write_fixed(response.room_instance_id, message.room_instance_id);
+            response.nonce = message.nonce;
+            response.ciphertext = message.ciphertext;
+            auto packet = std::make_shared<std::vector<unsigned char>>(sizeof(response));
+            std::memcpy(packet->data(), &response, sizeof(response));
+            send(packet->data(), packet->size(), remote_endpoint_, packet);
+        }
+        send_room_chat_history_done(
+            request.request_id, room_id, room_instance_id, request.access_epoch,
+            ROOM_STATUS_OK, history.truncated ? ROOM_CHAT_HISTORY_TRUNCATED : 0);
     }
 
     bool kick_room_participant(const std::string& room_id, uint32_t participant_id,
@@ -836,7 +1009,8 @@ private:
         }
 
         auto registration = client_manager_.register_client(
-            remote_endpoint_, now, room_id, profile_id, display_name,
+            remote_endpoint_, now, room_id, room_snapshot.room_instance_id,
+            room_snapshot.access_epoch, profile_id, display_name,
             registered_capabilities, join.key_public, security);
         for (uint32_t removed_client_id: registration.removed_client_ids) {
             spdlog::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",

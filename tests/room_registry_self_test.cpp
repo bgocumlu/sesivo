@@ -1,8 +1,10 @@
 #include "room_registry.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <unordered_map>
 
 namespace {
@@ -105,12 +107,77 @@ void test_empty_rooms_disappear() {
     require(registry.list_rooms(counts).empty(), "joined empty room should disappear");
 }
 
+Bytes<SECURE_PACKET_NONCE_BYTES> nonce_for(int value) {
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce{};
+    nonce[0] = static_cast<char>(value);
+    return nonce;
+}
+
+Bytes<ROOM_CHAT_CIPHERTEXT_MAX_BYTES> ciphertext_for(int value) {
+    Bytes<ROOM_CHAT_CIPHERTEXT_MAX_BYTES> ciphertext{};
+    const std::string text = "ciphertext-" + std::to_string(value);
+    std::copy(text.begin(), text.end(), ciphertext.begin());
+    return ciphertext;
+}
+
+void test_chat_ring_buffer_and_history() {
+    room_registry::RoomRegistry registry;
+    const auto now = std::chrono::steady_clock::now();
+    const auto created =
+        registry.create_room("chat-room", "Chat Room", "", ROOM_ACCESS_OPEN, now);
+    require(created.ok, "chat room should be created");
+
+    for (int i = 1; i <= 12; ++i) {
+        const auto stored = registry.store_chat_message(
+            created.room.room_id, created.room.room_instance_id,
+            created.room.access_epoch, 7, nonce_for(i), ciphertext_for(i),
+            static_cast<uint16_t>(12 + std::to_string(i).size()),
+            1000 + i, now + std::chrono::seconds(i));
+        require(stored.ok, "chat message should store");
+        require(stored.message.sequence == static_cast<uint64_t>(i),
+                "chat sequence should increase");
+    }
+
+    const auto duplicate = registry.store_chat_message(
+        created.room.room_id, created.room.room_instance_id,
+        created.room.access_epoch, 7, nonce_for(12), ciphertext_for(12),
+        14, 2000, now + std::chrono::seconds(20));
+    require(!duplicate.ok && duplicate.status == ROOM_STATUS_CONFLICT,
+            "duplicate retained nonce should reject");
+
+    const auto history = registry.chat_history_since(
+        created.room.room_id, created.room.room_instance_id,
+        created.room.access_epoch, 0, now + std::chrono::seconds(30));
+    require(history.ok, "chat history should succeed");
+    require(history.truncated, "history from before retained tail should be truncated");
+    require(history.messages.size() == ROOM_CHAT_RETAINED_MESSAGES,
+            "history should retain only configured tail");
+    require(history.messages.front().sequence == 3,
+            "oldest retained chat sequence should be 3 after 12 sends");
+    require(history.messages.back().sequence == 12,
+            "newest retained chat sequence should be 12");
+
+    const auto recent = registry.chat_history_since(
+        created.room.room_id, created.room.room_instance_id,
+        created.room.access_epoch, 10, now + std::chrono::seconds(31));
+    require(recent.ok, "recent chat history should succeed");
+    require(!recent.truncated, "recent chat history should not be truncated");
+    require(recent.messages.size() == 2, "recent history should return messages after cursor");
+
+    const auto wrong_epoch = registry.chat_history_since(
+        created.room.room_id, created.room.room_instance_id,
+        created.room.access_epoch + 1, 0, now + std::chrono::seconds(32));
+    require(!wrong_epoch.ok && wrong_epoch.status == ROOM_STATUS_FORBIDDEN,
+            "wrong epoch history should reject");
+}
+
 }  // namespace
 
 int main() {
     test_create_join_and_password_change();
     test_open_and_approve_ignore_password();
     test_empty_rooms_disappear();
+    test_chat_ring_buffer_and_history();
     std::cout << "room registry self-test passed\n";
     return 0;
 }

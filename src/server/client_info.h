@@ -12,6 +12,8 @@ struct ClientInfo {
     std::chrono::steady_clock::time_point joined_at;
     uint32_t                              client_id = 0;  // Unique ID for this client
     std::string                           room_id;
+    std::string                           room_instance_id;
+    uint32_t                              access_epoch = 0;
     std::string                           profile_id;
     std::string                           display_name;
     uint32_t                              capabilities = 0;

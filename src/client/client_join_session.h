@@ -10,11 +10,13 @@
 
 struct PerformerJoinOptions {
     std::string room_id;
+    std::string room_instance_id;
     std::string room_handle;
     std::string user_id;
     std::string display_name;
     std::string join_token;
     std::string media_secret;
+    uint32_t access_epoch = 0;
     uint8_t access_mode = ROOM_ACCESS_OPEN;
     Bytes<E2E_PUBLIC_KEY_BYTES> key_public{};
 };
@@ -26,14 +28,17 @@ public:
         std::chrono::steady_clock::duration retry_interval = std::chrono::seconds(1));
 
     const std::string& room_id() const;
+    const std::string& room_instance_id() const;
     const std::string& user_id() const;
     const std::string& join_token() const;
     const std::string& media_secret() const;
+    uint32_t access_epoch() const;
     bool has_join_token() const;
     bool has_media_secret() const;
 
     void configure(PerformerJoinOptions options);
     void set_media_secret(std::string media_secret);
+    void set_access_epoch(uint32_t access_epoch);
     void set_key_public(Bytes<E2E_PUBLIC_KEY_BYTES> key_public);
     void set_access_mode(uint8_t access_mode);
     uint8_t access_mode() const;

@@ -82,6 +82,14 @@ struct SecureControlMetadata {
     uint16_t plaintext_bytes = 0;
 };
 
+struct ChatMetadata {
+    std::string room_id;
+    std::string room_instance_id;
+    uint32_t sender_id = 0;
+    uint32_t access_epoch = 0;
+    Bytes<SECURE_PACKET_NONCE_BYTES> nonce{};
+};
+
 inline bool parse_secure_audio_header(const unsigned char* packet, size_t packet_len,
                                       SecureAudioMetadata& metadata,
                                       uint16_t& encrypted_bytes,
@@ -207,6 +215,52 @@ inline std::optional<SessionKey> derive_media_key_from_secret(
         return std::nullopt;
     }
     return detail::session_key_from_digest(*digest);
+}
+
+inline std::optional<SessionKey> derive_chat_key_from_secret(
+    const std::string& room_id,
+    const std::string& room_instance_id,
+    const std::string& media_secret) {
+    std::vector<unsigned char> message;
+    detail::append_string(message, "sesivo-e2e-chat-v1|");
+    detail::append_string(message, room_id);
+    detail::append_string(message, "|");
+    detail::append_string(message, room_instance_id);
+    const auto digest = detail::hmac_sha256_bytes(
+        detail::bytes_from_string(media_secret), message);
+    if (!digest.has_value()) {
+        return std::nullopt;
+    }
+    return detail::session_key_from_digest(*digest);
+}
+
+inline bool make_chat_nonce(Bytes<SECURE_PACKET_NONCE_BYTES>& nonce) {
+    static_assert(SECURE_PACKET_NONCE_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_NPUBBYTES);
+    if (!detail::ensure_sodium_initialized()) {
+        nonce.fill(0);
+        return false;
+    }
+    randombytes_buf(nonce.data(), nonce.size());
+    return true;
+}
+
+inline std::vector<unsigned char> chat_associated_data(const ChatMetadata& metadata) {
+    std::vector<unsigned char> associated_data;
+    detail::append_string(associated_data, std::to_string(metadata.room_id.size()));
+    associated_data.push_back(':');
+    detail::append_string(associated_data, metadata.room_id);
+    associated_data.push_back('|');
+    detail::append_string(associated_data, std::to_string(metadata.room_instance_id.size()));
+    associated_data.push_back(':');
+    detail::append_string(associated_data, metadata.room_instance_id);
+    associated_data.push_back('|');
+    detail::append_string(associated_data, std::to_string(metadata.sender_id));
+    associated_data.push_back('|');
+    detail::append_string(associated_data, std::to_string(metadata.access_epoch));
+    associated_data.push_back('|');
+    associated_data.insert(associated_data.end(), metadata.nonce.begin(), metadata.nonce.end());
+    return associated_data;
 }
 
 inline bool make_e2e_keypair(E2EPublicKey& public_key, E2ESecretKey& secret_key) {
@@ -443,6 +497,85 @@ inline bool open_control_packet(const SessionKey& key, const unsigned char* pack
         return false;
     }
     if (actual_plaintext_bytes != metadata.plaintext_bytes) {
+        return false;
+    }
+    plaintext_len = static_cast<size_t>(actual_plaintext_bytes);
+    return true;
+}
+
+inline bool seal_chat_message(const SessionKey& key, const ChatMetadata& metadata,
+                              const unsigned char* plaintext, size_t plaintext_len,
+                              unsigned char* ciphertext_out, size_t ciphertext_capacity,
+                              size_t& ciphertext_len) {
+    static_assert(SECURE_PACKET_NONCE_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_NPUBBYTES);
+    static_assert(SECURE_PACKET_TAG_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_ABYTES);
+    static_assert(SessionKey{}.size() ==
+                  crypto_aead_chacha20poly1305_IETF_KEYBYTES);
+
+    ciphertext_len = 0;
+    if (metadata.room_id.empty() || metadata.room_instance_id.empty() ||
+        metadata.sender_id == 0 || metadata.access_epoch == 0 ||
+        plaintext == nullptr || plaintext_len == 0 ||
+        plaintext_len > ROOM_CHAT_PLAINTEXT_MAX_BYTES ||
+        ciphertext_out == nullptr ||
+        ciphertext_capacity < plaintext_len + SECURE_PACKET_TAG_BYTES ||
+        !detail::ensure_sodium_initialized()) {
+        return false;
+    }
+
+    const auto associated_data = chat_associated_data(metadata);
+    unsigned long long actual_ciphertext_bytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_encrypt(
+            ciphertext_out, &actual_ciphertext_bytes, plaintext,
+            static_cast<unsigned long long>(plaintext_len),
+            associated_data.data(),
+            static_cast<unsigned long long>(associated_data.size()),
+            nullptr,
+            reinterpret_cast<const unsigned char*>(metadata.nonce.data()),
+            key.data()) != 0 ||
+        actual_ciphertext_bytes != plaintext_len + SECURE_PACKET_TAG_BYTES ||
+        actual_ciphertext_bytes > ROOM_CHAT_CIPHERTEXT_MAX_BYTES) {
+        return false;
+    }
+    ciphertext_len = static_cast<size_t>(actual_ciphertext_bytes);
+    return true;
+}
+
+inline bool open_chat_message(const SessionKey& key, const ChatMetadata& metadata,
+                              const unsigned char* ciphertext, size_t ciphertext_len,
+                              unsigned char* plaintext_out, size_t plaintext_capacity,
+                              size_t& plaintext_len) {
+    static_assert(SECURE_PACKET_NONCE_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_NPUBBYTES);
+    static_assert(SECURE_PACKET_TAG_BYTES ==
+                  crypto_aead_chacha20poly1305_IETF_ABYTES);
+    static_assert(SessionKey{}.size() ==
+                  crypto_aead_chacha20poly1305_IETF_KEYBYTES);
+
+    plaintext_len = 0;
+    if (metadata.room_id.empty() || metadata.room_instance_id.empty() ||
+        metadata.sender_id == 0 || metadata.access_epoch == 0 ||
+        ciphertext == nullptr ||
+        ciphertext_len <= SECURE_PACKET_TAG_BYTES ||
+        ciphertext_len > ROOM_CHAT_CIPHERTEXT_MAX_BYTES ||
+        plaintext_out == nullptr ||
+        plaintext_capacity < ciphertext_len - SECURE_PACKET_TAG_BYTES ||
+        !detail::ensure_sodium_initialized()) {
+        return false;
+    }
+
+    const auto associated_data = chat_associated_data(metadata);
+    unsigned long long actual_plaintext_bytes = 0;
+    if (crypto_aead_chacha20poly1305_ietf_decrypt(
+            plaintext_out, &actual_plaintext_bytes, nullptr,
+            ciphertext, static_cast<unsigned long long>(ciphertext_len),
+            associated_data.data(),
+            static_cast<unsigned long long>(associated_data.size()),
+            reinterpret_cast<const unsigned char*>(metadata.nonce.data()),
+            key.data()) != 0 ||
+        actual_plaintext_bytes > ROOM_CHAT_PLAINTEXT_MAX_BYTES) {
         return false;
     }
     plaintext_len = static_cast<size_t>(actual_plaintext_bytes);

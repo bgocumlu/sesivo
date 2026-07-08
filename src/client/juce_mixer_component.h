@@ -90,6 +90,7 @@ private:
     void load_wav_path(const juce::File& file);
     void refresh_room_admin_controls(const std::vector<ParticipantInfo>& participants);
     void request_room_settings_dialog();
+    void request_room_chat_dialog();
     void request_room_access_change(uint8_t access_mode, std::string password);
     void request_participants_dialog();
     void request_room_approve(uint32_t participant_id);
@@ -194,6 +195,7 @@ private:
     juce::TextButton room_participants_button_;
     juce::TextButton room_close_button_;
     juce::TextButton room_copy_invite_button_;
+    juce::TextButton room_chat_button_;
 
     juce::TextButton mic_mute_button_;
     juce::TextButton monitor_toggle_;

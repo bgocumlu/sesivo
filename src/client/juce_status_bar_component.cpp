@@ -61,7 +61,11 @@ void JuceStatusBarComponent::refresh(
     const bool joined = connected_port != 0 && client.is_join_confirmed();
 
     server_text_ = server_text;
-    room_text_ = client.get_room_id().empty() ? "-" : juce::String(client.get_room_id());
+    const juce::String room_name(startup_options.room_name);
+    room_text_ = room_name.isEmpty()
+                     ? (client.get_room_id().empty() ? "-"
+                                                     : juce::String(client.get_room_id()))
+                     : room_name;
     state_text_ = effective_connection_status;
     users_text_ = juce::String(static_cast<int>(participants.size() +
                                                 (joined ? size_t{1} : size_t{0})));

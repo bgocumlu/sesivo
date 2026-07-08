@@ -22,6 +22,7 @@ public:
         std::string server_address;
         uint16_t server_port = 0;
         std::string room_id;
+        std::string room_name;
         std::string room_admin_token;
         std::string room_instance_id;
         uint32_t access_epoch = 0;

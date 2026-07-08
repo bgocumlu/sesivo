@@ -2348,7 +2348,8 @@ void JuceRoomBrowserComponent::apply_status(BrowserJobResult result) {
 void JuceRoomBrowserComponent::apply_ticket_result(const BrowserJobResult& result) {
     auto make_launch = [&]() {
         return JoinLaunch{result.server_address, result.server_port,
-                          result.joined_room_id, result.ticket.admin_token,
+                          result.joined_room_id, result.ticket.room_name,
+                          result.ticket.admin_token,
                           result.ticket.room_instance_id,
                           result.ticket.access_epoch,
                           result.media_secret,

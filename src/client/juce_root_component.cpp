@@ -31,6 +31,7 @@ void JuceRootComponent::open_invite(std::string invite_text) {
     client_.stop_connection();
     startup_options_.room_admin_token.clear();
     startup_options_.room_instance_id.clear();
+    startup_options_.room_name.clear();
     startup_options_.access_epoch = 0;
     startup_options_.media_secret.clear();
     startup_options_.access_mode = ROOM_ACCESS_OPEN;
@@ -51,6 +52,7 @@ JuceRoomBrowserComponent& JuceRootComponent::show_browser() {
             auto options = startup_options_;
             options.server_address = launch.server_address;
             options.server_port = launch.server_port;
+            options.room_name = launch.room_name;
             options.room_admin_token = launch.room_admin_token;
             options.room_instance_id = launch.room_instance_id;
             options.access_epoch = launch.access_epoch;

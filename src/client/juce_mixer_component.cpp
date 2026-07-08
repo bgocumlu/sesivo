@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -34,6 +35,7 @@ constexpr int GAP = juce_theme::gap;
 constexpr int ROW = juce_theme::row_height;
 constexpr int STATUS_HEIGHT = 66;
 constexpr int BOTTOM_HEIGHT = 170;
+constexpr std::array<int, 7> BUFFER_FRAME_OPTIONS{96, 120, 128, 240, 256, 480, 960};
 
 struct DockLayout {
     juce::Rectangle<int> local_audio;
@@ -46,26 +48,22 @@ struct DockLayout {
 
 DockLayout make_dock_layout(juce::Rectangle<int> bounds) {
     const int width = bounds.getWidth();
-    int local_width = juce::jlimit(300, 370, width * 26 / 100);
-    int network_width = juce::jlimit(220, 285, width * 20 / 100);
-    int redundancy_width = juce::jlimit(145, 165, width * 11 / 100);
-    int metronome_width = juce::jlimit(150, 175, width * 12 / 100);
-    int recording_width = juce::jlimit(110, 130, width * 9 / 100);
-    int wav_width = width - local_width - network_width - redundancy_width -
-                    metronome_width - recording_width - (5 * GAP);
+    int local_width = juce::jlimit(285, 360, width * 25 / 100);
+    int network_width = juce::jlimit(320, 430, width * 30 / 100);
+    int tools_width = juce::jlimit(145, 175, width * 12 / 100);
+    int wav_width = width - local_width - network_width - tools_width - (3 * GAP);
 
     if (wav_width < 260) {
         int deficit = 260 - wav_width;
         const int local_shrink = std::min(deficit / 2, local_width - 285);
         local_width -= local_shrink;
         deficit -= local_shrink;
-        const int network_shrink = std::min(deficit / 2, network_width - 205);
+        const int network_shrink = std::min(deficit, network_width - 300);
         network_width -= network_shrink;
         deficit -= network_shrink;
-        const int metronome_shrink = std::min(deficit, metronome_width - 150);
-        metronome_width -= metronome_shrink;
-        wav_width = width - local_width - network_width - redundancy_width -
-                    metronome_width - recording_width - (5 * GAP);
+        const int tools_shrink = std::min(deficit, tools_width - 140);
+        tools_width -= tools_shrink;
+        wav_width = width - local_width - network_width - tools_width - (3 * GAP);
     }
 
     DockLayout layout;
@@ -73,14 +71,65 @@ DockLayout make_dock_layout(juce::Rectangle<int> bounds) {
     bounds.removeFromLeft(GAP);
     layout.network = bounds.removeFromLeft(network_width);
     bounds.removeFromLeft(GAP);
-    layout.redundancy = bounds.removeFromLeft(redundancy_width);
-    bounds.removeFromLeft(GAP);
-    layout.metronome = bounds.removeFromLeft(metronome_width);
-    bounds.removeFromLeft(GAP);
-    layout.recording = bounds.removeFromLeft(recording_width);
+    layout.metronome = bounds.removeFromLeft(tools_width);
     bounds.removeFromLeft(GAP);
     layout.wav = bounds;
     return layout;
+}
+
+bool is_supported_buffer_frame_option(int frames) {
+    return std::find(BUFFER_FRAME_OPTIONS.begin(), BUFFER_FRAME_OPTIONS.end(), frames) !=
+           BUFFER_FRAME_OPTIONS.end();
+}
+
+juce::String format_sample_count(uint64_t value) {
+    if (value == 0) {
+        return "0";
+    }
+
+    juce::String out;
+    int group_digits = 0;
+    while (value > 0) {
+        if (group_digits == 3) {
+            out = "," + out;
+            group_digits = 0;
+        }
+        out = juce::String(static_cast<int>(value % 10)) + out;
+        value /= 10;
+        ++group_digits;
+    }
+    return out;
+}
+
+juce::String buffer_match_suffix(const AudioStream::LatencyInfo& latency) {
+    if (latency.requested_buffer_frames <= 0 || latency.actual_buffer_frames <= 0) {
+        return {};
+    }
+    if (latency.requested_buffer_frames == latency.actual_buffer_frames) {
+        return " match";
+    }
+    return " req " + juce::String(latency.requested_buffer_frames);
+}
+
+juce::String device_latency_warning(const AudioStream::LatencyInfo& latency,
+                                    double device_path_ms) {
+    if (latency.requested_buffer_frames > 0 && latency.actual_buffer_frames > 0 &&
+        latency.requested_buffer_frames != latency.actual_buffer_frames) {
+        return "Device changed buffer";
+    }
+    if (device_path_ms >= 20.0) {
+        return "High device latency";
+    }
+    return {};
+}
+
+int label_line_count(const juce::String& text) {
+    const auto bytes = text.toStdString();
+    return static_cast<int>(std::count(bytes.begin(), bytes.end(), '\n')) + 1;
+}
+
+int diagnostics_label_height(const juce::String& text) {
+    return std::max(ROW, (label_line_count(text) * 15) + 10);
 }
 
 juce::String opus_packet_label(int frames) {
@@ -715,6 +764,9 @@ void JuceMixerComponent::configure_controls() {
 
     juce_theme::style_label(diagnostics_label_, juce_theme::colour::text_dim(), 12.0F);
     diagnostics_label_.setJustificationType(juce::Justification::topLeft);
+    network_viewport_.setViewedComponent(&network_content_, false);
+    network_viewport_.setScrollBarsShown(true, false);
+    network_viewport_.setScrollBarThickness(6);
     auto configure_section = [](juce::Label& label, const juce::String& text) {
         label.setText(text, juce::dontSendNotification);
         juce_theme::style_label(label, juce_theme::colour::text(), 14.0F, true);
@@ -734,7 +786,7 @@ void JuceMixerComponent::configure_controls() {
     configure_caption(jitter_label_, "Jitter");
     configure_caption(queue_label_, "Queue");
     configure_caption(age_limit_label_, "Age");
-    configure_caption(redundancy_label_, "Redundancy");
+    configure_caption(redundancy_label_, "Mode");
     configure_caption(wav_position_label_, "0:00 / 0:00");
     configure_caption(wav_gain_label_, "Gain 1.00x");
     room_admin_status_label_.setText(room_admin_status_, juce::dontSendNotification);
@@ -749,7 +801,7 @@ void JuceMixerComponent::configure_controls() {
     configure_linear_slider(jitter_ms_slider_, 0.0, 200.0, 1.0, " ms");
     configure_linear_slider(queue_limit_slider_, 1.0, MAX_OPUS_QUEUE_LIMIT_PACKETS, 1.0,
                             " pkt");
-    configure_linear_slider(age_limit_slider_, 1.0, 500.0, 1.0, " ms");
+    configure_linear_slider(age_limit_slider_, 1.0, MAX_JITTER_PACKET_AGE_MS, 1.0, " ms");
     auto_jitter_toggle_.setButtonText("Auto jitter");
 
     bpm_editor_.setInputRestrictions(6, "0123456789.");
@@ -774,22 +826,24 @@ void JuceMixerComponent::configure_controls() {
     room_close_button_.setButtonText("Close room");
     room_copy_invite_button_.setButtonText("Copy invite");
 
-    add_all(*this, {&status_bar_, &leave_button_, &diagnostics_label_, &participants_component_,
-                    &local_audio_label_, &network_label_, &redundancy_section_label_,
+    add_all(*this, {&status_bar_, &leave_button_, &participants_component_,
+                    &local_audio_label_, &network_viewport_,
                     &metronome_label_, &recording_label_, &wav_label_,
                     &room_admin_label_, &room_admin_status_label_,
-                    &packet_label_, &jitter_label_, &queue_label_,
-                    &age_limit_label_, &redundancy_label_,
                     &wav_position_label_, &wav_gain_label_,
                     &room_settings_button_, &room_participants_button_,
                     &room_close_button_, &room_copy_invite_button_,
-                    &mic_mute_button_, &monitor_toggle_, &jitter_ms_slider_,
-                    &queue_limit_slider_, &age_limit_slider_,
-                    &auto_jitter_toggle_, &redundancy_combo_, &bpm_editor_,
+                    &mic_mute_button_, &monitor_toggle_,
+                    &bpm_editor_,
                     &metronome_start_stop_button_, &metronome_tap_button_,
                     &record_button_, &wav_path_editor_, &wav_load_button_,
                     &wav_play_button_, &wav_position_slider_, &wav_gain_slider_,
                     &wav_mute_toggle_});
+    add_all(network_content_, {&network_label_, &packet_label_, &jitter_label_, &queue_label_,
+                               &age_limit_label_, &opus_packet_combo_, &jitter_ms_slider_,
+                               &queue_limit_slider_, &age_limit_slider_,
+                               &redundancy_section_label_, &redundancy_label_,
+                               &redundancy_combo_, &auto_jitter_toggle_, &diagnostics_label_});
 
     leave_button_.onClick = [this]() { leave_room(); };
     room_settings_button_.onClick = [this]() { request_room_settings_dialog(); };
@@ -899,7 +953,7 @@ void JuceMixerComponent::configure_device_controls() {
     refresh_devices_button_.setButtonText("Refresh");
 
     add_all(*this, {&api_combo_, &input_combo_, &input_channel_combo_, &output_combo_,
-                    &buffer_combo_, &opus_packet_combo_, &apply_audio_button_,
+                    &buffer_combo_, &apply_audio_button_,
                     &start_stop_audio_button_, &reset_audio_button_,
                     &refresh_devices_button_, &device_status_label_});
 
@@ -943,6 +997,7 @@ void JuceMixerComponent::configure_device_controls() {
     opus_packet_combo_.onChange = [this]() {
         if (!updating_from_client_) {
             pending_opus_frames_per_packet_ = opus_packet_combo_.getSelectedId();
+            auto_match_buffer_to_packet_frames(pending_opus_frames_per_packet_);
         }
     };
 
@@ -983,9 +1038,7 @@ void JuceMixerComponent::paint(juce::Graphics& g) {
                            static_cast<float>(bottom.getBottom() - 12));
     };
     draw_separator(dock.network);
-    draw_separator(dock.redundancy);
     draw_separator(dock.metronome);
-    draw_separator(dock.recording);
     draw_separator(dock.wav);
 }
 
@@ -1040,35 +1093,20 @@ void JuceMixerComponent::resized() {
     refresh_devices_button_.setBounds(action_row.removeFromLeft(70).reduced(2));
     device_status_label_.setBounds(action_row.reduced(2));
 
-    auto network = dock.network.reduced(12, 10);
-    set_title(network_label_, network);
-    set_labeled_row(network.removeFromTop(ROW), packet_label_, opus_packet_combo_, 52);
-    network.removeFromTop(4);
-    set_labeled_row(network.removeFromTop(ROW), jitter_label_, jitter_ms_slider_, 52);
-    network.removeFromTop(4);
-    set_labeled_row(network.removeFromTop(ROW), queue_label_, queue_limit_slider_, 52);
-    network.removeFromTop(4);
-    set_labeled_row(network.removeFromTop(ROW), age_limit_label_, age_limit_slider_, 52);
-    diagnostics_label_.setBounds(network.reduced(2, 4));
+    network_viewport_.setBounds(dock.network.reduced(12, 10));
+    layout_network_content();
 
-    auto redundancy = dock.redundancy.reduced(12, 10);
-    set_title(redundancy_section_label_, redundancy);
-    redundancy_combo_.setBounds(redundancy.removeFromTop(ROW).reduced(2));
-    redundancy.removeFromTop(6);
-    auto_jitter_toggle_.setBounds(redundancy.removeFromTop(ROW).reduced(2));
-
-    auto metro = dock.metronome.reduced(12, 10);
-    set_title(metronome_label_, metro);
-    auto bpm_row = metro.removeFromTop(ROW);
+    auto tools = dock.metronome.reduced(12, 10);
+    set_title(metronome_label_, tools);
+    auto bpm_row = tools.removeFromTop(ROW);
     bpm_editor_.setBounds(bpm_row.removeFromLeft(70).reduced(2));
     bpm_row.removeFromLeft(control_gap);
     metronome_start_stop_button_.setBounds(bpm_row.removeFromLeft(58).reduced(2));
-    metro.removeFromTop(6);
-    metronome_tap_button_.setBounds(metro.removeFromTop(ROW).reduced(2));
-
-    auto recording = dock.recording.reduced(12, 10);
-    set_title(recording_label_, recording);
-    record_button_.setBounds(recording.removeFromTop(ROW).removeFromLeft(74).reduced(2));
+    tools.removeFromTop(6);
+    metronome_tap_button_.setBounds(tools.removeFromTop(ROW).reduced(2));
+    tools.removeFromTop(12);
+    set_title(recording_label_, tools);
+    record_button_.setBounds(tools.removeFromTop(ROW).removeFromLeft(86).reduced(2));
 
     auto wav = dock.wav.reduced(12, 10);
     set_title(wav_label_, wav);
@@ -1120,6 +1158,46 @@ void JuceMixerComponent::resized() {
     }
 
     participants_component_.setBounds(participants_area);
+}
+
+void JuceMixerComponent::layout_network_content() {
+    const auto viewport = network_viewport_.getBounds();
+    if (viewport.isEmpty()) {
+        return;
+    }
+
+    constexpr int control_gap = 6;
+    auto set_title = [](juce::Label& label, juce::Rectangle<int>& panel) {
+        label.setBounds(panel.removeFromTop(22));
+        panel.removeFromTop(2);
+    };
+    auto set_labeled_row = [](juce::Rectangle<int> row, juce::Label& label,
+                              juce::Component& control, int label_width = 56) {
+        label.setBounds(row.removeFromLeft(label_width));
+        control.setBounds(row.reduced(2));
+    };
+
+    auto network = juce::Rectangle<int>(0, 0, std::max(1, viewport.getWidth() - 20), 1000);
+    set_title(network_label_, network);
+    set_labeled_row(network.removeFromTop(ROW), packet_label_, opus_packet_combo_, 52);
+    network.removeFromTop(4);
+    set_labeled_row(network.removeFromTop(ROW), jitter_label_, jitter_ms_slider_, 52);
+    network.removeFromTop(4);
+    set_labeled_row(network.removeFromTop(ROW), queue_label_, queue_limit_slider_, 52);
+    network.removeFromTop(4);
+    set_labeled_row(network.removeFromTop(ROW), age_limit_label_, age_limit_slider_, 52);
+    network.removeFromTop(10);
+    set_title(redundancy_section_label_, network);
+    set_labeled_row(network.removeFromTop(ROW), redundancy_label_, redundancy_combo_, 52);
+    network.removeFromTop(4);
+    auto_jitter_toggle_.setBounds(network.removeFromTop(ROW).reduced(2));
+    network.removeFromTop(10);
+
+    const int diagnostics_height = diagnostics_label_height(diagnostics_label_.getText());
+    diagnostics_label_.setBounds(network.removeFromTop(diagnostics_height).reduced(2, 4));
+
+    const int content_height = std::max(viewport.getHeight(), diagnostics_label_.getBottom() + control_gap);
+    network_content_.setSize(std::max(1, viewport.getWidth() - 20), content_height);
 }
 
 void JuceMixerComponent::timerCallback() {
@@ -1207,28 +1285,30 @@ void JuceMixerComponent::refresh_live_state() {
     wav_position_slider_.setValue(static_cast<double>(wav.position),
                                   juce::dontSendNotification);
 
+    const double reported_device_ms = latency.input_latency_ms + latency.output_latency_ms;
+    const double fallback_device_ms = latency.buffer_duration_ms > 0.0
+                                          ? latency.buffer_duration_ms * 2.0
+                                          : 0.0;
+    const double device_path_ms = reported_device_ms > 0.0 ? reported_device_ms
+                                                           : fallback_device_ms;
+    const auto warning = device_latency_warning(latency, device_path_ms);
+    const juce::String warning_line = warning.isEmpty() ? juce::String{} : "\n" + warning;
     diagnostics_label_.setText(
         "Opus " + juce::String(client_.get_opus_network_frame_count()) + " frames / " +
             juce::String(client_.get_opus_network_packet_ms(), 1) + " ms\n" +
-            "Jitter " + juce::String(client_.get_opus_jitter_buffer_ms()) + " ms (" +
-            juce::String(static_cast<int>(client_.get_opus_jitter_buffer_packets())) +
-            " pkt), queue " +
-            juce::String(static_cast<int>(client_.get_opus_queue_limit_packets())) + "\n" +
-            "Total est " + juce::String(path.total_estimate_ms, 1) + " ms, E2E avg max " +
-            juce::String(path.e2e_latency_avg_max_ms, 1) + " ms\n" +
-            "Latency in " + juce::String(latency.input_latency_ms, 1) + " ms, out " +
-            juce::String(latency.output_latency_ms, 1) + " ms, buffer " +
-            juce::String(latency.actual_buffer_frames) + " frames\n" +
-            "Callback avg " + juce::String(callback_timing.avg_ms, 2) + " ms, max " +
-            juce::String(callback_timing.max_ms, 2) + " ms, late " +
-            juce::String(static_cast<int>(callback_timing.over_deadline_count)) + "\n" +
-            "Metro beat " + juce::String(static_cast<int>(metronome.beat_number)) +
-            ", sync " + juce::String(static_cast<int>(metronome.sync_sent)) + "/" +
-            juce::String(static_cast<int>(metronome.sync_received)) + "\n" +
-            "Recording " + juce::String(recording.active ? "on" : "off") + ", queued " +
-            juce::String(static_cast<int>(recording.queued_blocks)) + ", dropped " +
-            juce::String(static_cast<int>(recording.dropped_blocks)),
+            "E2E avg " + juce::String(path.e2e_latency_avg_max_ms, 1) + " ms\n" +
+            "E2E peak " + juce::String(path.e2e_latency_peak_ms, 1) + " ms\n" +
+            "Samples " + format_sample_count(path.e2e_latency_samples) + "\n" +
+            "Device " + juce::String(device_path_ms, 1) + " ms\n" +
+            "In " + juce::String(latency.input_latency_ms, 1) + " / out " +
+            juce::String(latency.output_latency_ms, 1) + " ms\n" +
+            "Buffer " + juce::String(latency.actual_buffer_frames) +
+            buffer_match_suffix(latency) + warning_line + "\n" +
+            "Callback avg " + juce::String(callback_timing.avg_ms, 2) + " ms\n" +
+            "Callback max " + juce::String(callback_timing.max_ms, 2) + " ms\n" +
+            "Late " + juce::String(static_cast<int>(callback_timing.over_deadline_count)),
         juce::dontSendNotification);
+    layout_network_content();
 
     start_stop_audio_button_.setButtonText(client_.is_audio_stream_active() ? "Stop"
                                                                             : "Start");
@@ -1579,7 +1659,7 @@ void JuceMixerComponent::populate_input_channel_combo() {
 void JuceMixerComponent::populate_buffer_combo() {
     updating_from_client_ = true;
     buffer_combo_.clear(juce::dontSendNotification);
-    for (const int frames: {96, 120, 128, 240, 256}) {
+    for (const int frames: BUFFER_FRAME_OPTIONS) {
         buffer_combo_.addItem(juce::String(frames), frames);
     }
     buffer_combo_.setSelectedId(pending_buffer_frames_, juce::dontSendNotification);
@@ -1600,6 +1680,17 @@ void JuceMixerComponent::populate_opus_packet_combo() {
     opus_packet_combo_.setSelectedId(pending_opus_frames_per_packet_,
                                      juce::dontSendNotification);
     updating_from_client_ = false;
+}
+
+void JuceMixerComponent::auto_match_buffer_to_packet_frames(int packet_frames) {
+    if (!is_supported_buffer_frame_option(packet_frames)) {
+        return;
+    }
+
+    pending_buffer_frames_ = packet_frames;
+    buffer_combo_.setSelectedId(pending_buffer_frames_, juce::dontSendNotification);
+    set_device_status("Matched buffer to " + juce::String(packet_frames) +
+                      " frame packets");
 }
 
 void JuceMixerComponent::populate_redundancy_combo() {

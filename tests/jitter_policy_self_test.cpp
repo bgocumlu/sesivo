@@ -75,6 +75,24 @@ void test_jitter_age_limit_uses_floor_packet_count() {
             "85 ms age limit should allow only 4 complete 20 ms packets");
 }
 
+void test_zero_age_limit_disables_age_drops() {
+    require(!jitter_packet_age_limit_enabled(0),
+            "0 ms age limit should disable age drops");
+    require(!jitter_packet_age_exceeds_limit(1, 0),
+            "0 ms age limit must not treat any packet as too old");
+    require(!jitter_packet_age_exceeds_limit(10 * 1000000LL, -1),
+            "negative age limit should be treated as disabled before clamping");
+}
+
+void test_positive_age_limit_drops_only_older_packets() {
+    require(jitter_packet_age_limit_enabled(60),
+            "positive age limit should enable age drops");
+    require(!jitter_packet_age_exceeds_limit(60 * 1000000LL, 60),
+            "packet exactly at age limit should be accepted");
+    require(jitter_packet_age_exceeds_limit((60 * 1000000LL) + 1, 60),
+            "packet older than age limit should be dropped");
+}
+
 void test_auto_start_jitter_ms_converts_to_packets_for_stable_frames() {
     require(opus_auto_start_jitter_packets_for_audio(
                 DEFAULT_OPUS_JITTER_PACKETS, opus_network_clock::SAMPLE_RATE,
@@ -132,6 +150,8 @@ int main() {
     test_auto_start_jitter_respects_higher_configured_floor();
     test_jitter_ms_converts_to_packets_for_supported_frame_sizes();
     test_jitter_age_limit_uses_floor_packet_count();
+    test_zero_age_limit_disables_age_drops();
+    test_positive_age_limit_drops_only_older_packets();
     test_auto_start_jitter_ms_converts_to_packets_for_stable_frames();
     test_jitter_packet_count_round_trips_to_effective_ms();
     test_auto_start_target_does_not_snap_to_floor_before_ready();

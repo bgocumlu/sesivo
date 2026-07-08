@@ -45,6 +45,18 @@ inline size_t opus_jitter_packets_within_ms(int target_ms, uint32_t sample_rate,
     return clamp_opus_jitter_packets(static_cast<size_t>(packets));
 }
 
+inline bool jitter_packet_age_limit_enabled(int age_limit_ms) {
+    return age_limit_ms > 0;
+}
+
+inline bool jitter_packet_age_exceeds_limit(int64_t packet_age_ns, int age_limit_ms) {
+    if (!jitter_packet_age_limit_enabled(age_limit_ms)) {
+        return false;
+    }
+    const int64_t max_packet_age_ns = static_cast<int64_t>(age_limit_ms) * 1000000LL;
+    return packet_age_ns > max_packet_age_ns;
+}
+
 inline int opus_jitter_ms_for_packets(size_t packets, uint32_t sample_rate,
                                       uint16_t frame_count) {
     if (packets == 0 || sample_rate == 0 || frame_count == 0) {

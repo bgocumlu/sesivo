@@ -4202,12 +4202,8 @@ private:
                 auto packet_age = now - opus_packet.timestamp;
                 auto packet_age_ns =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(packet_age).count();
-                const auto max_packet_age_ns =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::milliseconds(client->get_jitter_packet_age_limit_ms()))
-                        .count();
-
-                while (packet_age_ns > max_packet_age_ns) {
+                while (jitter_packet_age_exceeds_limit(
+                    packet_age_ns, client->get_jitter_packet_age_limit_ms())) {
                     observe_opus_age_limit_drop(participant);
                     dequeue_status =
                         participant.opus_queue.dequeue(opus_packet, playout_gap_wait_packets);
@@ -4553,19 +4549,12 @@ private:
             }
         }
 
-        // Apply normalization if multiple sources to prevent clipping
-        if (active_count > 1) {
-            constexpr float HEADROOM = 0.5F;
-            float           gain     = HEADROOM / static_cast<float>(active_count);
-
-            for (unsigned long i = 0; i < frame_count * out_channels; ++i) {
-                output_buffer[i] *= gain;
-
-                // Soft clip (safety limiter)
-                output_buffer[i] = std::min(output_buffer[i], 1.0F);
-                output_buffer[i] = std::max(output_buffer[i], -1.0F);
-            }
-        }
+        const float target_mix_gain = audio_analysis::mix_normalization_target_gain(active_count);
+        const float smoothed_mix_gain = audio_analysis::smooth_mix_normalization_gain(
+            client->output_mix_gain_, target_mix_gain, frame_count, runtime_sample_rate);
+        client->output_mix_gain_ = smoothed_mix_gain;
+        audio_analysis::apply_gain_and_hard_limit(output_buffer, frame_count * out_channels,
+                                                  smoothed_mix_gain);
 
         if (input_buffer != nullptr && !client->mic_muted_.load(std::memory_order_acquire)) {
             const float input_gain = client->audio_state_.input_gain();
@@ -4665,6 +4654,7 @@ private:
     std::atomic<int>         opus_redundancy_depth_packets_{
         DEFAULT_OPUS_REDUNDANCY_DEPTH_PACKETS};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
+    float                    output_mix_gain_ = 1.0F;
     // Pre-sized so the audio callback's try_enqueue never allocates
     // (max_send_queue_frames caps useful depth at 8; 64 gives block-pool slack).
     moodycamel::ConcurrentQueue<OpusSendFrame> opus_send_queue_{64};

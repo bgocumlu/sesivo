@@ -73,4 +73,35 @@ inline void mix_local_monitor(float* output, const float* input, size_t frame_co
     mix_mono_to_stereo(output, input, frame_count, out_channels, gain);
 }
 
+inline float mix_normalization_target_gain(int active_source_count) {
+    if (active_source_count <= 1) {
+        return 1.0F;
+    }
+    constexpr float HEADROOM = 0.5F;
+    return HEADROOM / static_cast<float>(active_source_count);
+}
+
+inline float smooth_mix_normalization_gain(float current_gain, float target_gain,
+                                           size_t frame_count, double sample_rate,
+                                           double smoothing_ms = 80.0) {
+    current_gain = std::clamp(current_gain, 0.0F, 1.0F);
+    target_gain = std::clamp(target_gain, 0.0F, 1.0F);
+    if (frame_count == 0 || sample_rate <= 0.0 || smoothing_ms <= 0.0) {
+        return target_gain;
+    }
+
+    const double callback_ms = static_cast<double>(frame_count) * 1000.0 / sample_rate;
+    const float step = static_cast<float>(std::clamp(callback_ms / smoothing_ms, 0.0, 1.0));
+    return current_gain + ((target_gain - current_gain) * step);
+}
+
+inline void apply_gain_and_hard_limit(float* samples, size_t count, float gain) {
+    if (samples == nullptr || count == 0) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        samples[i] = std::clamp(samples[i] * gain, -1.0F, 1.0F);
+    }
+}
+
 }  // namespace audio_analysis

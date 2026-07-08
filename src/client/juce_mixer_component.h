@@ -75,6 +75,8 @@ private:
     void populate_buffer_combo();
     void populate_opus_packet_combo();
     void populate_redundancy_combo();
+    void auto_match_buffer_to_packet_frames(int packet_frames);
+    void layout_network_content();
     void apply_audio_settings();
     void start_or_stop_audio();
     void reset_audio_path();
@@ -158,6 +160,8 @@ private:
     int pending_opus_frames_per_packet_ = 0;
 
     juce::Label diagnostics_label_;
+    juce::Component network_content_;
+    juce::Viewport network_viewport_;
     juce::Label device_status_label_;
     juce::Label local_audio_label_;
     juce::Label network_label_;

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-set(SESIVO_VERSION "0.2.0")
+set(SESIVO_VERSION "0.3.0")
 
 # Windows release artifacts must run on machines without the Visual C++
 # Redistributable installed. Use /MT for release-like configs and /MTd for Debug.

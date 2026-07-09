@@ -5,7 +5,5 @@
   "homepage": "https://sesivo.app/",
   "repository": "https://github.com/bgocumlu/sesivo",
   "downloads_page": "https://sesivo.app/downloads.html",
-  "downloads": "https://github.com/bgocumlu/sesivo/releases/latest",
-  "version": "0.1.0",
-  "updated": "2026-07-08"
+  "latest_release": "https://github.com/bgocumlu/sesivo/releases/latest"
 }

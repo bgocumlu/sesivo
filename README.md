@@ -15,7 +15,7 @@ Includes:
 - `site.webmanifest`
 - `styles.css`
 - `favicon.svg`
-- `api/example.json`
+- `info.json`
 - `assets/session.png`
 
 Current canonical URL:

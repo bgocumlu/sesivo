@@ -7,7 +7,7 @@
 - [Home](https://sesivo.app/)
 - [Downloads](https://sesivo.app/downloads.html)
 - [Docs](https://sesivo.app/docs.html)
-- [Static API example](https://sesivo.app/api/example.json)
+- [Site information JSON](https://sesivo.app/info.json)
 - [Latest downloads](https://github.com/bgocumlu/sesivo/releases/latest)
 - [GitHub repository](https://github.com/bgocumlu/sesivo)
 

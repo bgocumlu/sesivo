@@ -142,6 +142,9 @@ if(JAM_BUILD_TESTS)
     jam_add_self_test(audio_backend_policy_self_test audio_backend_policy_self_test.cpp)
 
     jam_add_self_test(juce_audio_adapter_self_test juce_audio_adapter_self_test.cpp)
+
+    jam_add_self_test(wav_file_playback_self_test wav_file_playback_self_test.cpp)
+    target_link_libraries(wav_file_playback_self_test PRIVATE spdlog::spdlog)
 endif()
 
 if(JAM_BUILD_TESTS)
@@ -177,6 +180,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(audio_analysis_self_test)
     jam_add_executable_test(audio_backend_policy_self_test)
     jam_add_executable_test(juce_audio_adapter_self_test)
+    jam_add_executable_test(wav_file_playback_self_test)
 
     if(NODE_EXECUTABLE)
         add_test(NAME latency_measurement_tool_self_test

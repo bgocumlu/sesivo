@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -151,6 +152,11 @@ inline void pcm16_stereo_to_mono_float(const int16_t* input, float* output, int 
 
 // Sample rate conversion (can extract to class later)
 namespace audio_resample {
+struct LinearResult {
+    double source_frames_consumed = 0.0;
+    int output_frames_from_input = 0;
+};
+
 // Simple linear interpolation resampling with fractional position
 // input: source audio (already float)
 // output: destination buffer (must be pre-allocated)
@@ -158,18 +164,18 @@ namespace audio_resample {
 // input_frames: number of frames in input
 // output_frames: number of frames to generate in output
 // src_pos_start: starting fractional source position (input/output - updated on return)
-// Returns: number of source frames consumed (as double for fractional tracking)
-inline double linear(const float* input, float* output, float ratio, int input_frames,
-                     int output_frames, double& src_pos_start) {
+inline LinearResult linear(const float* input, float* output, float ratio, int input_frames,
+                           int output_frames, double& src_pos_start) {
     if (ratio == 1.0F) {
         // No resampling needed
         std::copy(input, input + output_frames, output);
         src_pos_start += static_cast<double>(output_frames);
-        return static_cast<double>(output_frames);
+        return {static_cast<double>(output_frames), output_frames};
     }
 
-    const double inv_ratio = 1.0 / static_cast<double>(ratio);
-    double       src_pos   = src_pos_start;
+    const double step = static_cast<double>(ratio);
+    double       src_pos = src_pos_start;
+    int          output_frames_from_input = 0;
 
     for (int i = 0; i < output_frames; ++i) {
         int    src_idx = static_cast<int>(src_pos);
@@ -179,26 +185,35 @@ inline double linear(const float* input, float* output, float ratio, int input_f
             // Linear interpolation between two samples
             output[i] =
                 static_cast<float>(input[src_idx] * (1.0 - frac) + (input[src_idx + 1] * frac));
+            output_frames_from_input = i + 1;
         } else if (src_idx < input_frames) {
             // Last sample (no interpolation)
             output[i] = input[src_idx];
+            output_frames_from_input = i + 1;
         } else {
             // Past end of input - output silence
             output[i] = 0.0F;
         }
 
-        src_pos += inv_ratio;
+        src_pos += step;
     }
 
     // Update starting position for next call
     double frames_consumed = src_pos - src_pos_start;
     src_pos_start          = src_pos;
-    return frames_consumed;
+    return {frames_consumed, output_frames_from_input};
 }
 }  // namespace audio_resample
 
 // Main WAV playback class
 class WavFilePlayback {
+    struct LoadedWav {
+        std::vector<float> pcm_data;
+        int sample_rate = 0;
+        int channels = 0;
+        int bits_per_sample = 0;
+    };
+
 public:
     WavFilePlayback() = default;
 
@@ -210,17 +225,14 @@ public:
 
     // Allow moving (atomics initialized in body since they can't be copy-constructed)
     WavFilePlayback(WavFilePlayback&& other) noexcept
-        : pcm_data_(std::move(other.pcm_data_)),
-          file_sample_rate_(other.file_sample_rate_),
-          file_channels_(other.file_channels_),
-          file_bits_per_sample_(other.file_bits_per_sample_),
-          playing_(other.playing_.load()),
+        : loaded_wav_(std::atomic_load_explicit(&other.loaded_wav_, std::memory_order_acquire)),
+          playing_(other.playing_.load(std::memory_order_acquire)),
           read_position_(other.read_position_.load()),
           resample_ratio_(other.resample_ratio_.load()),
           resample_position_frac_(other.resample_position_frac_.load()) {
-        other.file_sample_rate_     = 0;
-        other.file_channels_        = 0;
-        other.file_bits_per_sample_ = 0;
+        std::shared_ptr<const LoadedWav> cleared;
+        std::atomic_store_explicit(&other.loaded_wav_, std::move(cleared),
+                                   std::memory_order_release);
         other.playing_.store(false);
         other.read_position_.store(0);
         other.resample_ratio_.store(1.0F);
@@ -229,18 +241,18 @@ public:
 
     WavFilePlayback& operator=(WavFilePlayback&& other) noexcept {
         if (this != &other) {
-            pcm_data_             = std::move(other.pcm_data_);
-            file_sample_rate_     = other.file_sample_rate_;
-            file_channels_        = other.file_channels_;
-            file_bits_per_sample_ = other.file_bits_per_sample_;
-            playing_.store(other.playing_.load());
+            auto loaded =
+                std::atomic_load_explicit(&other.loaded_wav_, std::memory_order_acquire);
+            std::atomic_store_explicit(&loaded_wav_, std::move(loaded),
+                                       std::memory_order_release);
+            playing_.store(other.playing_.load(std::memory_order_acquire));
             read_position_.store(other.read_position_.load());
             resample_ratio_.store(other.resample_ratio_.load());
             resample_position_frac_.store(other.resample_position_frac_.load());
 
-            other.file_sample_rate_     = 0;
-            other.file_channels_        = 0;
-            other.file_bits_per_sample_ = 0;
+            std::shared_ptr<const LoadedWav> cleared;
+            std::atomic_store_explicit(&other.loaded_wav_, std::move(cleared),
+                                       std::memory_order_release);
             other.playing_.store(false);
             other.read_position_.store(0);
             other.resample_ratio_         = 1.0F;
@@ -274,11 +286,6 @@ public:
             return false;
         }
 
-        // Store file metadata
-        file_sample_rate_     = static_cast<int>(header.sample_rate);
-        file_channels_        = static_cast<int>(header.num_channels);
-        file_bits_per_sample_ = static_cast<int>(header.bits_per_sample);
-
         // Read PCM data
         const int total_samples = header.data_size / (header.bits_per_sample / 8);
         const int total_frames  = total_samples / header.num_channels;
@@ -293,18 +300,18 @@ public:
         }
 
         // Convert to float, always output as mono.
-        // Create new vector and atomically swap via shared_ptr (thread-safe)
-        auto new_pcm_data = std::make_shared<std::vector<float>>(total_frames);
+        auto new_wav = std::make_shared<LoadedWav>();
+        new_wav->sample_rate = static_cast<int>(header.sample_rate);
+        new_wav->channels = static_cast<int>(header.num_channels);
+        new_wav->bits_per_sample = static_cast<int>(header.bits_per_sample);
+        new_wav->pcm_data.resize(total_frames);
         if (header.num_channels == 1) {
-            pcm_decode::pcm16_to_float(pcm16_data.data(), new_pcm_data->data(), total_frames);
+            pcm_decode::pcm16_to_float(pcm16_data.data(), new_wav->pcm_data.data(), total_frames);
         } else {
             // Stereo to mono conversion
-            pcm_decode::pcm16_stereo_to_mono_float(pcm16_data.data(), new_pcm_data->data(),
+            pcm_decode::pcm16_stereo_to_mono_float(pcm16_data.data(), new_wav->pcm_data.data(),
                                                    total_frames);
         }
-
-        // Atomically swap the shared_ptr (audio thread keeps old reference alive if still using it)
-        pcm_data_ = std::const_pointer_cast<const std::vector<float>>(new_pcm_data);
 
         // Reset playback state
         playing_.store(false);
@@ -312,26 +319,30 @@ public:
         resample_ratio_.store(1.0F);
         resample_position_frac_.store(0.0);
 
-        spdlog::info("Loaded WAV file: {} ({}Hz, {}ch, {}bits, {} frames)", path, file_sample_rate_,
-                  file_channels_, file_bits_per_sample_, total_frames);
+        std::shared_ptr<const LoadedWav> published = std::move(new_wav);
+        std::atomic_store_explicit(&loaded_wav_, std::move(published),
+                                   std::memory_order_release);
+
+        spdlog::info("Loaded WAV file: {} ({}Hz, {}ch, {}bits, {} frames)", path,
+                     header.sample_rate, header.num_channels, header.bits_per_sample,
+                     total_frames);
 
         return true;
     }
 
     void unload() {
-        // Atomically clear shared_ptr (audio thread keeps old reference alive if still using it)
-        pcm_data_.reset();
-        file_sample_rate_     = 0;
-        file_channels_        = 0;
-        file_bits_per_sample_ = 0;
         playing_.store(false);
         read_position_.store(0);
         resample_ratio_.store(1.0F);
         resample_position_frac_.store(0.0);
+        std::shared_ptr<const LoadedWav> cleared;
+        std::atomic_store_explicit(&loaded_wav_, std::move(cleared),
+                                   std::memory_order_release);
     }
 
     bool is_loaded() const {
-        return pcm_data_ != nullptr && !pcm_data_->empty();
+        auto wav = loaded_wav();
+        return wav != nullptr && !wav->pcm_data.empty();
     }
 
     void play() {
@@ -347,9 +358,9 @@ public:
     void seek(int64_t frame_position) {
         // Only allow seeking when paused (boundary discipline)
         if (!playing_.load(std::memory_order_acquire)) {
-            auto pcm = pcm_data_;  // Get local reference
-            if (pcm) {
-                const int64_t max_pos = static_cast<int64_t>(pcm->size());
+            auto wav = loaded_wav();
+            if (wav) {
+                const int64_t max_pos = static_cast<int64_t>(wav->pcm_data.size());
                 const int64_t clamped =
                     std::max(static_cast<int64_t>(0), std::min(frame_position, max_pos));
                 read_position_.store(clamped, std::memory_order_release);
@@ -368,23 +379,23 @@ public:
     }
 
     int64_t get_total_frames() const {
-        auto pcm = pcm_data_;  // Get local reference
-        return pcm ? static_cast<int64_t>(pcm->size()) : 0;
+        auto wav = loaded_wav();
+        return wav ? static_cast<int64_t>(wav->pcm_data.size()) : 0;
     }
 
     // Read audio data (thread-safe, called from audio callback)
     // Returns number of frames read (0 = EOF, < frames_requested = partial)
     int read(float* output, int frames_requested, int target_sample_rate) {
-        // Get local reference to PCM data (thread-safe via shared_ptr)
-        auto pcm = pcm_data_;
-        if (!pcm || !playing_.load(std::memory_order_acquire)) {
+        auto wav = loaded_wav();
+        if (!wav || !playing_.load(std::memory_order_acquire)) {
             std::fill(output, output + frames_requested, 0.0F);
             return 0;
         }
+        const auto& pcm = wav->pcm_data;
 
         // Calculate resampling ratio (source_rate / target_rate)
         const float ratio =
-            static_cast<float>(file_sample_rate_) / static_cast<float>(target_sample_rate);
+            static_cast<float>(wav->sample_rate) / static_cast<float>(target_sample_rate);
 
         // Check if ratio changed and reset state if needed
         float current_ratio = resample_ratio_.load(std::memory_order_acquire);
@@ -394,7 +405,7 @@ public:
         }
 
         const int64_t current_pos = read_position_.load(std::memory_order_acquire);
-        const int64_t max_frames  = static_cast<int64_t>(pcm->size());
+        const int64_t max_frames  = static_cast<int64_t>(pcm.size());
 
         if (current_pos >= max_frames) {
             // EOF
@@ -410,7 +421,7 @@ public:
             const int     frames_to_copy =
                 static_cast<int>(std::min(static_cast<int64_t>(frames_requested), available));
 
-            std::copy(pcm->begin() + current_pos, pcm->begin() + current_pos + frames_to_copy,
+            std::copy(pcm.begin() + current_pos, pcm.begin() + current_pos + frames_to_copy,
                       output);
 
             if (frames_to_copy < frames_requested) {
@@ -427,10 +438,11 @@ public:
 
             // Calculate how many source frames we need (with some margin for interpolation)
             const double src_frames_needed =
-                (static_cast<double>(frames_requested) / static_cast<double>(ratio)) + 2.0;
+                src_pos_frac +
+                (static_cast<double>(frames_requested) * static_cast<double>(ratio)) + 2.0;
             const int64_t available = max_frames - current_pos;
-            const int     source_frames =
-                static_cast<int>(std::min(static_cast<int64_t>(src_frames_needed), available));
+            const int     source_frames = static_cast<int>(
+                std::min(static_cast<int64_t>(std::ceil(src_frames_needed)), available));
 
             if (source_frames == 0) {
                 // EOF
@@ -441,26 +453,30 @@ public:
             }
 
             // Get pointer to source data
-            const float* source_ptr = pcm->data() + current_pos;
+            const float* source_ptr = pcm.data() + current_pos;
 
             // Perform resampling with fractional position continuity
             double src_pos_start   = src_pos_frac;
-            double frames_consumed = audio_resample::linear(
+            auto result = audio_resample::linear(
                 source_ptr, output, ratio, source_frames, frames_requested, src_pos_start);
 
             // Update read position (integer part of consumed frames)
-            int64_t frames_advanced = static_cast<int64_t>(frames_consumed);
-            read_position_.fetch_add(frames_advanced, std::memory_order_acq_rel);
+            int64_t frames_advanced =
+                std::min<int64_t>(available, static_cast<int64_t>(src_pos_start));
+            const int64_t new_pos = current_pos + frames_advanced;
+            read_position_.store(new_pos, std::memory_order_release);
 
             // Store fractional remainder for next call
-            double fractional_remainder = frames_consumed - static_cast<double>(frames_advanced);
+            double fractional_remainder =
+                src_pos_start - static_cast<double>(frames_advanced);
             resample_position_frac_.store(fractional_remainder, std::memory_order_release);
 
             // Check if we've reached EOF
-            const int64_t new_pos = read_position_.load(std::memory_order_acquire);
-            if (new_pos >= max_frames) {
+            if (new_pos >= max_frames || result.output_frames_from_input < frames_requested) {
+                read_position_.store(max_frames, std::memory_order_release);
                 playing_.store(false, std::memory_order_release);
                 resample_position_frac_.store(0.0, std::memory_order_release);
+                return result.output_frames_from_input;
             }
 
             return frames_requested;
@@ -469,24 +485,27 @@ public:
 
     // Metadata getters
     int get_sample_rate() const {
-        return file_sample_rate_;
+        auto wav = loaded_wav();
+        return wav ? wav->sample_rate : 0;
     }
 
     int get_channels() const {
-        return file_channels_;
+        auto wav = loaded_wav();
+        return wav ? wav->channels : 0;
     }
 
     int get_bits_per_sample() const {
-        return file_bits_per_sample_;
+        auto wav = loaded_wav();
+        return wav ? wav->bits_per_sample : 0;
     }
 
 private:
-    // Internal structure (private - can refactor later)
-    // Use shared_ptr for thread-safe loading/unloading (audio thread keeps reference alive)
-    std::shared_ptr<const std::vector<float>> pcm_data_;  // Load entire file.
-    int file_sample_rate_     = 0;
-    int file_channels_        = 0;
-    int file_bits_per_sample_ = 0;
+    std::shared_ptr<const LoadedWav> loaded_wav() const {
+        return std::atomic_load_explicit(&loaded_wav_, std::memory_order_acquire);
+    }
+
+    // Atomically published so the audio thread can keep an old file alive while UI loads/unloads.
+    std::shared_ptr<const LoadedWav> loaded_wav_;
 
     // Playback state
     std::atomic<bool>    playing_{false};

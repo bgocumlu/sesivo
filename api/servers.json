@@ -1,0 +1,9 @@
+{
+  "servers": [
+    {
+      "name": "Istanbul",
+      "address": "194.62.55.226",
+      "port": 9999
+    }
+  ]
+}

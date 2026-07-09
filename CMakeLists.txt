@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(SESIVO_VERSION "0.1.0")
 
 # Windows release artifacts must run on machines without the Visual C++
 # Redistributable installed. Use /MT for release-like configs and /MTd for Debug.
@@ -8,7 +9,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     CACHE STRING "Use the static MSVC runtime" FORCE
 )
 
-project(jam LANGUAGES C CXX)
+project(jam VERSION ${SESIVO_VERSION} LANGUAGES C CXX)
+set(SESIVO_VERSION_RC
+    "${PROJECT_VERSION_MAJOR},${PROJECT_VERSION_MINOR},${PROJECT_VERSION_PATCH},0"
+)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -27,6 +31,13 @@ set(JAM_COMMON_DIR "${JAM_SRC_DIR}/common")
 set(JAM_CLIENT_DIR "${JAM_SRC_DIR}/client")
 set(JAM_SERVER_DIR "${JAM_SRC_DIR}/server")
 set(JAM_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+set(SESIVO_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/sesivo_version.h.in"
+    "${SESIVO_GENERATED_DIR}/sesivo_version.h"
+    @ONLY
+)
 
 function(jam_add_project_includes target_name)
     target_include_directories(${target_name} PRIVATE

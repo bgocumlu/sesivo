@@ -14,6 +14,18 @@ function Get-EnvOrDefault {
     return $value
 }
 
+function Get-ProjectVersion {
+    $repoRoot = Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")
+    $cmakeLists = Join-Path $repoRoot "CMakeLists.txt"
+    $match = Select-String -Path $cmakeLists `
+        -Pattern '^\s*set\s*\(\s*SESIVO_VERSION\s+"([^"]+)"\s*\)' |
+        Select-Object -First 1
+    if (-not $match) {
+        throw "could not read SESIVO_VERSION from CMakeLists.txt"
+    }
+    return $match.Matches[0].Groups[1].Value
+}
+
 function Require-Command {
     param([Parameter(Mandatory = $true)][string]$Name)
 
@@ -124,7 +136,7 @@ function Add-ZipEntry {
 $buildDir = Get-EnvOrDefault "BUILD_DIR" "build"
 $config = Get-EnvOrDefault "CONFIG" "Release"
 $packageDir = Get-EnvOrDefault "PACKAGE_DIR" (Join-Path $buildDir "package")
-$appVersion = Get-EnvOrDefault "APP_VERSION" "0.1.0"
+$appVersion = Get-EnvOrDefault "APP_VERSION" (Get-ProjectVersion)
 $signWindows = Get-EnvOrDefault "SIGN_WINDOWS" "1"
 $timestampUrl = Get-EnvOrDefault "WINDOWS_TIMESTAMP_URL" "http://timestamp.digicert.com"
 $signDescription = Get-EnvOrDefault "WINDOWS_SIGN_DESCRIPTION" "sesivo"

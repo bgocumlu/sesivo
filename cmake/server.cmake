@@ -17,6 +17,7 @@ add_executable(server
     ${JAM_COMMON_DIR}/logging_setup.cpp
 )
 jam_add_project_includes(server)
+target_include_directories(server PRIVATE "${SESIVO_GENERATED_DIR}")
 set_target_properties(server PROPERTIES
     OUTPUT_NAME sesivo-server
 )

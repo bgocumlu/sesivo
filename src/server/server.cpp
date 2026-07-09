@@ -42,6 +42,7 @@
 #include "server_config.h"
 #include "server_metrics.h"
 #include "session_crypto.h"
+#include "sesivo_version.h"
 #include "udp_port.h"
 #include "udp_socket_config.h"
 
@@ -74,6 +75,59 @@ static const char* runtime_arch_name() {
 #else
     return "unknown";
 #endif
+}
+
+static bool is_lan_ipv4(const asio::ip::address_v4& address) {
+    const auto bytes = address.to_bytes();
+    return bytes[0] == 10 ||
+           (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) ||
+           (bytes[0] == 192 && bytes[1] == 168);
+}
+
+static void append_unique_address(std::vector<std::string>& addresses,
+                                  std::string address) {
+    if (std::find(addresses.begin(), addresses.end(), address) == addresses.end()) {
+        addresses.push_back(std::move(address));
+    }
+}
+
+static std::vector<std::string> lan_ipv4_addresses(asio::io_context& io_context) {
+    std::vector<std::string> addresses;
+    std::error_code ec;
+    const auto hostname = asio::ip::host_name(ec);
+    if (ec || hostname.empty()) {
+        return addresses;
+    }
+
+    udp::resolver resolver(io_context);
+    const auto results = resolver.resolve(udp::v4(), hostname, "0", ec);
+    if (ec) {
+        return addresses;
+    }
+
+    for (const auto& entry: results) {
+        const auto address = entry.endpoint().address();
+        if (!address.is_v4()) {
+            continue;
+        }
+        const auto ipv4 = address.to_v4();
+        if (is_lan_ipv4(ipv4)) {
+            append_unique_address(addresses, ipv4.to_string());
+        }
+    }
+    return addresses;
+}
+
+static void log_server_addresses(asio::io_context& io_context, uint16_t port) {
+    spdlog::warn("Sesivo server address: Local: 127.0.0.1:{}", port);
+    const auto addresses = lan_ipv4_addresses(io_context);
+    if (addresses.empty()) {
+        spdlog::warn("Sesivo server address: LAN: not detected");
+        return;
+    }
+    for (const auto& address: addresses) {
+        spdlog::warn("Sesivo server address: LAN: {}:{}", address, port);
+    }
 }
 
 template <size_t N>
@@ -2196,6 +2250,8 @@ int main(int argc, char** argv) {
                                    : spdlog::level::info;
         logging::init(true, false, !options.log_file_path.empty(), options.log_file_path,
                       log_level, options.log_max_bytes, options.log_max_files);
+        spdlog::warn("Sesivo server version {}", SESIVO_VERSION);
+        log_server_addresses(io_context, options.port);
 
         if (options.crash_reports_enabled) {
             crash_reporter::Options crash_options;

@@ -20,7 +20,7 @@ if (!target) {
 const repoDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const buildDir = resolveFromRepo(process.env.BUILD_DIR ?? "build");
 const packageDir = resolveFromRepo(process.env.PACKAGE_DIR ?? join(buildDir, "package"));
-const version = process.env.APP_VERSION ?? readPackageVersion();
+const version = process.env.APP_VERSION ?? readProjectVersion();
 const tag = `v${version}`;
 const releaseTitle = tag;
 const releaseNotes = `sesivo ${tag}`;
@@ -29,12 +29,12 @@ function resolveFromRepo(path) {
   return resolve(repoDir, path);
 }
 
-function readPackageVersion() {
-  const packagingPath = join(repoDir, "cmake", "packaging.cmake");
-  const text = readFileSync(packagingPath, "utf8");
-  const match = text.match(/set\s*\(\s*CPACK_PACKAGE_VERSION\s+"([^"]+)"/);
+function readProjectVersion() {
+  const cmakePath = join(repoDir, "CMakeLists.txt");
+  const text = readFileSync(cmakePath, "utf8");
+  const match = text.match(/set\s*\(\s*SESIVO_VERSION\s+"([^"]+)"/);
   if (!match) {
-    console.error("Could not read CPACK_PACKAGE_VERSION from cmake/packaging.cmake.");
+    console.error("Could not read SESIVO_VERSION from CMakeLists.txt.");
     process.exit(1);
   }
   return match[1];

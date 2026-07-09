@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd "${script_dir}/.." && pwd)"
+
+read_project_version() {
+    local version
+    version="$(sed -nE 's/^[[:space:]]*set[[:space:]]*\([[:space:]]*SESIVO_VERSION[[:space:]]+"([^"]+)"[[:space:]]*\).*/\1/p' "${repo_dir}/CMakeLists.txt" | head -n 1)"
+    if [[ -z "$version" ]]; then
+        echo "could not read SESIVO_VERSION from CMakeLists.txt" >&2
+        exit 2
+    fi
+    printf '%s\n' "$version"
+}
+
 require_env() {
     local name="$1"
     if [[ -z "${!name:-}" ]]; then
@@ -43,7 +56,7 @@ build_dir="${BUILD_DIR:-build}"
 config="${CONFIG:-Release}"
 package_dir="${PACKAGE_DIR:-${build_dir}/package}"
 app_path="${build_dir}/Sesivo.app"
-app_version="${APP_VERSION:-0.1.0}"
+app_version="${APP_VERSION:-$(read_project_version)}"
 dmg_path="${package_dir}/sesivo-${app_version}-macos-arm64.dmg"
 entitlements="packaging/macos/entitlements.plist"
 

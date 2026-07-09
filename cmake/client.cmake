@@ -52,8 +52,17 @@ if(APPLE)
     list(APPEND JAM_CLIENT_PLATFORM_SOURCES "${JAM_CLIENT_ICON_ICNS}")
 endif()
 if(WIN32)
+    set(SESIVO_WINDOWS_ICON_RC_PATH
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/icons/sesivo.ico"
+    )
+    set(SESIVO_WINDOWS_RC "${SESIVO_GENERATED_DIR}/sesivo.rc")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows/sesivo.rc.in"
+        "${SESIVO_WINDOWS_RC}"
+        @ONLY
+    )
     list(APPEND JAM_CLIENT_PLATFORM_SOURCES
-        "${CMAKE_CURRENT_SOURCE_DIR}/packaging/windows/sesivo.rc"
+        "${SESIVO_WINDOWS_RC}"
     )
 endif()
 
@@ -85,6 +94,7 @@ add_executable(client
     ${JAM_CLIENT_PLATFORM_SOURCES}
 )
 jam_add_project_includes(client)
+target_include_directories(client PRIVATE "${SESIVO_GENERATED_DIR}")
 
 set_target_properties(client PROPERTIES
     OUTPUT_NAME sesivo
@@ -99,9 +109,9 @@ if(APPLE)
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.sesivo.client"
         MACOSX_BUNDLE_ICON_FILE "sesivo.icns"
         MACOSX_BUNDLE_INFO_STRING "sesivo"
-        MACOSX_BUNDLE_LONG_VERSION_STRING "0.1.0"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
-        MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
+        MACOSX_BUNDLE_LONG_VERSION_STRING "${SESIVO_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${SESIVO_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${SESIVO_VERSION}"
         MACOSX_BUNDLE_COPYRIGHT "Copyright 2026 sesivo"
     )
 endif()

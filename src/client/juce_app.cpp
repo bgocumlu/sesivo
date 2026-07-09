@@ -10,6 +10,7 @@
 #include "opus_defines.h"
 #include "performer_join_token.h"
 #include "secure_invite.h"
+#include "sesivo_version.h"
 
 #include <asio/io_context.hpp>
 #include <spdlog/spdlog.h>
@@ -186,7 +187,7 @@ void register_windows_url_protocol() {}
 class SesivoApplication final : public juce::JUCEApplication {
 public:
     const juce::String getApplicationName() override { return "sesivo"; }
-    const juce::String getApplicationVersion() override { return "0.1.0"; }
+    const juce::String getApplicationVersion() override { return SESIVO_VERSION; }
     bool moreThanOneInstanceAllowed() override { return true; }
 
     void initialise(const juce::String& command_line) override {

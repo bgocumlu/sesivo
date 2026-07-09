@@ -166,5 +166,11 @@ target_link_libraries(ui_style_sandbox PRIVATE
 )
 
 if(WIN32)
+    set_target_properties(client PROPERTIES
+        WIN32_EXECUTABLE "$<NOT:$<CONFIG:Debug>>"
+    )
+    target_link_options(client PRIVATE
+        "$<$<NOT:$<CONFIG:Debug>>:/ENTRY:mainCRTStartup>"
+    )
     target_link_libraries(client PRIVATE Avrt Qwave)
 endif()

@@ -73,6 +73,7 @@ private:
 
     struct ServerStatus {
         bool ok = false;
+        bool rooms_loaded = false;
         bool token_auth_available = false;
         bool truncated = false;
         std::string reason;
@@ -89,6 +90,7 @@ private:
         uint16_t port = 0;
         ServerStatus status;
         std::chrono::steady_clock::time_point last_refresh{};
+        std::chrono::steady_clock::time_point next_status_refresh{};
     };
 
     struct PendingInviteJoin {
@@ -118,10 +120,16 @@ private:
 
     struct BrowserJobResult {
         JobKind kind = JobKind::Status;
-        int server_index = -1;
         std::string server_address;
         uint16_t server_port = 0;
-        ServerStatus status;
+        struct StatusUpdate {
+            int server_index = -1;
+            std::string server_address;
+            uint16_t server_port = 0;
+            ServerStatus status;
+            std::string message;
+        };
+        std::vector<StatusUpdate> status_updates;
         TicketResult ticket;
         bool joined = false;
         bool waiting_for_room_key = false;

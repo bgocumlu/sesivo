@@ -5,10 +5,12 @@
 #include "performer_join_token.h"
 #include "protocol.h"
 #include "secure_invite.h"
+#include "udp_socket_config.h"
 
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
+#include <asio/steady_timer.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -21,10 +23,13 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 using asio::ip::udp;
@@ -932,6 +937,26 @@ private:
     OfficialServerFetchLinkButton fetch_link_;
 };
 
+template <typename Request>
+std::string room_browser_udp_request_summary(const Request& request) {
+    std::ostringstream out;
+    if constexpr (std::is_same_v<Request, ServerStatusRequestHdr>) {
+        out << "SERVER_STATUS_REQUEST request_id=" << request.request_id
+            << " room_offset=" << request.room_offset
+            << " room_limit=" << static_cast<int>(request.room_limit);
+    } else if constexpr (std::is_same_v<Request, RoomCreateRequestHdr>) {
+        out << "ROOM_CREATE_REQUEST request_id=" << request.request_id
+            << " room='" << fixed_string(request.room_id) << "' access="
+            << static_cast<int>(request.access_mode);
+    } else if constexpr (std::is_same_v<Request, RoomJoinTokenRequestHdr>) {
+        out << "ROOM_JOIN_TOKEN_REQUEST request_id=" << request.request_id
+            << " room='" << fixed_string(request.room_id) << "'";
+    } else {
+        out << "CTRL";
+    }
+    return out.str();
+}
+
 template <typename Request, typename Response>
 Response send_control_request(const std::string& address, uint16_t port,
                               const Request& request, CtrlHdr::Cmd expected_type,
@@ -949,7 +974,9 @@ Response send_control_request(const std::string& address, uint16_t port,
     socket.non_blocking(true);
 
     const auto sent_at = std::chrono::steady_clock::now();
-    socket.send_to(asio::buffer(&request, sizeof(request)), endpoint);
+    const auto sent = socket.send_to(asio::buffer(&request, sizeof(request)), endpoint);
+    spdlog::info("Room browser UDP send {} to {}:{} bytes={}",
+                 room_browser_udp_request_summary(request), address, port, sent);
 
     std::array<unsigned char, 2048> buffer{};
     udp::endpoint sender;
@@ -1761,6 +1788,9 @@ void JuceRoomBrowserComponent::paint(juce::Graphics& g) {
     if (!selected_status().ok) {
         ui::draw_label(g, room_area.reduced(20), status_text_, 16.0f, ui::text_dim,
                        false, juce::Justification::centred);
+    } else if (!selected_status().rooms_loaded) {
+        ui::draw_label(g, room_area.reduced(20), status_text_, 16.0f, ui::text_dim,
+                       false, juce::Justification::centred);
     } else if (visible.empty()) {
         ui::draw_label(g, room_area.reduced(20),
                         selected_status().rooms.empty() ? "No rooms on this server"
@@ -2048,43 +2078,283 @@ void JuceRoomBrowserComponent::start_status_refresh(bool manual) {
         }
         return;
     }
-    const int server_index = selected_server_index_;
-    const BrowserServer server = selected_server();
-    const uint32_t request_id = next_request_id();
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        if (job_running_) {
+            if (manual) {
+                repaint();
+            }
+            return;
+        }
+    }
+
+    struct StatusRefreshTarget {
+        int server_index = -1;
+        std::string address;
+        uint16_t port = 0;
+        bool selected = false;
+        uint32_t request_id = 0;
+    };
+
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<StatusRefreshTarget> targets;
+    targets.reserve(servers_.size());
+    for (int i = 0; i < static_cast<int>(servers_.size()); ++i) {
+        const auto& server = servers_[static_cast<size_t>(i)];
+        if (server.address.empty() || server.port == 0) {
+            continue;
+        }
+
+        const bool selected = i == selected_server_index_;
+        const bool due =
+            manual || selected ||
+            server.next_status_refresh.time_since_epoch().count() == 0 ||
+            server.next_status_refresh <= now;
+        if (!due) {
+            continue;
+        }
+
+        targets.push_back(
+            StatusRefreshTarget{i, server.address, server.port, selected,
+                                next_request_id()});
+    }
+
+    if (targets.empty()) {
+        return;
+    }
+
     if (manual) {
         status_text_ = "Refreshing...";
     }
-    start_job([server, server_index, request_id]() {
+
+    start_job([targets = std::move(targets)]() mutable {
         BrowserJobResult result;
         result.kind = JobKind::Status;
-        result.server_index = server_index;
-        result.server_address = server.address;
-        result.server_port = server.port;
 
-        try {
-            uint16_t room_offset = 0;
-            for (int page = 0; page < ROOM_STATUS_PAGE_LIMIT; ++page) {
-                ServerStatusRequestHdr request{};
-                request.magic = CTRL_MAGIC;
-                request.type = CtrlHdr::Cmd::SERVER_STATUS_REQUEST;
-                request.request_id = request_id;
-                request.room_offset = room_offset;
-                request.room_limit =
-                    static_cast<uint8_t>(MAX_ROOM_STATUS_SUMMARIES);
+        struct StatusRefreshRunner final
+            : public std::enable_shared_from_this<StatusRefreshRunner> {
+            struct ProbeState {
+                ProbeState(asio::io_context& io_context,
+                           StatusRefreshTarget target_value)
+                    : resolver(io_context),
+                      timer(io_context),
+                      target(std::move(target_value)) {}
 
-                double rtt = 0.0;
-                const auto response =
-                    send_control_request<ServerStatusRequestHdr, ServerStatusResponseHdr>(
-                        server.address, server.port, request,
-                        CtrlHdr::Cmd::SERVER_STATUS_RESPONSE, request_id, rtt);
-                result.status.ok = true;
-                result.status.round_trip_ms = rtt;
-                result.status.server_id = fixed_string(response.server_id);
-                result.status.total_rooms = response.total_rooms;
-                result.status.active_participants = response.active_participants;
-                result.status.truncated = response.truncated != 0;
-                result.status.token_auth_available =
+                udp::resolver resolver;
+                asio::steady_timer timer;
+                StatusRefreshTarget target;
+                udp::endpoint endpoint;
+                ServerStatus status;
+                std::chrono::steady_clock::time_point sent_at{};
+                uint16_t expected_room_offset = 0;
+                int page_count = 0;
+                bool has_rtt = false;
+                bool finished = false;
+            };
+
+            explicit StatusRefreshRunner(std::vector<StatusRefreshTarget> target_values)
+                : targets(std::move(target_values)), socket(context) {}
+
+            std::vector<BrowserJobResult::StatusUpdate> run() {
+                std::error_code ec;
+                udp_network::open_dual_stack_socket(socket, 0, ec);
+                if (ec) {
+                    for (const auto& target: targets) {
+                        updates.push_back(failure_update(target, ec.message()));
+                    }
+                    return std::move(updates);
+                }
+
+                pending = static_cast<int>(targets.size());
+                if (pending == 0) {
+                    return {};
+                }
+
+                start_receive();
+                for (const auto& target: targets) {
+                    auto state =
+                        std::make_shared<ProbeState>(context, target);
+                    probes.push_back(state);
+                    request_map.emplace(target.request_id, state);
+                    start_resolve(state);
+                }
+                context.run();
+                return std::move(updates);
+            }
+
+            void start_resolve(const std::shared_ptr<ProbeState>& state) {
+                arm_timeout(state);
+                state->resolver.async_resolve(
+                    state->target.address, std::to_string(state->target.port),
+                    [self = shared_from_this(), state](
+                        std::error_code ec,
+                        udp::resolver::results_type endpoints) {
+                        self->handle_resolve(state, ec, std::move(endpoints));
+                    });
+            }
+
+            void handle_resolve(const std::shared_ptr<ProbeState>& state,
+                                std::error_code ec,
+                                const udp::resolver::results_type& endpoints) {
+                if (state->finished) {
+                    return;
+                }
+                if (ec || endpoints.empty()) {
+                    finish_failure(state, ec ? ec.message()
+                                             : "server address did not resolve");
+                    return;
+                }
+
+                const auto endpoint =
+                    udp_network::choose_endpoint_for_socket(socket, endpoints);
+                if (!endpoint.has_value()) {
+                    finish_failure(state, "server address did not resolve");
+                    return;
+                }
+                state->endpoint = *endpoint;
+                request_page(state, 0);
+            }
+
+            void request_page(const std::shared_ptr<ProbeState>& state,
+                              uint16_t room_offset) {
+                if (state->finished) {
+                    return;
+                }
+
+                arm_timeout(state);
+                auto request = std::make_shared<ServerStatusRequestHdr>();
+                request->magic = CTRL_MAGIC;
+                request->type = CtrlHdr::Cmd::SERVER_STATUS_REQUEST;
+                request->request_id = state->target.request_id;
+                request->room_offset = room_offset;
+                request->room_limit =
+                    state->target.selected
+                        ? static_cast<uint8_t>(MAX_ROOM_STATUS_SUMMARIES)
+                        : 1;
+                state->expected_room_offset = room_offset;
+
+                state->sent_at = std::chrono::steady_clock::now();
+                socket.async_send_to(
+                    asio::buffer(request.get(), sizeof(*request)),
+                    state->endpoint,
+                    [self = shared_from_this(), state,
+                     request](std::error_code ec, std::size_t bytes) {
+                        self->handle_send(state, *request, ec, bytes);
+                    });
+            }
+
+            void handle_send(const std::shared_ptr<ProbeState>& state,
+                             const ServerStatusRequestHdr& request,
+                             std::error_code ec, std::size_t bytes) {
+                if (state->finished) {
+                    return;
+                }
+                if (ec) {
+                    finish_failure(state, ec.message());
+                    return;
+                }
+                spdlog::info("Room browser UDP send {} to {}:{} bytes={}",
+                             room_browser_udp_request_summary(request),
+                             state->target.address, state->target.port, bytes);
+            }
+
+            void start_receive() {
+                socket.async_receive_from(
+                    asio::buffer(buffer), sender,
+                    [self = shared_from_this()](std::error_code ec,
+                                                std::size_t bytes) {
+                        self->handle_receive(ec, bytes);
+                    });
+            }
+
+            void handle_receive(std::error_code ec, std::size_t bytes) {
+                if (ec) {
+                    if (ec == asio::error::operation_aborted) {
+                        return;
+                    }
+                    if (pending > 0) {
+                        start_receive();
+                    }
+                    return;
+                }
+
+                handle_response(bytes);
+                if (pending > 0) {
+                    start_receive();
+                }
+            }
+
+            void handle_response(std::size_t bytes) {
+                if (bytes < sizeof(ServerStatusResponseHdr)) {
+                    return;
+                }
+
+                CtrlHdr ctrl{};
+                std::memcpy(&ctrl, buffer.data(), sizeof(ctrl));
+                if (ctrl.magic != CTRL_MAGIC ||
+                    ctrl.type != CtrlHdr::Cmd::SERVER_STATUS_RESPONSE) {
+                    return;
+                }
+
+                ServerStatusResponseHdr response{};
+                std::memcpy(&response, buffer.data(), sizeof(response));
+                const auto it = request_map.find(response.request_id);
+                if (it == request_map.end()) {
+                    return;
+                }
+
+                auto state = it->second;
+                if (state->finished || !same_endpoint(sender, state->endpoint)) {
+                    return;
+                }
+                if (response.room_offset != state->expected_room_offset) {
+                    return;
+                }
+
+                apply_response(*state, response);
+                const size_t next_offset =
+                    static_cast<size_t>(response.room_offset) + response.room_count;
+                const bool can_page =
+                    state->target.selected && response.room_count != 0 &&
+                    response.truncated != 0 && next_offset < response.total_rooms &&
+                    state->page_count + 1 < ROOM_STATUS_PAGE_LIMIT;
+                if (can_page) {
+                    ++state->page_count;
+                    request_page(state, static_cast<uint16_t>(std::min<size_t>(
+                                            next_offset,
+                                            std::numeric_limits<uint16_t>::max())));
+                    return;
+                }
+
+                state->status.truncated =
+                    state->target.selected && response.truncated != 0 &&
+                    next_offset < response.total_rooms;
+                finish_success(state);
+            }
+
+            void apply_response(ProbeState& state,
+                                const ServerStatusResponseHdr& response) {
+                const auto received_at = std::chrono::steady_clock::now();
+                if (!state.has_rtt) {
+                    state.status.round_trip_ms =
+                        std::chrono::duration<double, std::milli>(
+                            received_at - state.sent_at)
+                            .count();
+                    state.has_rtt = true;
+                }
+
+                state.status.ok = true;
+                state.status.rooms_loaded = state.target.selected;
+                state.status.server_id = fixed_string(response.server_id);
+                state.status.total_rooms = response.total_rooms;
+                state.status.active_participants = response.active_participants;
+                state.status.token_auth_available =
                     response.token_auth_available != 0;
+                state.status.truncated = response.truncated != 0;
+
+                if (!state.target.selected) {
+                    return;
+                }
 
                 for (uint8_t i = 0; i < response.room_count; ++i) {
                     BrowserRoom room;
@@ -2096,29 +2366,89 @@ void JuceRoomBrowserComponent::start_status_refresh(bool manual) {
                     room.participant_count = response.rooms[i].participant_count;
                     room.access_mode = response.rooms[i].access_mode;
                     room.locked = room.access_mode == ROOM_ACCESS_PASSWORD;
-                    result.status.rooms.push_back(std::move(room));
+                    state.status.rooms.push_back(std::move(room));
                 }
-
-                const size_t next_offset =
-                    static_cast<size_t>(response.room_offset) + response.room_count;
-                if (response.room_count == 0 || response.truncated == 0 ||
-                    next_offset >= response.total_rooms) {
-                    result.status.truncated = false;
-                    break;
-                }
-                if (page + 1 == ROOM_STATUS_PAGE_LIMIT) {
-                    result.status.truncated = true;
-                    break;
-                }
-                room_offset = static_cast<uint16_t>(
-                    std::min<size_t>(next_offset,
-                                     std::numeric_limits<uint16_t>::max()));
             }
-        } catch (const std::exception& e) {
-            result.status.ok = false;
-            result.status.reason = e.what();
-            result.message = e.what();
-        }
+
+            void arm_timeout(const std::shared_ptr<ProbeState>& state) {
+                state->timer.expires_after(1100ms);
+                state->timer.async_wait(
+                    [self = shared_from_this(), state](std::error_code ec) {
+                        if (ec || state->finished) {
+                            return;
+                        }
+                        if (state->status.ok) {
+                            self->finish_success(state);
+                        } else {
+                            self->finish_failure(state, "server did not respond");
+                        }
+                    });
+            }
+
+            void finish_success(const std::shared_ptr<ProbeState>& state) {
+                BrowserJobResult::StatusUpdate update;
+                update.server_index = state->target.server_index;
+                update.server_address = state->target.address;
+                update.server_port = state->target.port;
+                update.status = std::move(state->status);
+                finish(state, std::move(update));
+            }
+
+            void finish_failure(const std::shared_ptr<ProbeState>& state,
+                                std::string message) {
+                finish(state, failure_update(state->target, std::move(message)));
+            }
+
+            BrowserJobResult::StatusUpdate failure_update(
+                const StatusRefreshTarget& target, std::string message) const {
+                BrowserJobResult::StatusUpdate update;
+                update.server_index = target.server_index;
+                update.server_address = target.address;
+                update.server_port = target.port;
+                update.status.ok = false;
+                update.status.reason = message;
+                update.message = std::move(message);
+                return update;
+            }
+
+            void finish(const std::shared_ptr<ProbeState>& state,
+                        BrowserJobResult::StatusUpdate update) {
+                if (state->finished) {
+                    return;
+                }
+                state->finished = true;
+                std::error_code ignored;
+                state->resolver.cancel();
+                state->timer.cancel();
+                request_map.erase(state->target.request_id);
+                updates.push_back(std::move(update));
+                --pending;
+                if (pending == 0) {
+                    socket.cancel(ignored);
+                    context.stop();
+                }
+            }
+
+            bool same_endpoint(const udp::endpoint& left,
+                               const udp::endpoint& right) const {
+                return left.port() == right.port() &&
+                       udp_network::format_address_for_display(left.address()) ==
+                           udp_network::format_address_for_display(right.address());
+            }
+
+            std::vector<StatusRefreshTarget> targets;
+            asio::io_context context;
+            udp::socket socket;
+            std::vector<std::shared_ptr<ProbeState>> probes;
+            std::unordered_map<uint32_t, std::shared_ptr<ProbeState>> request_map;
+            std::vector<BrowserJobResult::StatusUpdate> updates;
+            std::array<unsigned char, 2048> buffer{};
+            udp::endpoint sender;
+            int pending = 0;
+        };
+
+        result.status_updates =
+            std::make_shared<StatusRefreshRunner>(std::move(targets))->run();
         return result;
     });
 }
@@ -2172,7 +2502,6 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                               : "";
                       const auto profile_id =
                           self->profile_id_for_display_name(display_name);
-                      const int server_index = self->selected_server_index_;
                       const uint32_t request_id = self->next_request_id();
                       self->persist_selected_server();
 
@@ -2181,12 +2510,11 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                           juce::String(room.room_name.empty() ? room.room_id
                                                               : room.room_name) +
                           "...";
-                      self->start_job([self, server, server_index, room, profile_id,
+                      self->start_job([self, server, room, profile_id,
                                        display_name, password,
                                        request_id]() {
                           BrowserJobResult result_value;
                           result_value.kind = JobKind::Join;
-                          result_value.server_index = server_index;
                           result_value.server_address = server.address;
                           result_value.server_port = server.port;
                           result_value.display_name = display_name;
@@ -2347,20 +2675,18 @@ void JuceRoomBrowserComponent::start_create_flow() {
                 const auto profile_id =
                     self->profile_id_for_display_name(input.display_name);
                 const auto server = self->selected_server();
-                const int server_index = self->selected_server_index_;
                 const uint32_t request_id = self->next_request_id();
                 self->persist_selected_server();
 
                 self->status_text_ =
                     "Creating " + juce::String(input.room_name) + "...";
-                self->start_job([self, server, server_index, room_id,
+                self->start_job([self, server, room_id,
                                  room_name = input.room_name, profile_id,
                                  display_name = input.display_name,
                                  password = input.password, media_secret,
                                  access_mode = input.access_mode, request_id]() {
                     BrowserJobResult result_value;
                     result_value.kind = JobKind::Create;
-                    result_value.server_index = server_index;
                     result_value.server_address = server.address;
                     result_value.server_port = server.port;
                     result_value.display_name = display_name;
@@ -2633,15 +2959,53 @@ void JuceRoomBrowserComponent::poll_job_result() {
 }
 
 void JuceRoomBrowserComponent::apply_status(BrowserJobResult result) {
-    if (result.server_index >= 0 &&
-        result.server_index < static_cast<int>(servers_.size())) {
-        auto& server = servers_[static_cast<size_t>(result.server_index)];
-        server.status = std::move(result.status);
-        server.last_refresh = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    bool selected_server_was_refreshed = false;
+    std::string selected_server_message;
+
+    for (auto& update: result.status_updates) {
+        std::optional<int> server_index;
+        if (update.server_index >= 0 &&
+            update.server_index < static_cast<int>(servers_.size())) {
+            const auto& server =
+                servers_[static_cast<size_t>(update.server_index)];
+            if (same_endpoint(server.address, server.port, update.server_address,
+                              update.server_port)) {
+                server_index = update.server_index;
+            }
+        }
+        if (!server_index.has_value()) {
+            server_index =
+                find_server_endpoint(update.server_address, update.server_port);
+        }
+        if (!server_index.has_value()) {
+            continue;
+        }
+
+        auto& server = servers_[static_cast<size_t>(*server_index)];
+        server.status = std::move(update.status);
+        server.last_refresh = now;
+        const bool selected = *server_index == selected_server_index_;
+        server.next_status_refresh =
+            now + (server.status.ok || selected ? 10s : 30s);
+        if (selected) {
+            selected_server_was_refreshed = true;
+            selected_server_message = update.message;
+            result.server_address = server.address;
+            result.server_port = server.port;
+        }
     }
+
+    if (!selected_server_was_refreshed) {
+        next_auto_refresh_ = now;
+        return;
+    }
+
     if (selected_status().ok) {
         status_text_ =
-            selected_status().rooms.empty()
+            !selected_status().rooms_loaded
+                ? "Refreshing..."
+                : selected_status().rooms.empty()
                 ? "No rooms on this server"
                 : selected_status().truncated
                       ? "Showing " +
@@ -2652,10 +3016,14 @@ void JuceRoomBrowserComponent::apply_status(BrowserJobResult result) {
                             " rooms"
                       : "Ready";
     } else {
-        status_text_ = result.message.empty() ? "Server offline" : result.message;
+        status_text_ = selected_server_message.empty() ? "Server offline"
+                                                       : selected_server_message;
+    }
+    if (selected_status().ok && !selected_status().rooms_loaded) {
+        next_auto_refresh_ = now;
     }
     clamp_scroll_offsets();
-    if (result.status.ok && pending_invite_join_.has_value() &&
+    if (selected_status().ok && pending_invite_join_.has_value() &&
         pending_invite_join_->server_address == result.server_address &&
         pending_invite_join_->server_port == result.server_port) {
         const auto room_id = pending_invite_join_->room_id;

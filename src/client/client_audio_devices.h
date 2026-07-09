@@ -24,6 +24,11 @@ struct SavedRoomServer {
     uint16_t port = 0;
 };
 
+struct SavedRoomServerEndpoint {
+    std::string address;
+    uint16_t port = 0;
+};
+
 AudioDevicePreferences load_audio_device_preferences(const std::filesystem::path& path);
 // Save calls enqueue serialized background writes. The return value means the
 // write was accepted, not that it has already reached disk.
@@ -37,6 +42,10 @@ bool save_saved_room_servers(const std::filesystem::path& path,
                              const std::vector<SavedRoomServer>& servers,
                              std::optional<bool> room_servers_seeded = std::nullopt);
 bool load_room_servers_seeded(const std::filesystem::path& path);
+std::optional<SavedRoomServerEndpoint> load_last_selected_room_server(
+    const std::filesystem::path& path);
+bool save_last_selected_room_server(const std::filesystem::path& path,
+                                    const SavedRoomServerEndpoint& server);
 std::string load_client_display_name(const std::filesystem::path& path);
 bool save_client_display_name(const std::filesystem::path& path,
                               const std::string& display_name);

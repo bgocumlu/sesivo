@@ -184,6 +184,7 @@ private:
                                             std::optional<int> ignored_index =
                                                 std::nullopt) const;
     void focus_server(int index);
+    void persist_selected_server() const;
     int server_row_at(juce::Point<int> position) const;
     int room_row_at(juce::Point<int> position) const;
     bool join_button_at(juce::Point<int> position) const;

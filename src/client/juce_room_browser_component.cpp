@@ -1160,6 +1160,10 @@ void JuceRoomBrowserComponent::load_servers() {
     const bool has_startup_server =
         startup_options_.server_endpoint_explicit &&
         (!startup_options_.server_address.empty() || startup_options_.server_port != 0);
+    const auto last_selected_server =
+        has_startup_server
+            ? std::optional<SavedRoomServerEndpoint>{}
+            : load_last_selected_room_server(startup_options_.config_path);
     auto startup_server = make_server(
         {}, startup_options_.server_address,
         startup_options_.server_port == 0 ? 9999 : startup_options_.server_port);
@@ -1176,6 +1180,13 @@ void JuceRoomBrowserComponent::load_servers() {
         } else {
             servers_.insert(servers_.begin(), std::move(startup_server));
             selected_server_index_ = 0;
+        }
+    } else if (last_selected_server.has_value()) {
+        if (const auto existing = find_server_endpoint(
+                last_selected_server->address, last_selected_server->port)) {
+            selected_server_index_ = *existing;
+        } else {
+            spdlog::info("Last selected room server is not in the saved server list");
         }
     }
 
@@ -1955,9 +1966,7 @@ void JuceRoomBrowserComponent::mouseDown(const juce::MouseEvent& event) {
 
     const int server_index = server_row_at(position);
     if (server_index >= 0) {
-        selected_server_index_ = server_index;
-        selected_room_index_ = -1;
-        room_scroll_px_ = 0;
+        focus_server(server_index);
         start_status_refresh(true);
         repaint();
         return;
@@ -2165,6 +2174,7 @@ void JuceRoomBrowserComponent::start_join_flow(int room_index) {
                           self->profile_id_for_display_name(display_name);
                       const int server_index = self->selected_server_index_;
                       const uint32_t request_id = self->next_request_id();
+                      self->persist_selected_server();
 
                       self->status_text_ =
                           "Joining " +
@@ -2302,8 +2312,8 @@ void JuceRoomBrowserComponent::start_join_invite_flow(std::string initial_invite
                     server.name = "Invite";
                     server.address = invite->server_address;
                     server.port = invite->server_port;
-                    self->servers_.insert(self->servers_.begin(), std::move(server));
-                    self->focus_server(0);
+                    self->servers_.push_back(std::move(server));
+                    self->focus_server(static_cast<int>(self->servers_.size()) - 1);
                     self->save_servers();
                 }
                 self->pending_invite_join_ = PendingInviteJoin{
@@ -2339,6 +2349,7 @@ void JuceRoomBrowserComponent::start_create_flow() {
                 const auto server = self->selected_server();
                 const int server_index = self->selected_server_index_;
                 const uint32_t request_id = self->next_request_id();
+                self->persist_selected_server();
 
                 self->status_text_ =
                     "Creating " + juce::String(input.room_name) + "...";
@@ -2475,10 +2486,9 @@ void JuceRoomBrowserComponent::start_edit_servers_flow() {
                         return;
                     }
                     self->servers_.erase(self->servers_.begin() + edit_index);
-                    self->selected_server_index_ =
+                    self->focus_server(
                         std::clamp(edit_index, 0,
-                                   static_cast<int>(self->servers_.size()) - 1);
-                    self->selected_room_index_ = -1;
+                                   static_cast<int>(self->servers_.size()) - 1));
                     self->status_text_ = "Server removed";
                     self->save_servers();
                     self->start_status_refresh(true);
@@ -2517,8 +2527,7 @@ void JuceRoomBrowserComponent::start_edit_servers_flow() {
                 updated.status = {};
                 updated.last_refresh = {};
                 self->servers_[static_cast<size_t>(edit_index)] = std::move(updated);
-                self->selected_server_index_ = edit_index;
-                self->selected_room_index_ = -1;
+                self->focus_server(edit_index);
                 self->save_servers();
                 self->start_status_refresh(true);
                 self->repaint();
@@ -2870,6 +2879,19 @@ void JuceRoomBrowserComponent::focus_server(int index) {
         server_scroll_px_ = selected_bottom - visible_height;
     }
     clamp_scroll_offsets();
+    persist_selected_server();
+}
+
+void JuceRoomBrowserComponent::persist_selected_server() const {
+    if (selected_server_index_ < 0 ||
+        selected_server_index_ >= static_cast<int>(servers_.size())) {
+        return;
+    }
+
+    const auto& server = servers_[static_cast<size_t>(selected_server_index_)];
+    save_last_selected_room_server(
+        startup_options_.config_path,
+        SavedRoomServerEndpoint{server.address, server.port});
 }
 
 int JuceRoomBrowserComponent::server_row_at(juce::Point<int> position) const {

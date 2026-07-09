@@ -12,6 +12,7 @@
 namespace {
 
 constexpr const char* ROOM_SERVERS_SEEDED_KEY = "roomServersSeeded";
+constexpr const char* LAST_SELECTED_SERVER_KEY = "lastSelectedServer";
 
 std::string trim_copy(const std::string& value) {
     const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char c) {
@@ -192,6 +193,55 @@ bool load_room_servers_seeded(const std::filesystem::path& path) {
         static_cast<bool>(root_obj->getProperty(ROOM_SERVERS_SEEDED_KEY));
     spdlog::info("Loaded room server seed flag: {}", seeded);
     return seeded;
+}
+
+std::optional<SavedRoomServerEndpoint> load_last_selected_room_server(
+    const std::filesystem::path& path) {
+    auto root = read_client_config_root(path);
+    const auto* root_obj = root.getDynamicObject();
+    if (root_obj == nullptr) {
+        spdlog::info("Last selected room server not found");
+        return std::nullopt;
+    }
+
+    const auto selected_value = root_obj->getProperty(LAST_SELECTED_SERVER_KEY);
+    auto* selected = selected_value.getDynamicObject();
+    if (selected == nullptr) {
+        spdlog::info("Last selected room server not found");
+        return std::nullopt;
+    }
+
+    SavedRoomServerEndpoint server;
+    server.address = trim_copy(string_property(*selected, "address"));
+    const int port = static_cast<int>(selected->getProperty("port"));
+    if (server.address.empty() || port <= 0 || port > 65535) {
+        spdlog::warn("Last selected room server is invalid");
+        return std::nullopt;
+    }
+    server.port = static_cast<uint16_t>(port);
+    spdlog::info("Loaded last selected room server: {}:{}", server.address,
+                 server.port);
+    return server;
+}
+
+bool save_last_selected_room_server(const std::filesystem::path& path,
+                                    const SavedRoomServerEndpoint& server) {
+    const auto address = trim_copy(server.address);
+    if (path.empty() || address.empty() || server.port == 0) {
+        return false;
+    }
+
+    spdlog::info("Queueing last selected room server save: {}:{}", address,
+                 server.port);
+    return enqueue_client_config_write(
+        path,
+        [address, port = server.port](juce::DynamicObject& object) {
+            auto* selected = new juce::DynamicObject();
+            selected->setProperty("address", juce::String(address));
+            selected->setProperty("port", static_cast<int>(port));
+            object.setProperty(LAST_SELECTED_SERVER_KEY, juce::var(selected));
+        },
+        "Saved last selected room server");
 }
 
 std::string load_client_display_name(const std::filesystem::path& path) {

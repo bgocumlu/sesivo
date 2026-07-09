@@ -91,6 +91,14 @@ jobs:
             return String(tagName ?? "").replace(/^v/i, "");
           }
 
+          function replaceLatestVersion(html, version) {
+            const pattern = /<p>Latest version: [^<]+<\/p>/;
+            if (!pattern.test(html)) {
+              throw new Error("Could not find latest version text in downloads.html.");
+            }
+            return html.replace(pattern, `<p>Latest version: ${version}</p>`);
+          }
+
           function updateInfoJson(release) {
             if (!fs.existsSync("info.json")) {
               console.log("info.json not found; skipping latest_version update.");
@@ -124,7 +132,9 @@ jobs:
               return;
             }
 
+            const version = releaseVersion(release.tag_name);
             let downloadsHtml = fs.readFileSync("downloads.html", "utf8");
+            downloadsHtml = replaceLatestVersion(downloadsHtml, version);
             downloadsHtml = replaceDownloadLink(
               downloadsHtml,
               "Download Sesivo for macOS",

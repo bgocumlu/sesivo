@@ -5,6 +5,7 @@
 #include "client_config_path.h"
 #include "client_runtime.h"
 #include "client_startup.h"
+#include "http_json_fetch_job.h"
 #include "juce_main_window.h"
 #include "logging_setup.h"
 #include "opus_defines.h"
@@ -16,9 +17,12 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <exception>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -31,6 +35,10 @@
 #endif
 
 namespace {
+
+constexpr const char* APP_INFO_URL = "https://sesivo.app/info.json";
+constexpr const char* DEFAULT_DOWNLOADS_URL = "https://sesivo.app/downloads.html";
+constexpr int UPDATE_CHECK_TIMEOUT_MS = 3000;
 
 bool apply_startup_latency_profile(ClientAppFacade& client,
                                    const ClientStartupOptions& startup_options) {
@@ -119,6 +127,86 @@ std::string invite_text_from_launch(const juce::String& command_line,
     return invite_text_from_candidates(candidates);
 }
 
+std::string trim_ascii(std::string value) {
+    auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+    value.erase(value.begin(),
+                std::find_if(value.begin(), value.end(),
+                             [&](char c) { return !is_space(c); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(),
+                             [&](char c) { return !is_space(c); })
+                    .base(),
+                value.end());
+    return value;
+}
+
+std::optional<std::vector<int>> parse_version_numbers(std::string version) {
+    version = trim_ascii(std::move(version));
+    if (!version.empty() && (version.front() == 'v' || version.front() == 'V')) {
+        version.erase(version.begin());
+    }
+    if (version.empty()) {
+        return std::nullopt;
+    }
+
+    std::vector<int> parts;
+    size_t start = 0;
+    while (start <= version.size()) {
+        const size_t dot = version.find('.', start);
+        const size_t end = dot == std::string::npos ? version.size() : dot;
+        if (end == start) {
+            return std::nullopt;
+        }
+
+        int value = 0;
+        for (size_t i = start; i < end; ++i) {
+            const unsigned char c = static_cast<unsigned char>(version[i]);
+            if (!std::isdigit(c)) {
+                return std::nullopt;
+            }
+            const int digit = version[i] - '0';
+            if (value > (std::numeric_limits<int>::max() - digit) / 10) {
+                return std::nullopt;
+            }
+            value = value * 10 + digit;
+        }
+        parts.push_back(value);
+        if (dot == std::string::npos) {
+            break;
+        }
+        start = dot + 1;
+    }
+
+    return parts.empty() ? std::nullopt
+                         : std::optional<std::vector<int>>(std::move(parts));
+}
+
+bool version_is_newer(const std::string& latest, const std::string& current) {
+    const auto latest_parts = parse_version_numbers(latest);
+    const auto current_parts = parse_version_numbers(current);
+    if (!latest_parts.has_value() || !current_parts.has_value()) {
+        return false;
+    }
+
+    const size_t count = std::max(latest_parts->size(), current_parts->size());
+    for (size_t i = 0; i < count; ++i) {
+        const int latest_value = i < latest_parts->size() ? (*latest_parts)[i] : 0;
+        const int current_value =
+            i < current_parts->size() ? (*current_parts)[i] : 0;
+        if (latest_value != current_value) {
+            return latest_value > current_value;
+        }
+    }
+    return false;
+}
+
+std::string json_string_property(const juce::var& root, const char* key) {
+    auto* object = root.getDynamicObject();
+    if (object == nullptr) {
+        return {};
+    }
+    return trim_ascii(object->getProperty(key).toString().toStdString());
+}
+
 #if JUCE_WINDOWS
 bool set_registry_string(HKEY parent, const wchar_t* subkey, const wchar_t* name,
                          const std::wstring& value) {
@@ -184,7 +272,8 @@ void register_windows_url_protocol() {
 void register_windows_url_protocol() {}
 #endif
 
-class SesivoApplication final : public juce::JUCEApplication {
+class SesivoApplication final : public juce::JUCEApplication,
+                                private juce::Timer {
 public:
     const juce::String getApplicationName() override { return "sesivo"; }
     const juce::String getApplicationVersion() override { return SESIVO_VERSION; }
@@ -237,6 +326,9 @@ public:
     }
 
     void shutdown() override {
+        stopTimer();
+        update_check_.join();
+        update_dialog_.reset();
         main_window_ = nullptr;
         if (client_runtime_ != nullptr) {
             auto& client_app = client_runtime_->app_facade();
@@ -262,6 +354,18 @@ public:
     }
 
 private:
+    void timerCallback() override {
+        if (main_window_ == nullptr) {
+            stopTimer();
+            return;
+        }
+
+        if (auto result = update_check_.poll()) {
+            stopTimer();
+            apply_update_check_result(*result);
+        }
+    }
+
     void start_runtime(const juce::String& command_line) {
         io_context_ = std::make_unique<asio::io_context>();
         const auto config_path = client_config_path(startup_options_.config_dir);
@@ -307,6 +411,7 @@ private:
         main_window_ = std::make_unique<JuceMainWindow>(
             "sesivo", client_app, std::move(gui_startup_options),
             []() { juce::JUCEApplicationBase::quit(); });
+        schedule_update_check();
         if (!launch_invite.empty()) {
             schedule_open_invite(std::move(launch_invite));
         }
@@ -375,6 +480,64 @@ private:
         return true;
     }
 
+    void schedule_update_check() {
+        update_check_.start(APP_INFO_URL, UPDATE_CHECK_TIMEOUT_MS);
+        startTimerHz(10);
+    }
+
+    void apply_update_check_result(const HttpJsonFetchResult& result) {
+        if (!result.ok) {
+            return;
+        }
+
+        const auto status = json_string_property(result.json, "status");
+        if (!status.empty() && status != "ok") {
+            return;
+        }
+
+        const auto latest_version =
+            json_string_property(result.json, "latest_version");
+        if (!version_is_newer(latest_version, SESIVO_VERSION)) {
+            return;
+        }
+
+        auto downloads_page = json_string_property(result.json, "downloads_page");
+        if (downloads_page.empty()) {
+            downloads_page = DEFAULT_DOWNLOADS_URL;
+        }
+
+        show_update_dialog(latest_version, downloads_page);
+    }
+
+    void show_update_dialog(const std::string& latest_version,
+                            std::string downloads_page) {
+        if (main_window_ == nullptr || update_dialog_ != nullptr) {
+            return;
+        }
+
+        update_dialog_ = std::make_unique<juce::AlertWindow>(
+            "Update Available",
+            juce::String("Current version: ") + juce::String(SESIVO_VERSION) +
+                "\nLatest version: " + juce::String(latest_version),
+            juce::AlertWindow::NoIcon, main_window_.get());
+        auto& dialog = *update_dialog_;
+        dialog.addButton("Update", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        dialog.addButton("Close", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+        dialog.enterModalState(
+            true, juce::ModalCallbackFunction::create(
+                      [this, downloads_page = std::move(downloads_page)](int result) {
+                          if (result == 1) {
+                              juce::URL(downloads_page).launchInDefaultBrowser();
+                          }
+                          if (update_dialog_ != nullptr) {
+                              update_dialog_->exitModalState(result);
+                              update_dialog_->setVisible(false);
+                              update_dialog_.reset();
+                          }
+                      }),
+            false);
+    }
+
     void open_invite_if_present(const juce::String& command_line) {
         auto launch_invite = invite_text_from_launch(command_line, false);
         if (!launch_invite.empty() && main_window_ != nullptr) {
@@ -401,6 +564,8 @@ private:
     std::unique_ptr<ClientRuntime> client_runtime_;
     std::thread io_thread_;
     std::unique_ptr<JuceMainWindow> main_window_;
+    HttpJsonFetchJob update_check_;
+    std::unique_ptr<juce::AlertWindow> update_dialog_;
 };
 
 juce::JUCEApplicationBase* create_sesivo_application() {

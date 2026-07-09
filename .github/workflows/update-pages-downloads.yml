@@ -87,6 +87,24 @@ jobs:
             );
           }
 
+          function releaseVersion(tagName) {
+            return String(tagName ?? "").replace(/^v/i, "");
+          }
+
+          function updateInfoJson(release) {
+            if (!fs.existsSync("info.json")) {
+              console.log("info.json not found; skipping latest_version update.");
+              return;
+            }
+
+            const info = JSON.parse(fs.readFileSync("info.json", "utf8"));
+            info.latest_version = releaseVersion(release.tag_name);
+            if (release.html_url) {
+              info.latest_release = release.html_url;
+            }
+            fs.writeFileSync("info.json", `${JSON.stringify(info, null, 2)}\n`);
+          }
+
           async function main() {
             const release = await getJson(releaseUrl);
             const assets = release.assets ?? [];
@@ -118,6 +136,7 @@ jobs:
               windowsAsset.browser_download_url,
             );
             fs.writeFileSync("downloads.html", downloadsHtml);
+            updateInfoJson(release);
 
             if (fs.existsSync("llms.txt")) {
               let llms = fs.readFileSync("llms.txt", "utf8");
@@ -145,7 +164,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads.html llms.txt
+          git add downloads.html info.json llms.txt
           if git diff --cached --quiet; then
             echo "Download links are already current."
             exit 0

@@ -286,6 +286,8 @@ private:
             startup_options_.startup_input_channel_index;
         gui_startup_options.server_address = startup_options_.server_address;
         gui_startup_options.server_port = startup_options_.server_port;
+        gui_startup_options.server_endpoint_explicit =
+            startup_options_.server_endpoint_explicit;
         std::string token_reason;
         const auto startup_token = performer_join_token::parse_unverified(
             startup_options_.performer_join.join_token, token_reason);

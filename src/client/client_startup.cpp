@@ -80,8 +80,10 @@ ClientStartupOptions parse_startup_options(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--server" && i + 1 < argc) {
             options.server_address = argv[++i];
+            options.server_endpoint_explicit = true;
         } else if (arg == "--port" && i + 1 < argc) {
             options.server_port = parse_udp_port(argv[++i], "--port");
+            options.server_endpoint_explicit = true;
         } else if (arg == "--app-version" && i + 1 < argc) {
             options.app_version = argv[++i];
         } else if (arg == "--config-dir" && i + 1 < argc) {

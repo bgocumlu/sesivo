@@ -9,6 +9,7 @@
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
@@ -38,6 +39,8 @@ constexpr int CONTENT_GAP = juce_theme::gap;
 constexpr int SERVER_ROW_HEIGHT = 70;
 constexpr int ROOM_ROW_HEIGHT = 66;
 constexpr int ROOM_STATUS_PAGE_LIMIT = 8;
+constexpr const char* OFFICIAL_SERVERS_URL = "https://sesivo.app/api/servers.json";
+constexpr int OFFICIAL_SERVERS_FETCH_TIMEOUT_MS = 5000;
 
 namespace ui {
 const juce::Colour background{0xff121315};
@@ -356,8 +359,70 @@ bool is_local_address(const std::string& address) {
     return value == "127.0.0.1" || value == "localhost" || value == "::1";
 }
 
+std::string normalized_endpoint_address(std::string address) {
+    return lowercase_copy(trim_copy(std::move(address)));
+}
+
+bool same_endpoint(const std::string& left_address, uint16_t left_port,
+                   const std::string& right_address, uint16_t right_port) {
+    return left_port == right_port &&
+           normalized_endpoint_address(left_address) ==
+               normalized_endpoint_address(right_address);
+}
+
 juce::String endpoint_label(const std::string& address, uint16_t port) {
     return juce::String(address) + ":" + juce::String(port);
+}
+
+std::string string_property(juce::DynamicObject& object, const char* key) {
+    return trim_copy(object.getProperty(key).toString().toStdString());
+}
+
+struct ParsedOfficialRoomServers {
+    bool valid = false;
+    std::vector<SavedRoomServer> servers;
+};
+
+ParsedOfficialRoomServers parse_official_room_servers(const juce::var& root) {
+    ParsedOfficialRoomServers parsed;
+    auto* root_object = root.getDynamicObject();
+    if (root_object == nullptr) {
+        spdlog::warn("Official room server JSON is not an object");
+        return parsed;
+    }
+
+    const auto servers_value = root_object->getProperty("servers");
+    const auto* servers = servers_value.getArray();
+    if (servers == nullptr) {
+        spdlog::warn("Official room server fetch returned no servers array");
+        return parsed;
+    }
+
+    parsed.valid = true;
+    for (const auto& server_value: *servers) {
+        auto* server_object = server_value.getDynamicObject();
+        if (server_object == nullptr) {
+            continue;
+        }
+
+        const auto enabled = server_object->getProperty("enabled");
+        if (!enabled.isVoid() && !static_cast<bool>(enabled)) {
+            continue;
+        }
+
+        SavedRoomServer server;
+        server.name = string_property(*server_object, "name");
+        server.address = string_property(*server_object, "address");
+        const int port = static_cast<int>(server_object->getProperty("port"));
+        if (server.address.empty() || port <= 0 || port > 65535) {
+            continue;
+        }
+        server.port = static_cast<uint16_t>(port);
+        parsed.servers.push_back(std::move(server));
+    }
+    spdlog::info("Parsed {} enabled official room server(s)",
+                 parsed.servers.size());
+    return parsed;
 }
 
 template <size_t N>
@@ -574,6 +639,12 @@ struct CreateRoomInput {
     uint8_t access_mode = ROOM_ACCESS_OPEN;
 };
 
+struct AddServerInput {
+    std::string name;
+    std::string address;
+    uint16_t port = 0;
+};
+
 class CreateRoomDialog final : public juce::Component {
 public:
     CreateRoomDialog(juce::String display_name,
@@ -723,6 +794,144 @@ private:
     juce::TextButton cancel_button_;
 };
 
+class OfficialServerFetchLinkButton final : public juce::Button {
+public:
+    OfficialServerFetchLinkButton() : juce::Button("Fetch official servers") {
+        setButtonText("Fetch official servers");
+        setMouseCursor(juce::MouseCursor::PointingHandCursor);
+    }
+
+    void paintButton(juce::Graphics& g, bool highlighted, bool down) override {
+        auto area = getLocalBounds();
+        g.setFont(juce_theme::font(12.5F, false));
+        g.setColour(down ? juce_theme::colour::accent()
+                         : highlighted ? juce_theme::colour::text_dim()
+                                       : juce_theme::colour::text_faint());
+        g.drawFittedText(getButtonText(), area, juce::Justification::centred, 1);
+    }
+};
+
+class AddServerDialog final : public juce::Component {
+public:
+    AddServerDialog(std::function<void(AddServerInput)> on_add,
+                    std::function<void()> on_fetch_official)
+        : on_add_(std::move(on_add)),
+          on_fetch_official_(std::move(on_fetch_official)) {
+        setSize(370, 294);
+
+        name_label_.setText("Name", juce::dontSendNotification);
+        address_label_.setText("Address", juce::dontSendNotification);
+        port_label_.setText("Port", juce::dontSendNotification);
+        status_label_.setText({}, juce::dontSendNotification);
+        for (auto* label: {&name_label_, &address_label_, &port_label_}) {
+            juce_theme::style_label(*label, juce_theme::colour::text(), 12.5F);
+        }
+        juce_theme::style_label(status_label_, juce_theme::colour::warning(), 12.0F);
+
+        address_editor_.setText("127.0.0.1", juce::dontSendNotification);
+        port_editor_.setText("9999", juce::dontSendNotification);
+        port_editor_.setInputRestrictions(5, "0123456789");
+        for (auto* editor: {&name_editor_, &address_editor_, &port_editor_}) {
+            style_dialog_editor(*editor);
+        }
+
+        add_button_.setButtonText("Add");
+        cancel_button_.setButtonText("Cancel");
+        add_button_.onClick = [this]() { submit(); };
+        cancel_button_.onClick = [this]() { close(); };
+        fetch_link_.onClick = [this]() {
+            if (on_fetch_official_) {
+                on_fetch_official_();
+            }
+            close();
+        };
+
+        addAndMakeVisible(name_label_);
+        addAndMakeVisible(name_editor_);
+        addAndMakeVisible(address_label_);
+        addAndMakeVisible(address_editor_);
+        addAndMakeVisible(port_label_);
+        addAndMakeVisible(port_editor_);
+        addAndMakeVisible(status_label_);
+        addAndMakeVisible(add_button_);
+        addAndMakeVisible(cancel_button_);
+        addAndMakeVisible(fetch_link_);
+    }
+
+    void paint(juce::Graphics& g) override {
+        g.fillAll(juce_theme::colour::panel_bottom());
+    }
+
+    void resized() override {
+        auto area = getLocalBounds().reduced(34, 20);
+
+        layout_text_row(area, name_label_, name_editor_);
+        area.removeFromTop(8);
+        layout_text_row(area, address_label_, address_editor_);
+        area.removeFromTop(8);
+        layout_text_row(area, port_label_, port_editor_);
+        status_label_.setBounds(area.removeFromTop(20));
+        area.removeFromTop(8);
+
+        const int button_width = 86;
+        const int gap = 16;
+        const int total = button_width * 2 + gap;
+        auto buttons = area.removeFromTop(38);
+        buttons = buttons.withSizeKeepingCentre(total, 34);
+        add_button_.setBounds(buttons.removeFromLeft(button_width).reduced(2));
+        buttons.removeFromLeft(gap);
+        cancel_button_.setBounds(buttons.removeFromLeft(button_width).reduced(2));
+
+        area.removeFromTop(4);
+        fetch_link_.setBounds(area.removeFromTop(24).withSizeKeepingCentre(190, 24));
+    }
+
+private:
+    static void layout_text_row(juce::Rectangle<int>& area, juce::Label& label,
+                                juce::TextEditor& editor) {
+        label.setBounds(area.removeFromTop(18));
+        editor.setBounds(area.removeFromTop(28));
+    }
+
+    void submit() {
+        AddServerInput input;
+        input.name = trim_copy(name_editor_.getText().toStdString());
+        input.address = trim_copy(address_editor_.getText().toStdString());
+        const int port = port_editor_.getText().getIntValue();
+        if (input.address.empty() || port <= 0 ||
+            port > std::numeric_limits<uint16_t>::max()) {
+            status_label_.setText("Server address and port are required",
+                                  juce::dontSendNotification);
+            return;
+        }
+
+        input.port = static_cast<uint16_t>(port);
+        if (on_add_) {
+            on_add_(std::move(input));
+        }
+        close();
+    }
+
+    void close() {
+        if (auto* dialog = findParentComponentOfClass<juce::DialogWindow>()) {
+            dialog->exitModalState(0);
+        }
+    }
+
+    std::function<void(AddServerInput)> on_add_;
+    std::function<void()> on_fetch_official_;
+    juce::Label name_label_;
+    juce::TextEditor name_editor_;
+    juce::Label address_label_;
+    juce::TextEditor address_editor_;
+    juce::Label port_label_;
+    juce::TextEditor port_editor_;
+    juce::Label status_label_;
+    juce::TextButton add_button_;
+    juce::TextButton cancel_button_;
+    OfficialServerFetchLinkButton fetch_link_;
+};
+
 template <typename Request, typename Response>
 Response send_control_request(const std::string& address, uint16_t port,
                               const Request& request, CtrlHdr::Cmd expected_type,
@@ -839,6 +1048,7 @@ JuceRoomBrowserComponent::~JuceRoomBrowserComponent() {
     if (job_thread_.joinable()) {
         job_thread_.join();
     }
+    official_server_fetch_.join();
     if (audio_device_job_thread_.joinable()) {
         audio_device_job_thread_.join();
     }
@@ -930,28 +1140,36 @@ void JuceRoomBrowserComponent::load_servers() {
         return server;
     };
 
-    for (const auto& saved: load_saved_room_servers(startup_options_.config_path)) {
+    auto saved_servers = load_saved_room_servers(startup_options_.config_path);
+    room_servers_seeded_ = load_room_servers_seeded(startup_options_.config_path);
+
+    bool saved_servers_changed = false;
+    if (saved_servers.empty()) {
+        saved_servers.push_back(SavedRoomServer{"Local Network", "127.0.0.1", 9999});
+        saved_servers_changed = true;
+    }
+
+    if (saved_servers_changed) {
+        save_saved_room_servers(startup_options_.config_path, saved_servers);
+    }
+
+    for (const auto& saved: saved_servers) {
         servers_.push_back(make_server(saved.name, saved.address, saved.port));
     }
 
     const bool has_startup_server =
-        !startup_options_.server_address.empty() || startup_options_.server_port != 0;
+        startup_options_.server_endpoint_explicit &&
+        (!startup_options_.server_address.empty() || startup_options_.server_port != 0);
     auto startup_server = make_server(
         {}, startup_options_.server_address,
         startup_options_.server_port == 0 ? 9999 : startup_options_.server_port);
-
-    if (servers_.empty()) {
-        servers_.push_back(std::move(startup_server));
-        selected_server_index_ = 0;
-        return;
-    }
 
     selected_server_index_ = 0;
     if (has_startup_server) {
         const auto it = std::find_if(
             servers_.begin(), servers_.end(), [&](const BrowserServer& server) {
-                return server.address == startup_server.address &&
-                       server.port == startup_server.port;
+                return same_endpoint(server.address, server.port,
+                                     startup_server.address, startup_server.port);
             });
         if (it != servers_.end()) {
             selected_server_index_ = static_cast<int>(std::distance(servers_.begin(), it));
@@ -960,9 +1178,14 @@ void JuceRoomBrowserComponent::load_servers() {
             selected_server_index_ = 0;
         }
     }
+
+    if (!room_servers_seeded_) {
+        request_official_server_refresh();
+    }
 }
 
-void JuceRoomBrowserComponent::save_servers() const {
+void JuceRoomBrowserComponent::save_servers(
+    std::optional<bool> room_servers_seeded) const {
     std::vector<SavedRoomServer> saved;
     saved.reserve(servers_.size());
     for (const auto& server: servers_) {
@@ -971,7 +1194,104 @@ void JuceRoomBrowserComponent::save_servers() const {
         }
         saved.push_back(SavedRoomServer{server.name, server.address, server.port});
     }
-    save_saved_room_servers(startup_options_.config_path, saved);
+    save_saved_room_servers(startup_options_.config_path, saved, room_servers_seeded);
+}
+
+void JuceRoomBrowserComponent::request_official_server_refresh(bool manual) {
+    if (official_server_fetch_.running()) {
+        if (manual) {
+            official_server_fetch_manual_ = true;
+            status_text_ = "Fetching official servers...";
+            repaint();
+        }
+        return;
+    }
+
+    official_server_fetch_manual_ = manual;
+    if (manual) {
+        status_text_ = "Fetching official servers...";
+        repaint();
+    }
+    official_server_fetch_.start(OFFICIAL_SERVERS_URL,
+                                 OFFICIAL_SERVERS_FETCH_TIMEOUT_MS);
+}
+
+void JuceRoomBrowserComponent::poll_official_server_refresh() {
+    if (auto result = official_server_fetch_.poll()) {
+        const bool manual = official_server_fetch_manual_;
+        official_server_fetch_manual_ = false;
+        apply_official_server_refresh_result(*result, manual);
+    }
+}
+
+void JuceRoomBrowserComponent::apply_official_server_refresh_result(
+    const HttpJsonFetchResult& result, bool manual) {
+    if (!result.ok) {
+        if (manual) {
+            status_text_ = "Official server fetch failed";
+            repaint();
+        }
+        spdlog::info("No official room servers were added");
+        return;
+    }
+
+    const auto parsed = parse_official_room_servers(result.json);
+    if (!parsed.valid) {
+        if (manual) {
+            status_text_ = "Official server list invalid";
+            repaint();
+        }
+        spdlog::info("No official room servers were added");
+        return;
+    }
+
+    if (parsed.servers.empty()) {
+        if (!room_servers_seeded_) {
+            save_servers(true);
+            room_servers_seeded_ = true;
+        }
+        if (manual) {
+            status_text_ = "No official servers found";
+            repaint();
+        }
+        spdlog::info("No official room servers were added");
+        return;
+    }
+
+    auto make_server = [](std::string name, std::string address, uint16_t port) {
+        BrowserServer server;
+        server.address = address.empty() ? "127.0.0.1" : std::move(address);
+        server.port = port == 0 ? 9999 : port;
+        server.name = name.empty()
+                          ? (is_local_address(server.address) ? "Local Network"
+                                                              : server.address)
+                          : std::move(name);
+        return server;
+    };
+
+    int added = 0;
+    for (const auto& official: parsed.servers) {
+        if (find_server_endpoint(official.address, official.port).has_value()) {
+            continue;
+        }
+        servers_.push_back(make_server(official.name, official.address, official.port));
+        ++added;
+    }
+
+    if (added > 0 || !room_servers_seeded_) {
+        save_servers(true);
+        room_servers_seeded_ = true;
+    }
+    if (manual) {
+        status_text_ =
+            added == 0
+                ? juce::String("Official servers already in list")
+                : juce::String(added) + " official server(s) added";
+    }
+    spdlog::info("Applied official room server fetch: {} added, {} total", added,
+                 servers_.size());
+    clamp_scroll_offsets();
+    repaint();
 }
 
 void JuceRoomBrowserComponent::request_audio_device_refresh() {
@@ -1078,9 +1398,6 @@ JuceRoomBrowserComponent::load_audio_devices() {
                                client_.set_output_device(result.pending_output);
         if (input_ok && startup_options_.startup_input_channel_index.has_value()) {
             client_.set_input_channel_index(*startup_options_.startup_input_channel_index);
-        }
-        if (input_ok && output_ok) {
-            client_.save_audio_device_preferences();
         }
 
         if (result.input_devices.empty() || result.output_devices.empty()) {
@@ -1198,7 +1515,9 @@ void JuceRoomBrowserComponent::apply_audio_preflight_selection(bool restart_moni
     const bool output_ok = pending_output_ != AudioStream::NO_DEVICE &&
                            client_.set_output_device(pending_output_);
     if (input_ok && output_ok) {
-        client_.save_audio_device_preferences();
+        ::save_audio_device_preferences(
+            startup_options_.config_path, selected_api_name().toStdString(),
+            pending_input_, pending_output_, client_.get_audio_config().input_channel_index);
     }
 
     const bool should_monitor = monitor_toggle_.getToggleState();
@@ -1687,6 +2006,7 @@ void JuceRoomBrowserComponent::open_invite(std::string invite_text) {
 void JuceRoomBrowserComponent::timerCallback() {
     poll_job_result();
     poll_audio_device_refresh();
+    poll_official_server_refresh();
     if (waiting_for_room_key_ && client_.consume_room_removed_by_server()) {
         cancel_waiting_join();
         status_text_ = "Request declined";
@@ -1713,6 +2033,10 @@ void JuceRoomBrowserComponent::timerCallback() {
 
 void JuceRoomBrowserComponent::start_status_refresh(bool manual) {
     if (servers_.empty()) {
+        if (manual) {
+            status_text_ = "No server selected";
+            repaint();
+        }
         return;
     }
     const int server_index = selected_server_index_;
@@ -1970,23 +2294,17 @@ void JuceRoomBrowserComponent::start_join_invite_flow(std::string initial_invite
                     return;
                 }
 
-                auto server_it = std::find_if(
-                    self->servers_.begin(), self->servers_.end(),
-                    [&](const BrowserServer& server) {
-                        return server.address == invite->server_address &&
-                               server.port == invite->server_port;
-                    });
-                if (server_it == self->servers_.end()) {
+                if (const auto existing = self->find_server_endpoint(
+                        invite->server_address, invite->server_port)) {
+                    self->focus_server(*existing);
+                } else {
                     BrowserServer server;
                     server.name = "Invite";
                     server.address = invite->server_address;
                     server.port = invite->server_port;
                     self->servers_.insert(self->servers_.begin(), std::move(server));
-                    self->selected_server_index_ = 0;
+                    self->focus_server(0);
                     self->save_servers();
-                } else {
-                    self->selected_server_index_ =
-                        static_cast<int>(std::distance(self->servers_.begin(), server_it));
                 }
                 self->pending_invite_join_ = PendingInviteJoin{
                     invite->server_address, invite->server_port, invite->room_id};
@@ -1998,6 +2316,13 @@ void JuceRoomBrowserComponent::start_join_invite_flow(std::string initial_invite
 }
 
 void JuceRoomBrowserComponent::start_create_flow() {
+    if (servers_.empty() || selected_server_index_ < 0 ||
+        selected_server_index_ >= static_cast<int>(servers_.size())) {
+        status_text_ = "No server selected";
+        repaint();
+        return;
+    }
+
     auto* content = new CreateRoomDialog(
         last_display_name_,
         [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this)](
@@ -2178,6 +2503,13 @@ void JuceRoomBrowserComponent::start_edit_servers_flow() {
                     return;
                 }
                 updated.port = static_cast<uint16_t>(port);
+                if (const auto existing = self->find_server_endpoint(
+                        updated.address, updated.port, edit_index)) {
+                    self->focus_server(*existing);
+                    self->status_text_ = "Server already exists";
+                    self->repaint();
+                    return;
+                }
                 if (updated.name.empty()) {
                     updated.name = is_local_address(updated.address) ? "Local Network"
                                                                      : updated.address;
@@ -2195,56 +2527,52 @@ void JuceRoomBrowserComponent::start_edit_servers_flow() {
 }
 
 void JuceRoomBrowserComponent::start_add_server_flow() {
-    active_dialog_ = std::make_unique<juce::AlertWindow>(
-        "Add Server", "", juce::AlertWindow::NoIcon, this);
-    auto& alert = *active_dialog_;
-    alert.addTextEditor("name", "", "Name");
-    alert.addTextEditor("address", "127.0.0.1", "Address");
-    alert.addTextEditor("port", "9999", "Port");
-    style_dialog_editors(alert, {"name", "address", "port"});
-    alert.addButton("Add", 1, juce::KeyPress(juce::KeyPress::returnKey));
-    alert.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-    alert.enterModalState(
-        true,
-        juce::ModalCallbackFunction::create(
-            [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this)](
-                int result) {
-                auto* self = safe_this.getComponent();
-                if (self == nullptr || self->active_dialog_ == nullptr) {
-                    return;
-                }
-                auto& dialog = *self->active_dialog_;
-                dialog.exitModalState(result);
-                dialog.setVisible(false);
-                if (result != 1) {
-                    return;
-                }
+    auto* content = new AddServerDialog(
+        [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this)](
+            AddServerInput input) {
+            auto* self = safe_this.getComponent();
+            if (self == nullptr) {
+                return;
+            }
 
-                BrowserServer server;
-                server.address = read_required_text(dialog, "address");
-                const auto port_text = read_required_text(dialog, "port");
-                const int port = juce::String(port_text).getIntValue();
-                if (server.address.empty() || port <= 0 ||
-                    port > std::numeric_limits<uint16_t>::max()) {
-                    self->status_text_ = "Server address and port are required";
-                    self->repaint();
-                    return;
-                }
-                server.port = static_cast<uint16_t>(port);
-                server.name = read_required_text(dialog, "name");
-                if (server.name.empty()) {
-                    server.name = is_local_address(server.address) ? "Local Network"
-                                                                   : server.address;
-                }
-                self->servers_.push_back(std::move(server));
-                self->selected_server_index_ =
-                    static_cast<int>(self->servers_.size()) - 1;
-                self->selected_room_index_ = -1;
-                self->save_servers();
-                self->start_status_refresh(true);
+            BrowserServer server;
+            server.address = std::move(input.address);
+            server.port = input.port;
+            if (const auto existing =
+                    self->find_server_endpoint(server.address, server.port)) {
+                self->focus_server(*existing);
+                self->status_text_ = "Server already exists";
                 self->repaint();
-            }),
-        false);
+                return;
+            }
+
+            server.name = std::move(input.name);
+            if (server.name.empty()) {
+                server.name = is_local_address(server.address) ? "Local Network"
+                                                               : server.address;
+            }
+            self->servers_.push_back(std::move(server));
+            self->focus_server(static_cast<int>(self->servers_.size()) - 1);
+            self->save_servers();
+            self->start_status_refresh(true);
+            self->repaint();
+        },
+        [safe_this = juce::Component::SafePointer<JuceRoomBrowserComponent>(this)]() {
+            auto* self = safe_this.getComponent();
+            if (self != nullptr) {
+                self->request_official_server_refresh(true);
+            }
+        });
+
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "Add Server";
+    options.content.setOwned(content);
+    options.componentToCentreAround = this;
+    options.dialogBackgroundColour = juce_theme::colour::panel_bottom();
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = false;
+    options.resizable = false;
+    options.launchAsync();
 }
 
 void JuceRoomBrowserComponent::start_job(std::function<BrowserJobResult()> work) {
@@ -2505,6 +2833,43 @@ void JuceRoomBrowserComponent::clamp_scroll_offsets() {
         std::max(0, (static_cast<int>(visible.size()) - visible_room_rows) *
                         ROOM_ROW_HEIGHT);
     room_scroll_px_ = juce::jlimit(0, room_max_scroll, room_scroll_px_);
+}
+
+std::optional<int> JuceRoomBrowserComponent::find_server_endpoint(
+    const std::string& address, uint16_t port,
+    std::optional<int> ignored_index) const {
+    for (int i = 0; i < static_cast<int>(servers_.size()); ++i) {
+        if (ignored_index.has_value() && i == *ignored_index) {
+            continue;
+        }
+        const auto& server = servers_[static_cast<size_t>(i)];
+        if (same_endpoint(server.address, server.port, address, port)) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+void JuceRoomBrowserComponent::focus_server(int index) {
+    if (index < 0 || index >= static_cast<int>(servers_.size())) {
+        return;
+    }
+
+    selected_server_index_ = index;
+    selected_room_index_ = -1;
+    room_scroll_px_ = 0;
+
+    const int visible_server_rows =
+        std::max(1, server_list_area_.getHeight() / SERVER_ROW_HEIGHT);
+    const int visible_height = visible_server_rows * SERVER_ROW_HEIGHT;
+    const int selected_top = selected_server_index_ * SERVER_ROW_HEIGHT;
+    const int selected_bottom = selected_top + SERVER_ROW_HEIGHT;
+    if (selected_top < server_scroll_px_) {
+        server_scroll_px_ = selected_top;
+    } else if (selected_bottom > server_scroll_px_ + visible_height) {
+        server_scroll_px_ = selected_bottom - visible_height;
+    }
+    clamp_scroll_offsets();
 }
 
 int JuceRoomBrowserComponent::server_row_at(juce::Point<int> position) const {

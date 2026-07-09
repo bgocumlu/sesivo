@@ -63,8 +63,6 @@ trap cleanup EXIT
 cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE="$config" -DJAM_BUILD_CLIENT=ON
 cmake --build "$build_dir" --target client --config "$config"
 
-rm -f "$app_path/Contents/MacOS/sesivo-client.json"
-
 security create-keychain -p "$keychain_password" "$keychain"
 security list-keychains -d user -s "$keychain" $original_keychains
 security set-keychain-settings -lut 21600 "$keychain"

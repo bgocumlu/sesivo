@@ -62,12 +62,14 @@ add_executable(client
     ${JAM_CLIENT_DIR}/client_audio_devices.cpp
     ${JAM_CLIENT_DIR}/client_audio_state.cpp
     ${JAM_CLIENT_DIR}/client_config_path.cpp
+    ${JAM_CLIENT_DIR}/client_config_store.cpp
     ${JAM_CLIENT_DIR}/client_join_session.cpp
     ${JAM_CLIENT_DIR}/client_media_state.cpp
     ${JAM_CLIENT_DIR}/client_metronome.cpp
     ${JAM_CLIENT_DIR}/client_network_path.cpp
     ${JAM_CLIENT_DIR}/client_runtime.cpp
     ${JAM_CLIENT_DIR}/client_startup.cpp
+    ${JAM_CLIENT_DIR}/http_json_fetch_job.cpp
     ${JAM_CLIENT_DIR}/secure_invite.cpp
     ${JAM_CLIENT_DIR}/juce_app.cpp
     ${JAM_CLIENT_DIR}/audio_stream.cpp

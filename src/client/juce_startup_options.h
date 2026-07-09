@@ -15,6 +15,7 @@ struct JuceClientStartupOptions {
     std::optional<int> startup_input_channel_index;
     std::string server_address;
     uint16_t server_port = 0;
+    bool server_endpoint_explicit = false;
     std::string room_name;
     std::string room_admin_token;
     std::string room_instance_id;

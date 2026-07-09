@@ -11,6 +11,7 @@
 struct ClientStartupOptions {
     std::string server_address = "127.0.0.1";
     uint16_t server_port = 9999;
+    bool server_endpoint_explicit = false;
     std::string app_version;
     std::string config_dir;
     int requested_frames = 0;

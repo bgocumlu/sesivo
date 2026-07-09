@@ -25,6 +25,8 @@ struct SavedRoomServer {
 };
 
 AudioDevicePreferences load_audio_device_preferences(const std::filesystem::path& path);
+// Save calls enqueue serialized background writes. The return value means the
+// write was accepted, not that it has already reached disk.
 bool save_audio_device_preferences(const std::filesystem::path& path,
                                    const std::string& audio_api,
                                    AudioStream::DeviceIndex input_device,
@@ -32,7 +34,9 @@ bool save_audio_device_preferences(const std::filesystem::path& path,
                                    int input_channel_index);
 std::vector<SavedRoomServer> load_saved_room_servers(const std::filesystem::path& path);
 bool save_saved_room_servers(const std::filesystem::path& path,
-                             const std::vector<SavedRoomServer>& servers);
+                             const std::vector<SavedRoomServer>& servers,
+                             std::optional<bool> room_servers_seeded = std::nullopt);
+bool load_room_servers_seeded(const std::filesystem::path& path);
 std::string load_client_display_name(const std::filesystem::path& path);
 bool save_client_display_name(const std::filesystem::path& path,
                               const std::string& display_name);

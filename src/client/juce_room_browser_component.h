@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client_app_facade.h"
+#include "http_json_fetch_job.h"
 #include "juce_startup_options.h"
 
 #include <juce_gui_basics/juce_gui_basics.h>
@@ -153,7 +154,11 @@ private:
     void start_or_stop_monitor();
     void sync_monitor_button_text();
     void load_servers();
-    void save_servers() const;
+    void save_servers(std::optional<bool> room_servers_seeded = std::nullopt) const;
+    void request_official_server_refresh(bool manual = false);
+    void poll_official_server_refresh();
+    void apply_official_server_refresh_result(const HttpJsonFetchResult& result,
+                                              bool manual);
     void start_status_refresh(bool manual);
     void start_join_flow(int room_index);
     void start_join_invite_flow(std::string initial_invite = {});
@@ -174,6 +179,11 @@ private:
     const ServerStatus& selected_status() const;
     std::vector<int> visible_room_indices() const;
     void clamp_scroll_offsets();
+    std::optional<int> find_server_endpoint(const std::string& address,
+                                            uint16_t port,
+                                            std::optional<int> ignored_index =
+                                                std::nullopt) const;
+    void focus_server(int index);
     int server_row_at(juce::Point<int> position) const;
     int room_row_at(juce::Point<int> position) const;
     bool join_button_at(juce::Point<int> position) const;
@@ -192,6 +202,8 @@ private:
     std::vector<BrowserServer> servers_;
     int selected_server_index_ = 0;
     int selected_room_index_ = -1;
+    bool room_servers_seeded_ = false;
+    bool official_server_fetch_manual_ = false;
     std::string last_display_name_ = "Player";
     std::string local_profile_id_;
     juce::String status_text_ = "Choose a server";
@@ -228,6 +240,8 @@ private:
     bool job_running_ = false;
     bool job_finished_ = false;
     std::optional<BrowserJobResult> job_result_;
+
+    HttpJsonFetchJob official_server_fetch_;
 
     std::mutex audio_device_job_mutex_;
     std::thread audio_device_job_thread_;

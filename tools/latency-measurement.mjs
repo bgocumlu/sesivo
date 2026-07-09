@@ -18,6 +18,7 @@ function usage(exitCode = 0) {
     "threshold flags:",
     "  --max-e2e-avg-ms N --max-e2e-peak-ms N --max-plc-frames N --max-underruns N",
     "  --max-age-limit-drops N --max-sequence-unresolved-gaps N --max-callback-over-deadline N",
+    "  --max-callback-deadline-ms N --max-callback-max-ms N",
     "  --max-drift-ppm-abs N --max-queue-drift-packets N --min-e2e-samples N",
   ].join("\n");
   const stream = exitCode === 0 ? process.stdout : process.stderr;
@@ -421,6 +422,7 @@ function parseDiagnosticsLog(text) {
     participantCount: participants.length,
     latencySamples: latencyRows.length,
     participantSamples: participantRows.length,
+    callbackDeadlineMs: Math.max(0, ...latencyRows.map((row) => row.callbackDeadlineMs)),
     callbackOverDeadline: Math.max(0, ...latencyRows.map((row) => row.callbackOverDeadline)),
     callbackMaxMs: Math.max(0, ...latencyRows.map((row) => row.callbackMaxMs)),
     e2eAvgMsMax: Math.max(0, ...participants.map((row) => row.e2eAvgMs)),
@@ -451,6 +453,7 @@ const THRESHOLDS = {
   "max-age-limit-drops": ["max", "ageLimitDrops"],
   "max-sequence-unresolved-gaps": ["max", "sequenceUnresolvedGaps"],
   "max-callback-over-deadline": ["max", "callbackOverDeadline"],
+  "max-callback-deadline-ms": ["max", "callbackDeadlineMs"],
   "max-drift-ppm-abs": ["max", "driftPpmAbsMax"],
   "max-queue-drift-packets": ["max", "queueDriftPacketsAbsMax"],
   "max-callback-max-ms": ["max", "callbackMaxMs"],
@@ -596,11 +599,19 @@ function commandSelfTest() {
     "max-age-limit-drops": 0,
     "max-sequence-unresolved-gaps": 0,
     "max-callback-over-deadline": 0,
+    "max-callback-deadline-ms": 5,
     "max-e2e-avg-ms": 20,
     "min-e2e-samples": 100,
   });
   assert(diagnostics.ok, "diagnostics thresholds should pass");
   assert(diagnostics.aggregate.e2eSamples === 500, "e2e samples should parse");
+  assert(diagnostics.aggregate.callbackDeadlineMs === 5,
+         "callback deadline should parse");
+
+  const deadlineFailure = buildDiagnosticsReport(logPath, {
+    "max-callback-deadline-ms": 4,
+  });
+  assert(!deadlineFailure.ok, "callback deadline threshold should fail");
 
   const manifestPath = path.join(dir, "matrix.json");
   fs.writeFileSync(manifestPath, `${JSON.stringify({

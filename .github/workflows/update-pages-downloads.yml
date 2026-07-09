@@ -130,17 +130,6 @@ jobs:
               fs.writeFileSync("llms.txt", llms);
             }
 
-            if (fs.existsSync("api/example.json")) {
-              const api = JSON.parse(fs.readFileSync("api/example.json", "utf8"));
-              api.version = String(release.tag_name ?? "").replace(/^v/i, "") || api.version;
-              api.updated = String(
-                release.published_at ?? release.created_at ?? new Date().toISOString(),
-              ).slice(0, 10);
-              api.downloads_macos = macosAsset.browser_download_url;
-              api.downloads_windows = windowsAsset.browser_download_url;
-              fs.writeFileSync("api/example.json", `${JSON.stringify(api, null, 2)}\n`);
-            }
-
             console.log(`Updated downloads for ${release.tag_name}`);
             console.log(`macOS: ${macosAsset.name}`);
             console.log(`Windows: ${windowsAsset.name}`);
@@ -156,7 +145,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads.html llms.txt api/example.json
+          git add downloads.html llms.txt
           if git diff --cached --quiet; then
             echo "Download links are already current."
             exit 0

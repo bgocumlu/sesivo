@@ -131,6 +131,8 @@ if(JAM_BUILD_TESTS)
 
     jam_add_self_test(audio_callback_policy_self_test audio_callback_policy_self_test.cpp)
 
+    jam_add_self_test(opus_tail_fade_self_test opus_tail_fade_self_test.cpp)
+
     jam_add_self_test(redundant_receive_policy_self_test redundant_receive_policy_self_test.cpp)
     target_link_libraries(redundant_receive_policy_self_test PRIVATE concurrentqueue spdlog::spdlog opus)
 endif()
@@ -178,6 +180,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(udp_socket_config_self_test)
     jam_add_executable_test(jitter_policy_self_test)
     jam_add_executable_test(audio_callback_policy_self_test)
+    jam_add_executable_test(opus_tail_fade_self_test)
     jam_add_executable_test(redundant_receive_policy_self_test)
     jam_add_executable_test(recording_writer_self_test)
     jam_add_executable_test(audio_analysis_self_test)

@@ -482,7 +482,7 @@ three audits flag it (consolidated F3 severity: Critical).
 
 **Steps:**
 
-- [ ] **4.1 Create the pure helper** `src/client/opus_tail_fade.h`:
+- [x] **4.1 Create the pure helper** `src/client/opus_tail_fade.h`:
 
 ```cpp
 #pragma once
@@ -503,14 +503,14 @@ inline float opus_tail_fade_gain(unsigned long frames_into_tail,
 }
 ```
 
-- [ ] **4.2 Write the test** `tests/opus_tail_fade_self_test.cpp` (same
+- [x] **4.2 Write the test** `tests/opus_tail_fade_self_test.cpp` (same
   `require` pattern), asserting: gain at `frames_into_tail=0` is 1.0; gain is
   strictly decreasing as `frames_into_tail` grows; gain reaches 0.0 at or before
   `output_frames`; `output_frames == 0` returns 0. Register it in `CMakeLists.txt`
   (`jam_add_self_test(opus_tail_fade_self_test opus_tail_fade_self_test.cpp)`).
   Build and run it: passes (pure math; the test pins the contract).
 
-- [ ] **4.3 Use it in the mixer.** In `mix_available_opus_pcm_with_tail`
+- [x] **4.3 Use it in the mixer.** In `mix_available_opus_pcm_with_tail`
   (`client_runtime.cpp:3082-3103`), the loop currently computes
   `index = std::min(requested_index, last_index)`. Add the fade for held frames:
 
@@ -542,13 +542,13 @@ inline float opus_tail_fade_gain(unsigned long frames_into_tail,
   when PLC kicks in must all stay identical. The only behavioral change is that
   synthesized tail samples decay to zero instead of holding flat.
 
-- [ ] **4.4 Include** `opus_tail_fade.h` in `client_runtime.cpp`.
+- [x] **4.4 Include** `opus_tail_fade.h` in `client_runtime.cpp`.
 
-- [ ] **4.5 Run the standard verification block.** Listening check while you have
+- [x] **4.5 Run the standard verification block.** Listening check while you have
   the two localhost clients up: play sustained audio (the WAV playback works),
   toggle brief network stress if convenient — no buzz/stuck-tone tails.
 
-- [ ] **4.6 Commit:** `git commit -m "fix: fade partial-underflow tail instead of holding last sample"`
+- [x] **4.6 Commit:** `git commit -m "fix: fade partial-underflow tail instead of holding last sample"`
 
 **Done when:** a held region never emits the same non-zero value across the rest of
 a callback; the fade reaches zero within one callback; all tests + smoke clean.
@@ -1014,7 +1014,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 1 — Callback stack-overflow clamp | ☑ complete | `fix: clamp audio callback processing to 960 frames` |
 | 2 — Per-sender jitter milliseconds | ☑ complete | `fix: convert jitter ms per sender packet duration` |
 | 3 — Auto-jitter age ceiling | ☑ complete | `fix: clamp auto jitter target to the packet age ceiling` |
-| 4 — Underflow tail fade | ☐ not started | |
+| 4 — Underflow tail fade | ☑ complete | `fix: fade partial-underflow tail instead of holding last sample` |
 | 5 — 32-participant room limit | ☐ not started | |
 | 6 — Transactional live settings | ☐ not started | |
 | 7 — Off-callback snapshot retirement | ☐ not started | |

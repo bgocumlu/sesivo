@@ -63,6 +63,7 @@
 #include "opus_defines.h"
 #include "opus_encoder.h"
 #include "opus_network_clock.h"
+#include "opus_tail_fade.h"
 #include "packet_builder.h"
 #include "participant_info.h"
 #include "participant_manager.h"
@@ -3127,6 +3128,7 @@ private:
         }
         const double start_phase = participant.opus_resample_phase;
         const size_t last_index = participant.opus_pcm_buffered_frames - 1;
+        unsigned long frames_into_tail = 0;
         for (unsigned long i = 0; i < output_frames; ++i) {
             const double source_pos = start_phase + (static_cast<double>(i) * ratio);
             const auto requested_index = static_cast<size_t>(std::floor(source_pos));
@@ -3139,7 +3141,11 @@ private:
             const float b = index + 1 < participant.opus_pcm_buffered_frames
                                 ? participant.opus_pcm_buffer[index + 1]
                                 : a;
-            const float sample = (a + ((b - a) * frac)) * gain;
+            float sample = (a + ((b - a) * frac)) * gain;
+            if (requested_index > last_index) {
+                ++frames_into_tail;
+                sample *= opus_tail_fade_gain(frames_into_tail, output_frames);
+            }
 
             if (output_channels == 1) {
                 output_buffer[i] += sample;

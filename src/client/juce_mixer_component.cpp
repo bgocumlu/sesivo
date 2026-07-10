@@ -1008,6 +1008,9 @@ void JuceMixerComponent::configure_controls() {
     configure_caption(queue_label_, "RX capacity");
     configure_caption(age_limit_label_, "Age");
     configure_caption(preset_label_, "Latency");
+    juce_theme::style_label(latency_estimate_label_, juce_theme::colour::text_dim(),
+                            12.0F);
+    latency_estimate_label_.setJustificationType(juce::Justification::centredLeft);
     configure_caption(advanced_latency_label_, "Advanced >");
     advanced_latency_label_.setJustificationType(juce::Justification::centredLeft);
     advanced_latency_label_.setMouseCursor(juce::MouseCursor::PointingHandCursor);
@@ -1080,7 +1083,8 @@ void JuceMixerComponent::configure_controls() {
                                &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
                                &latency_preset_ultra_button_, &latency_preset_low_button_,
                                &latency_preset_balanced_button_, &latency_preset_stable_button_,
-                               &advanced_latency_label_, &redundancy_label_,
+                               &latency_estimate_label_, &advanced_latency_label_,
+                               &redundancy_label_,
                                &redundancy_combo_, &auto_jitter_toggle_,
                                &participant_overrides_label_, &diagnostics_label_});
 
@@ -1503,6 +1507,8 @@ void JuceMixerComponent::layout_network_content() {
         preset_row.removeFromLeft(preset_button_width));
     latency_preset_stable_button_.setBounds(preset_row);
     network.removeFromTop(4);
+    latency_estimate_label_.setBounds(network.removeFromTop(22).reduced(2, 0));
+    network.removeFromTop(2);
     advanced_latency_label_.setBounds(network.removeFromTop(24).reduced(2, 0));
 
     if (advanced_latency_open_) {
@@ -1667,6 +1673,29 @@ void JuceMixerComponent::refresh_live_state() {
                                                            : fallback_device_ms;
     const auto warning = device_latency_warning(latency, device_path_ms);
     const juce::String warning_line = warning.isEmpty() ? juce::String{} : "\n" + warning;
+    const int summary_packet_frames =
+        pending_opus_frames_per_packet_ > 0
+            ? pending_opus_frames_per_packet_
+            : static_cast<int>(client_.get_opus_network_frame_count());
+    const double summary_packet_ms =
+        static_cast<double>(summary_packet_frames) * 1000.0 /
+        static_cast<double>(opus_network_clock::SAMPLE_RATE);
+    const int summary_jitter_ms =
+        pending_network_jitter_ms_.value_or(client_.get_opus_jitter_buffer_ms());
+    const int summary_redundancy = pending_network_redundancy_depth_.value_or(
+        client_.get_opus_redundancy_depth_setting());
+    juce::String estimate_text =
+        "Estimated " + juce::String(path.total_estimate_ms, 1) + " ms";
+    if (!advanced_latency_open_) {
+        const int displayed_depth =
+            summary_redundancy == OPUS_REDUNDANCY_DEPTH_AUTO
+                ? client_.get_effective_opus_redundancy_depth()
+                : summary_redundancy;
+        estimate_text += "  •  " + juce::String(summary_packet_ms, 1) +
+                         " ms packet / " + juce::String(summary_jitter_ms) +
+                         " ms jitter / depth " + juce::String(displayed_depth);
+    }
+    latency_estimate_label_.setText(estimate_text, juce::dontSendNotification);
     diagnostics_label_.setText(
         "Opus " + juce::String(client_.get_opus_network_frame_count()) + " frames / " +
             juce::String(client_.get_opus_network_packet_ms(), 1) + " ms\n" +

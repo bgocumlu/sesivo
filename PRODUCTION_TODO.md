@@ -900,7 +900,7 @@ Implementation checklist (each bullet is one commit-sized change):
   shows selected-but-pending ("Low selected — Apply and restart audio") and must
   not render as active until the whole bundle is live (Task 6 provides the
   staging; this is the visual layer).
-- [ ] **C.6 Latency label with evidence level:** show the estimate next to the
+- [x] **C.6 Latency label with evidence level:** show the estimate next to the
   control (`total_estimate_ms` from `get_path_diagnostics()`), labeled
   **"Estimated"**, plus a one-line summary ("10 ms packet / 20 ms jitter /
   depth 2") when Advanced is collapsed. Never render an unlabeled number that
@@ -1039,5 +1039,6 @@ these are parity changes with minimal risk, not claimed latency wins.
 | C.3 — Custom deselects preset chips | ☑ complete | `feat: represent custom latency settings with no preset selected` |
 | C.4 — Remember last custom bundle | — removed | Network tuning should not be restored after conditions change |
 | C.5 — Pending vs active preset state | ☑ complete | `feat: distinguish pending and active latency presets` |
-| C.6–C.8 — Remaining preset UI | ☐ not started | |
+| C.6 — Estimated latency label + summary | ☑ complete | `feat: show labeled latency estimate and preset summary` |
+| C.7–C.8 — Remaining preset UI | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

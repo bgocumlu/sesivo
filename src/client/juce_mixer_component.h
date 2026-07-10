@@ -197,6 +197,7 @@ private:
     juce::Label queue_label_;
     juce::Label age_limit_label_;
     juce::Label preset_label_;
+    juce::Label latency_estimate_label_;
     juce::Label redundancy_label_;
     juce::Label participant_overrides_label_;
     juce::Label wav_position_label_;

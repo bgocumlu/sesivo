@@ -353,6 +353,14 @@ inline QosResult UdpSocketQos::ensure_flow(udp::socket& socket,
         applied = apply_socket_traffic_class(socket, IPPROTO_IP, IP_TOS, result) || applied;
     }
 
+#ifdef __APPLE__
+    int service_type = NET_SERVICE_TYPE_VO;
+    const int service_type_result =
+        ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_NET_SERVICE_TYPE,
+                     &service_type, sizeof(service_type));
+    const int service_type_errno = service_type_result == 0 ? 0 : errno;
+#endif
+
     if (applied) {
         socket_option_applied_ = true;
         result.detail = "DSCP EF socket option configured";
@@ -360,6 +368,12 @@ inline QosResult UdpSocketQos::ensure_flow(udp::socket& socket,
         result.detail = "DSCP EF socket option failed with errno " +
                         std::to_string(result.error_code);
     }
+#ifdef __APPLE__
+    if (service_type_errno != 0) {
+        result.detail += "; Wi-Fi voice service type failed with errno " +
+                         std::to_string(service_type_errno);
+    }
+#endif
     return result;
 }
 

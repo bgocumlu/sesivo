@@ -306,7 +306,7 @@ private:
     }
 
     ParticipantSnapshotPtr load_audio_snapshot() const {
-        return audio_snapshot_.load(std::memory_order_acquire);
+        return std::atomic_load_explicit(&audio_snapshot_, std::memory_order_acquire);
     }
 
     ParticipantSnapshotPtr load_info_participant_snapshot() const {
@@ -332,7 +332,8 @@ private:
     void publish_audio_snapshot_locked() {
         ParticipantSnapshotPtr published =
             build_participant_snapshot_locked(MAX_AUDIO_CALLBACK_PARTICIPANTS);
-        auto retired = audio_snapshot_.exchange(std::move(published), std::memory_order_acq_rel);
+        auto retired = std::atomic_exchange_explicit(
+            &audio_snapshot_, std::move(published), std::memory_order_acq_rel);
         if (retired) {
             retired_audio_snapshots_.push_back(
                 {std::move(retired), std::chrono::steady_clock::now()});
@@ -465,7 +466,7 @@ private:
         std::chrono::steady_clock::time_point retired_at;
     };
 
-    std::atomic<ParticipantSnapshotPtr>                              audio_snapshot_;
+    ParticipantSnapshotPtr                                           audio_snapshot_;
     ParticipantSnapshotPtr                                          info_participant_snapshot_;
     ParticipantMetadataSnapshotPtr                                  metadata_snapshot_;
     // Removed participants are parked here and destroyed only by

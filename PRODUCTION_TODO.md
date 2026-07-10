@@ -936,7 +936,7 @@ encoder/sender thread MMCSS "Pro Audio" priority, but its whole body is
 has no priority anywhere. On Apple Silicon a default-priority thread can be parked
 on an efficiency core, which the jitter buffer sees as network jitter.
 
-- [ ] **12.1** Add an `__APPLE__` branch to `ScopedSenderThreadPriority`'s
+- [x] **12.1** Add an `__APPLE__` branch to `ScopedSenderThreadPriority`'s
   constructor (destructor stays empty — the QoS class dies with the thread):
 
 ```cpp
@@ -949,7 +949,7 @@ on an efficiency core, which the jitter buffer sees as network jitter.
   with `#include <pthread.h>` / `#include <sys/qos.h>` under `__APPLE__` at the
   top of the file. No entitlements, nothing new to link.
 
-- [ ] **12.2** Give the IO thread the same treatment at `juce_app.cpp:382` —
+- [x] **12.2** Give the IO thread the same treatment at `juce_app.cpp:382` —
   first statement inside the thread lambda:
 
 ```cpp
@@ -971,7 +971,7 @@ via `IP_TOS`, but on macOS that typically never maps into the Wi-Fi WMM access
 categories. Apple's mechanism is the socket-level service type, which puts the
 flow into the Wi-Fi **voice** class (AC_VO) — and a Mac is almost always on Wi-Fi.
 
-- [ ] **12.3** In the POSIX `ensure_flow`, alongside (not replacing) the existing
+- [x] **12.3** In the POSIX `ensure_flow`, alongside (not replacing) the existing
   `IP_TOS` calls:
 
 ```cpp
@@ -987,10 +987,19 @@ flow into the Wi-Fi **voice** class (AC_VO) — and a Mac is almost always on Wi
 
   Keep `IP_TOS` for the wired/WAN legs of the path.
 
-- [ ] **12.4** Build and run the full verification block **on macOS**; then a
+- [x] **12.4** Build and run the full verification block **on macOS**; then a
   two-client audio session (Mac + anything) stays clean for a few minutes.
 
-- [ ] **12.5 Commit:** `git commit -m "feat: add macOS thread QoS and Wi-Fi voice service type"`
+- [x] **12.5 Commit:** `git commit -m "feat: add macOS thread QoS and Wi-Fi voice service type"`
+
+**macOS build prerequisite discovered during 12.4:** Task 7 introduced
+`std::atomic<std::shared_ptr<...>>` snapshot holders, which MSVC accepted but the
+macOS libc++ in the required build rejected. The two holders were changed to plain
+`std::shared_ptr` storage accessed exclusively through the standard
+`std::atomic_load_explicit`, `std::atomic_store_explicit`, and
+`std::atomic_exchange_explicit` free functions. This retains shared ownership,
+atomic publication, the existing acquire/release ordering, and off-callback
+retirement behavior; it only uses the portable API supplied by both libraries.
 
 **Done when:** the macOS build compiles with both changes; the sender and IO
 threads request `QOS_CLASS_USER_INTERACTIVE`; the media socket requests
@@ -1041,4 +1050,4 @@ these are parity changes with minimal risk, not claimed latency wins.
 | C.6 — Estimated latency label | — removed | Current estimate is not calibrated mouth-to-ear measurement |
 | C.7 — Recent-window preset health | ☑ complete | `feat: show recent latency preset health` |
 | C.8 — Final preset UI acceptance | ☑ complete | Existing policy tests + completed manual GUI pass |
-| 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |
+| 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☑ complete | `feat: add macOS thread QoS and Wi-Fi voice service type` |

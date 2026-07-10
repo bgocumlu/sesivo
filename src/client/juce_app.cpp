@@ -30,6 +30,11 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
+
 #if JUCE_WINDOWS
 #include <windows.h>
 #endif
@@ -382,7 +387,12 @@ private:
         if (!apply_startup_options(client_app)) {
             return;
         }
-        io_thread_ = std::thread([this]() { io_context_->run(); });
+        io_thread_ = std::thread([this]() {
+#ifdef __APPLE__
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+            io_context_->run();
+        });
 
         auto launch_invite = invite_text_from_launch(command_line, true);
 

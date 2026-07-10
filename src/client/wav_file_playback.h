@@ -234,8 +234,12 @@ public:
           resample_ratio_(other.resample_ratio_.load()),
           resample_position_frac_(other.resample_position_frac_.load()) {
         std::lock_guard<std::mutex> lock(other.retired_wavs_mutex_);
-        loaded_wav_.store(other.loaded_wav_.exchange(nullptr, std::memory_order_acq_rel),
-                          std::memory_order_release);
+        std::atomic_store_explicit(
+            &loaded_wav_,
+            std::atomic_exchange_explicit(&other.loaded_wav_,
+                                          std::shared_ptr<const LoadedWav>{},
+                                          std::memory_order_acq_rel),
+            std::memory_order_release);
         retired_wavs_ = std::move(other.retired_wavs_);
         other.playing_.store(false);
         other.read_position_.store(0);
@@ -246,8 +250,11 @@ public:
     WavFilePlayback& operator=(WavFilePlayback&& other) noexcept {
         if (this != &other) {
             std::scoped_lock lock(retired_wavs_mutex_, other.retired_wavs_mutex_);
-            auto incoming = other.loaded_wav_.exchange(nullptr, std::memory_order_acq_rel);
-            auto retired = loaded_wav_.exchange(std::move(incoming), std::memory_order_acq_rel);
+            auto incoming = std::atomic_exchange_explicit(
+                &other.loaded_wav_, std::shared_ptr<const LoadedWav>{},
+                std::memory_order_acq_rel);
+            auto retired = std::atomic_exchange_explicit(
+                &loaded_wav_, std::move(incoming), std::memory_order_acq_rel);
             if (retired) {
                 retired_wavs_.push_back(std::move(retired));
             }
@@ -533,7 +540,8 @@ private:
 
     void publish_loaded_wav(std::shared_ptr<const LoadedWav> published) {
         reap_retired_wavs();
-        auto retired = loaded_wav_.exchange(std::move(published), std::memory_order_acq_rel);
+        auto retired = std::atomic_exchange_explicit(
+            &loaded_wav_, std::move(published), std::memory_order_acq_rel);
         if (retired) {
             std::lock_guard<std::mutex> lock(retired_wavs_mutex_);
             retired_wavs_.push_back(std::move(retired));
@@ -541,11 +549,11 @@ private:
     }
 
     std::shared_ptr<const LoadedWav> loaded_wav() const {
-        return loaded_wav_.load(std::memory_order_acquire);
+        return std::atomic_load_explicit(&loaded_wav_, std::memory_order_acquire);
     }
 
     // Atomically published so the audio thread can keep an old file alive while UI loads/unloads.
-    std::atomic<std::shared_ptr<const LoadedWav>> loaded_wav_;
+    std::shared_ptr<const LoadedWav> loaded_wav_;
     mutable std::mutex retired_wavs_mutex_;
     std::vector<std::shared_ptr<const LoadedWav>> retired_wavs_;
 

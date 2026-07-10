@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "delivery_stall_policy.h"
 #include "opus_decoder.h"
 #include "protocol.h"  // For AUDIO_BUF_SIZE
 #include "sequence_tracker.h"
@@ -459,6 +460,8 @@ struct ParticipantData {
     std::atomic<float>                   gain{1.0F};
     std::atomic<float>                   pan{0.5F};  // 0.0 = full left, 0.5 = center, 1.0 = full right
     std::chrono::steady_clock::time_point last_packet_time;
+    delivery_stall_policy::BurstState     delivery_stall_burst;
+    std::atomic<bool>                     delivery_stall_flush_requested{false};
     std::atomic<size_t>                   jitter_buffer_floor_packets{MIN_JITTER_BUFFER_PACKETS};
     std::atomic<size_t>                   jitter_buffer_min_packets{MIN_JITTER_BUFFER_PACKETS};
     std::atomic<size_t>                   opus_queue_limit_packets{MAX_OPUS_QUEUE_SIZE};

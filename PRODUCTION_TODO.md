@@ -788,6 +788,12 @@ target from the oldest side before resuming playout (the trim machinery at
 `:3400-3414` already knows how). Effect: after an interruption, playback resumes at
 the live edge instead of replaying the buffered backlog.
 
+- [x] Detect delivery gaps over 500 ms and request a live-edge flush only when the
+  following burst exceeds the participant's jitter target; perform the oldest-side
+  trim on the audio callback thread before playout resumes.
+- [x] Suspend delivery for 2 seconds and confirm the stale backlog is trimmed, then
+  run the standard verification block with clean audio-health diagnostics.
+
 **Done when:** pausing delivery for 2 s (suspend the server process, or use the
 soak tooling) and releasing it resumes near-live audio without replaying the stale
 segment, and normal jitter bursts (< target) are untouched. Commit:
@@ -1019,7 +1025,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 6 — Transactional live settings | ☑ complete | `fix: make live network setting changes transactional` |
 | 7 — Off-callback snapshot retirement | ☑ complete | `refactor: retire audio snapshots off the callback thread` |
 | 8 — Wall-clock rate recovery | ☑ complete | `fix: make post-drop rate recovery wall-clock based` |
-| 9 — Stall backlog flush | ☐ not started | |
+| 9 — Stall backlog flush | ☑ complete | `fix: flush stale receive backlog after delivery stalls` |
 | 10 — Non-blocking media send | ☐ not started | |
 | 11 — Bounded SFU fan-out | ☐ not started | |
 | C.1–C.8 — Preset UI | ☐ not started | |

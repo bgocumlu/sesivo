@@ -57,6 +57,7 @@
 #include "client_metronome.h"
 #include "client_network_path.h"
 #include "client_runtime.h"
+#include "delivery_stall_policy.h"
 #include "jitter_policy.h"
 #include "message_validator.h"
 #include "opus_decoder.h"
@@ -3482,6 +3483,24 @@ private:
         return current_queue_size;
     }
 
+    static size_t flush_stalled_delivery_backlog(ParticipantData& participant) {
+        if (!participant.delivery_stall_flush_requested.exchange(
+                false, std::memory_order_acq_rel)) {
+            return participant.opus_queue.size_approx();
+        }
+
+        size_t current_queue_size = participant.opus_queue.size_approx();
+        const size_t target_packets = opus_playout_target_queue_packets(participant);
+        while (current_queue_size > target_packets) {
+            if (!participant.opus_queue.discard_oldest_actual_packet_for_latency_trim()) {
+                break;
+            }
+            --current_queue_size;
+            participant.opus_target_trim_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+        return current_queue_size;
+    }
+
     void update_jitter_floor(ParticipantData& participant, const OpusPacket& packet) {
         const bool manual_override =
             packet.codec == AudioCodec::Opus &&
@@ -4550,10 +4569,21 @@ private:
 
             size_t queue_size = participant.opus_queue.size_approx();
             observe_participant_queue_depth(participant, queue_size);
+            const size_t previous_packet_frame_count =
+                participant.last_packet_frame_count.load(std::memory_order_relaxed);
             update_jitter_floor(participant, packet);
             observe_receiver_clock_drift(participant, packet);
             participant.last_packet_frame_count.store(packet.frame_count,
-                                                      std::memory_order_relaxed);
+                                                       std::memory_order_relaxed);
+
+            if (delivery_stall_policy::record_arrival(
+                    participant.delivery_stall_burst, participant.last_packet_time,
+                    packet.timestamp, previous_packet_frame_count != 0,
+                    opus_playout_target_queue_packets(participant))) {
+                participant.delivery_stall_flush_requested.store(
+                    true, std::memory_order_release);
+            }
+            participant.last_packet_time = packet.timestamp;
 
             // Bounded jitter management: preserve sequenced playout order under overflow.
             const size_t configured_queue_limit =
@@ -4572,8 +4602,6 @@ private:
 
             size_t queue_after_enqueue = participant.opus_queue.size_approx();
             observe_participant_queue_depth(participant, queue_after_enqueue);
-            participant.last_packet_time = packet.timestamp;
-
             // Mark buffer as ready once we have enough packets
             if (!participant.buffer_ready.load(std::memory_order_relaxed) &&
                 queue_after_enqueue >= ready_threshold_packets(participant)) {
@@ -4716,6 +4744,9 @@ private:
             if (participant.is_muted.load(std::memory_order_relaxed)) {
                 return;
             }
+
+            observe_participant_queue_depth(
+                participant, flush_stalled_delivery_backlog(participant));
 
             if (!participant.buffer_ready.load(std::memory_order_relaxed)) {
                 const size_t queue_size = participant.opus_queue.size_approx();

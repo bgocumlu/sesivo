@@ -661,14 +661,14 @@ joiner gets an explicit denial and the client shows it; tests cover 32/33/re-joi
 
 **Steps:**
 
-- [ ] **6.1 Commit sliders on release, not per tick.** For each of
+- [x] **6.1 Commit sliders on release, not per tick.** For each of
   `jitter_ms_slider_`, `queue_limit_slider_`, `age_limit_slider_`: move the
   `client_.set_...` call from `onValueChange` into `onDragEnd`, and in
   `onValueChange` only apply when the change did not come from a mouse drag
   (`if (!slider.isMouseButtonDown()) { apply(); }`) so keyboard/textbox edits
   still work. One apply per gesture.
 
-- [ ] **6.2 Make a preset one coherent bundle.** Rework `apply_latency_preset`:
+- [x] **6.2 Make a preset one coherent bundle.** Rework `apply_latency_preset`:
   - If `preset->packet_frames` differs from the active packet frames or the
     matched buffer requires a stream restart (`pending_stream_restart_needed()`
     already exists, see `:2034`): **stage everything** — do *not* call the four
@@ -683,7 +683,7 @@ joiner gets an explicit denial and the client shows it; tests cover 32/33/re-joi
     live immediately, in that same order, as today.
   - Either way a preset click must never leave half a bundle active.
 
-- [ ] **6.3 Stop dropping `buffer_ready` when the queue already meets the new
+- [x] **6.3 Stop dropping `buffer_ready` when the queue already meets the new
   target.** In `client_runtime.cpp`, find `apply_opus_jitter_policy_to_participant`
   (grep it; it is called from `:1108`, `:1121`, `reset_participant...`). Wherever
   it (or its `reset_target=true` path) stores `buffer_ready = false`, gate the
@@ -691,7 +691,7 @@ joiner gets an explicit denial and the client shows it; tests cover 32/33/re-joi
   `participant.opus_queue.size_approx() < std::max<size_t>(1, new_target)`.
   Change nothing else about target/floor bookkeeping.
 
-- [ ] **6.4 Manual verification (this task's regressions are audible, not
+- [x] **6.4 Manual verification (this task's regressions are audible, not
   unit-testable):** two localhost clients with continuous audio (WAV playing).
   - Drag the jitter slider end to end slowly: audio must not pause or restart
     while dragging; one settle at release.
@@ -701,7 +701,7 @@ joiner gets an explicit denial and the client shows it; tests cover 32/33/re-joi
   - Confirm after each preset that jitter/age/queue/auto all match the preset
     table (`juce_mixer_component.cpp:57-75`) — no half-applied bundles.
 
-- [ ] **6.5** Run the standard verification block. **Commit:**
+- [x] **6.5** Run the standard verification block. **Commit:**
   `git commit -m "fix: make live network setting changes transactional"`
 
 **Done when:** slider drags apply once; a preset is atomic (fully live or fully
@@ -1016,7 +1016,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 3 — Auto-jitter age ceiling | ☑ complete | `fix: clamp auto jitter target to the packet age ceiling` |
 | 4 — Underflow tail fade | ☑ complete | `fix: fade partial-underflow tail instead of holding last sample` |
 | 5 — 32-participant room limit | ☑ complete | `fix: enforce shared 32-participant room limit with explicit denial` |
-| 6 — Transactional live settings | ☐ not started | |
+| 6 — Transactional live settings | ☑ complete | `fix: make live network setting changes transactional` |
 | 7 — Off-callback snapshot retirement | ☐ not started | |
 | 8 — Wall-clock rate recovery | ☐ not started | |
 | 9 — Stall backlog flush | ☐ not started | |

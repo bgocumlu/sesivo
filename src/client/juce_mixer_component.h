@@ -170,6 +170,10 @@ private:
     AudioStream::DeviceIndex pending_output_ = AudioStream::NO_DEVICE;
     int pending_buffer_frames_ = AudioStream::AudioConfig::DEFAULT_FRAMES_PER_BUFFER;
     int pending_opus_frames_per_packet_ = 0;
+    std::optional<int> pending_network_age_limit_ms_;
+    std::optional<int> pending_network_jitter_ms_;
+    std::optional<size_t> pending_network_queue_limit_packets_;
+    std::optional<bool> pending_network_auto_jitter_;
 
     juce::Label diagnostics_label_;
     juce::Component network_content_;

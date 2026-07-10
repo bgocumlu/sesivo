@@ -1121,6 +1121,17 @@ void JuceMixerComponent::configure_controls() {
         }
     };
     jitter_ms_slider_.onValueChange = [this]() {
+        if (!updating_from_client_ && !jitter_ms_slider_.isMouseButtonDown()) {
+            client_.set_opus_jitter_buffer_ms(
+                std::max(0, static_cast<int>(std::lround(jitter_ms_slider_.getValue()))));
+            if (client_.get_opus_queue_limit_packets() <
+                client_.get_opus_jitter_buffer_packets()) {
+                client_.set_opus_queue_limit_packets(
+                    client_.get_opus_jitter_buffer_packets());
+            }
+        }
+    };
+    jitter_ms_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
             client_.set_opus_jitter_buffer_ms(
                 std::max(0, static_cast<int>(std::lround(jitter_ms_slider_.getValue()))));
@@ -1132,12 +1143,24 @@ void JuceMixerComponent::configure_controls() {
         }
     };
     queue_limit_slider_.onValueChange = [this]() {
+        if (!updating_from_client_ && !queue_limit_slider_.isMouseButtonDown()) {
+            client_.set_opus_queue_limit_packets(static_cast<size_t>(
+                std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue())))));
+        }
+    };
+    queue_limit_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
             client_.set_opus_queue_limit_packets(static_cast<size_t>(
                 std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue())))));
         }
     };
     age_limit_slider_.onValueChange = [this]() {
+        if (!updating_from_client_ && !age_limit_slider_.isMouseButtonDown()) {
+            client_.set_jitter_packet_age_limit_ms(
+                std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue()))));
+        }
+    };
+    age_limit_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
             client_.set_jitter_packet_age_limit_ms(
                 std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue()))));
@@ -1520,16 +1543,28 @@ void JuceMixerComponent::refresh_live_state() {
     mic_mute_button_.setToggleState(client_.get_mic_muted(), juce::dontSendNotification);
     monitor_toggle_.setToggleState(client_.get_self_monitor_enabled(),
                                    juce::dontSendNotification);
-    jitter_ms_slider_.setValue(client_.get_opus_jitter_buffer_ms(),
-                               juce::dontSendNotification);
-    queue_limit_slider_.setValue(static_cast<double>(client_.get_opus_queue_limit_packets()),
-                                 juce::dontSendNotification);
-    age_limit_slider_.setValue(client_.get_jitter_packet_age_limit_ms(),
-                               juce::dontSendNotification);
+    if (!jitter_ms_slider_.isMouseButtonDown()) {
+        jitter_ms_slider_.setValue(
+            pending_network_jitter_ms_.value_or(client_.get_opus_jitter_buffer_ms()),
+            juce::dontSendNotification);
+    }
+    if (!queue_limit_slider_.isMouseButtonDown()) {
+        queue_limit_slider_.setValue(
+            static_cast<double>(pending_network_queue_limit_packets_.value_or(
+                client_.get_opus_queue_limit_packets())),
+            juce::dontSendNotification);
+    }
+    if (!age_limit_slider_.isMouseButtonDown()) {
+        age_limit_slider_.setValue(
+            pending_network_age_limit_ms_.value_or(
+                client_.get_jitter_packet_age_limit_ms()),
+            juce::dontSendNotification);
+    }
     latency_preset_combo_.setSelectedId(latency_preset_id_for_current_settings(),
                                         juce::dontSendNotification);
-    auto_jitter_toggle_.setToggleState(client_.get_opus_auto_jitter_default(),
-                                       juce::dontSendNotification);
+    auto_jitter_toggle_.setToggleState(
+        pending_network_auto_jitter_.value_or(client_.get_opus_auto_jitter_default()),
+        juce::dontSendNotification);
 
     const int redundancy_depth = client_.get_opus_redundancy_depth_setting();
     redundancy_combo_.setText(redundancy_label(redundancy_depth,
@@ -1970,11 +2005,15 @@ int JuceMixerComponent::latency_preset_id_for_current_settings() const {
     const int packet_frames = pending_opus_frames_per_packet_ > 0
                                   ? pending_opus_frames_per_packet_
                                   : static_cast<int>(client_.get_opus_network_frame_count());
-    const int jitter_ms = client_.get_opus_jitter_buffer_ms();
+    const int jitter_ms =
+        pending_network_jitter_ms_.value_or(client_.get_opus_jitter_buffer_ms());
     const int queue_limit_packets =
-        static_cast<int>(client_.get_opus_queue_limit_packets());
-    const int age_limit_ms = client_.get_jitter_packet_age_limit_ms();
-    const bool auto_jitter = client_.get_opus_auto_jitter_default();
+        static_cast<int>(pending_network_queue_limit_packets_.value_or(
+            client_.get_opus_queue_limit_packets()));
+    const int age_limit_ms = pending_network_age_limit_ms_.value_or(
+        client_.get_jitter_packet_age_limit_ms());
+    const bool auto_jitter = pending_network_auto_jitter_.value_or(
+        client_.get_opus_auto_jitter_default());
 
     for (const auto& preset: LATENCY_PRESETS) {
         if (preset.packet_frames == packet_frames && preset.jitter_ms == jitter_ms &&
@@ -1992,11 +2031,6 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
         return;
     }
 
-    client_.set_jitter_packet_age_limit_ms(preset->age_limit_ms);
-    client_.set_opus_jitter_buffer_ms(preset->jitter_ms);
-    client_.set_opus_queue_limit_packets(static_cast<size_t>(preset->queue_limit_packets));
-    client_.set_opus_auto_jitter_default(preset->auto_jitter);
-
     pending_opus_frames_per_packet_ = preset->packet_frames;
     opus_packet_combo_.setSelectedId(pending_opus_frames_per_packet_,
                                      juce::dontSendNotification);
@@ -2006,8 +2040,31 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
     queue_limit_slider_.setValue(preset->queue_limit_packets, juce::dontSendNotification);
     age_limit_slider_.setValue(preset->age_limit_ms, juce::dontSendNotification);
     auto_jitter_toggle_.setToggleState(preset->auto_jitter, juce::dontSendNotification);
+
+    const bool stage_network_settings =
+        pending_opus_frames_per_packet_ != client_.get_opus_network_frame_count() ||
+        pending_stream_restart_needed();
+    if (stage_network_settings) {
+        pending_network_age_limit_ms_ = preset->age_limit_ms;
+        pending_network_jitter_ms_ = preset->jitter_ms;
+        pending_network_queue_limit_packets_ =
+            static_cast<size_t>(preset->queue_limit_packets);
+        pending_network_auto_jitter_ = preset->auto_jitter;
+        set_device_status(juce::String(preset->label) + " selected — Apply to activate");
+    } else {
+        pending_network_age_limit_ms_.reset();
+        pending_network_jitter_ms_.reset();
+        pending_network_queue_limit_packets_.reset();
+        pending_network_auto_jitter_.reset();
+        client_.set_jitter_packet_age_limit_ms(preset->age_limit_ms);
+        client_.set_opus_jitter_buffer_ms(preset->jitter_ms);
+        client_.set_opus_queue_limit_packets(
+            static_cast<size_t>(preset->queue_limit_packets));
+        client_.set_opus_auto_jitter_default(preset->auto_jitter);
+        set_device_status(juce::String(preset->label) + " network preset selected");
+    }
+
     apply_audio_button_.setEnabled(device_controls_loaded_ && has_pending_audio_changes());
-    set_device_status(juce::String(preset->label) + " network preset selected");
 }
 
 void JuceMixerComponent::auto_match_buffer_to_packet_frames(int packet_frames) {
@@ -2047,6 +2104,16 @@ void JuceMixerComponent::apply_audio_settings() {
     const bool output_ok = client_.set_output_device(pending_output_);
     client_.set_requested_frames_per_buffer(pending_buffer_frames_);
     client_.set_opus_network_frame_count(pending_opus_frames_per_packet_);
+    if (pending_network_age_limit_ms_.has_value()) {
+        client_.set_jitter_packet_age_limit_ms(*pending_network_age_limit_ms_);
+        client_.set_opus_jitter_buffer_ms(*pending_network_jitter_ms_);
+        client_.set_opus_queue_limit_packets(*pending_network_queue_limit_packets_);
+        client_.set_opus_auto_jitter_default(*pending_network_auto_jitter_);
+        pending_network_age_limit_ms_.reset();
+        pending_network_jitter_ms_.reset();
+        pending_network_queue_limit_packets_.reset();
+        pending_network_auto_jitter_.reset();
+    }
     if (input_ok && output_ok) {
         client_.save_audio_device_preferences();
     } else {

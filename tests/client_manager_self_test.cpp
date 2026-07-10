@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <optional>
@@ -31,8 +32,8 @@ int main() {
                                                   "instance-a", 1,
                                                   "user-a", "User A");
 
-    const auto second_targets = manager.get_room_endpoints_except(second);
-    const auto first_targets = manager.get_room_endpoints_except(first);
+    const auto second_room = manager.get_cached_room_endpoints(second);
+    const auto first_room = manager.get_cached_room_endpoints(first);
 
     std::cout << "first_id=" << first_join.client_id << "\n";
     std::cout << "receiver_id=" << receiver_join.client_id << "\n";
@@ -40,8 +41,8 @@ int main() {
     std::cout << "duplicate_id=" << duplicate_join.client_id << "\n";
     std::cout << "duplicate_removed_count=" << duplicate_join.removed_client_ids.size() << "\n";
     std::cout << "manager_count=" << manager.count() << "\n";
-    std::cout << "second_targets=" << second_targets.size() << "\n";
-    std::cout << "first_targets=" << first_targets.size() << "\n";
+    std::cout << "second_room=" << second_room->size() << "\n";
+    std::cout << "first_room=" << first_room->size() << "\n";
 
     if (first_join.client_id == 0 || receiver_join.client_id == 0) {
         std::cerr << "initial joins failed\n";
@@ -69,12 +70,14 @@ int main() {
         std::cerr << "live endpoints were not retained correctly\n";
         return 6;
     }
-    if (second_targets.size() != 1 || second_targets.front() != receiver) {
-        std::cerr << "active duplicate sender does not forward exactly to receiver\n";
+    if (second_room->size() != 2 ||
+        std::find(second_room->begin(), second_room->end(), second) == second_room->end() ||
+        std::find(second_room->begin(), second_room->end(), receiver) == second_room->end()) {
+        std::cerr << "active duplicate sender room cache is incorrect\n";
         return 7;
     }
-    if (!first_targets.empty()) {
-        std::cerr << "stale endpoint still has forwarding targets\n";
+    if (!first_room->empty()) {
+        std::cerr << "stale endpoint still has a room cache\n";
         return 8;
     }
 
@@ -157,6 +160,38 @@ int main() {
     if (existing_registration.client_id == 0 || existing_registration.rejected_room_full) {
         std::cerr << "full room rejected an existing member re-registering\n";
         return 16;
+    }
+
+    ClientManager cache_manager;
+    const udp::endpoint cache_first(asio::ip::make_address("127.0.0.1"), 13001);
+    const udp::endpoint cache_second(asio::ip::make_address("127.0.0.1"), 13002);
+    const udp::endpoint cache_third(asio::ip::make_address("127.0.0.1"), 13003);
+    cache_manager.register_client(cache_first, now, "cache-room", "cache-instance", 1,
+                                  "cache-user-1", "Cache User 1");
+    cache_manager.register_client(cache_second, now, "cache-room", "cache-instance", 1,
+                                  "cache-user-2", "Cache User 2");
+    const auto cached_before = cache_manager.get_cached_room_endpoints(cache_first);
+    const auto cached_again = cache_manager.get_cached_room_endpoints(cache_second);
+    if (cached_before != cached_again || cached_before->size() != 2) {
+        std::cerr << "room endpoint list was not reused from the cache\n";
+        return 17;
+    }
+
+    cache_manager.register_client(cache_third, now, "cache-room", "cache-instance", 1,
+                                  "cache-user-3", "Cache User 3");
+    const auto cached_after_join = cache_manager.get_cached_room_endpoints(cache_first);
+    if (cached_after_join == cached_before || cached_after_join->size() != 3) {
+        std::cerr << "room endpoint cache was not invalidated after join\n";
+        return 18;
+    }
+
+    cache_manager.remove_client_with_info(cache_second);
+    const auto cached_after_leave = cache_manager.get_cached_room_endpoints(cache_first);
+    if (cached_after_leave == cached_after_join || cached_after_leave->size() != 2 ||
+        std::find(cached_after_leave->begin(), cached_after_leave->end(), cache_second) !=
+            cached_after_leave->end()) {
+        std::cerr << "room endpoint cache was not invalidated after leave\n";
+        return 19;
     }
 
     return 0;

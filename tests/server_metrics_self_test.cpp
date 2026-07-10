@@ -27,6 +27,8 @@ int main() {
     snapshot.drops.invalid_audio_total    = 11;
     snapshot.drops.rate_limited_audio_interval = 13;
     snapshot.drops.rate_limited_audio_total    = 17;
+    snapshot.drops.sfu_send_cap_interval       = 19;
+    snapshot.drops.sfu_send_cap_total          = 23;
     snapshot.ingress.push_back(
         {1, "127.0.0.1:40000", {10, 20, 2, 4, 1, 3, 1, 0, 4}, 120});
     snapshot.forwards.push_back({1, 2, {9, 19, 1, 2, 0, 1, 0, 0, 3}});
@@ -43,6 +45,8 @@ int main() {
             "connected client count missing");
     require(json.find("\"unknown_audio_interval\":3") != std::string::npos,
             "drop counters missing");
+    require(json.find("\"sfu_send_cap_total\":23") != std::string::npos,
+            "SFU send-cap drop counters missing");
     require(json.find("\"ingress\"") != std::string::npos, "ingress array missing");
     require(json.find("\"forwards\"") != std::string::npos, "forward array missing");
     require(json.find("\"pings\"") != std::string::npos, "ping array missing");

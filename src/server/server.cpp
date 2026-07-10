@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +53,7 @@ using namespace server_config;
 
 constexpr int64_t METRONOME_SCHEDULE_AHEAD_NS = 150'000'000;
 constexpr int64_t ROOM_JOIN_TICKET_TTL_MS = 10 * 60 * 1000;
+constexpr size_t MAX_OUTSTANDING_MEDIA_SENDS_PER_RECIPIENT = 64;
 
 static const char* runtime_platform_name() {
 #if defined(_WIN32)
@@ -137,6 +139,11 @@ std::string fixed_string(const Bytes<N>& bytes) {
 }
 
 class Server {
+    struct FanOutBuffer {
+        std::vector<unsigned char> bytes;
+        size_t pending_sends = 0;
+    };
+
 public:
     Server(asio::io_context& io_context, const ServerOptions& options)
         : options_(options),
@@ -261,6 +268,70 @@ public:
                                       spdlog::error("send error: {}", error_code.message());
                                   }
                               });
+    }
+
+    FanOutBuffer* acquire_fan_out_buffer(const void* data, std::size_t len) {
+        FanOutBuffer* buffer = nullptr;
+        if (free_fan_out_buffers_.empty()) {
+            fan_out_buffers_.push_back(std::make_unique<FanOutBuffer>());
+            buffer = fan_out_buffers_.back().get();
+        } else {
+            buffer = free_fan_out_buffers_.back();
+            free_fan_out_buffers_.pop_back();
+        }
+
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        buffer->bytes.assign(bytes, bytes + len);
+        buffer->pending_sends = 0;
+        return buffer;
+    }
+
+    void release_fan_out_buffer(FanOutBuffer* buffer) {
+        if (buffer == nullptr) {
+            return;
+        }
+        free_fan_out_buffers_.push_back(buffer);
+    }
+
+    bool send_media(FanOutBuffer* buffer, const udp::endpoint& target) {
+        auto& outstanding = outstanding_media_sends_.try_emplace(target).first->second;
+        size_t current = outstanding.load(std::memory_order_relaxed);
+        while (current < MAX_OUTSTANDING_MEDIA_SENDS_PER_RECIPIENT) {
+            if (outstanding.compare_exchange_weak(current, current + 1,
+                                                  std::memory_order_relaxed)) {
+                const auto qos = socket_qos_.ensure_flow(socket_, target);
+                if (qos.newly_configured &&
+                    (!qos.ok() || qos.detail.find("failed") != std::string::npos)) {
+                    spdlog::warn("UDP QoS not fully active for {}:{}: {}",
+                                 udp_network::format_address_for_display(target.address()),
+                                 target.port(), qos.detail);
+                }
+                ++buffer->pending_sends;
+                socket_.async_send_to(
+                    asio::buffer(buffer->bytes.data(), buffer->bytes.size()), target,
+                    [this, target, buffer](std::error_code error_code, std::size_t) {
+                        auto it = outstanding_media_sends_.find(target);
+                        if (it != outstanding_media_sends_.end()) {
+                            it->second.fetch_sub(1, std::memory_order_relaxed);
+                        }
+                        if (--buffer->pending_sends == 0) {
+                            release_fan_out_buffer(buffer);
+                        }
+                        if (error_code) {
+                            spdlog::error("send error: {}", error_code.message());
+                        }
+                    });
+                return true;
+            }
+        }
+
+        ++sfu_send_cap_drops_interval_;
+        const uint64_t drop_count = ++sfu_send_cap_drops_total_;
+        if (drop_count == 1 || drop_count % 100 == 0) {
+            spdlog::warn("SFU media send cap reached for {}:{} drops={}",
+                         target.address().to_string(), target.port(), drop_count);
+        }
+        return false;
     }
 
 private:
@@ -1338,10 +1409,9 @@ private:
         }
 
         client_manager_.update_alive(remote_endpoint_, now);
-        auto packet_copy = std::make_shared<std::vector<unsigned char>>(
-            packet_data, packet_data + bytes);
-        record_audio_ingress(sender_id, remote_endpoint_, packet_copy->data(), bytes);
-        forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
+        record_audio_ingress(sender_id, remote_endpoint_, packet_data, bytes);
+        auto* packet_copy = acquire_fan_out_buffer(packet_data, bytes);
+        forward_audio_to_others(remote_endpoint_, packet_copy);
     }
 
     void handle_plain_audio_message(unsigned char* packet_data, std::size_t bytes,
@@ -1406,10 +1476,9 @@ private:
 
         // SFU: Forward audio packet to all other clients (not back to sender)
         // Copy packet data before forwarding since recv_buf_ will be reused by do_receive()
-        auto packet_copy = std::make_shared<std::vector<unsigned char>>(packet_data,
-                                                                        packet_data + bytes);
-        record_audio_ingress(sender_id, remote_endpoint_, packet_copy->data(), bytes);
-        forward_audio_to_others(remote_endpoint_, packet_copy->data(), bytes, packet_copy);
+        record_audio_ingress(sender_id, remote_endpoint_, packet_data, bytes);
+        auto* packet_copy = acquire_fan_out_buffer(packet_data, bytes);
+        forward_audio_to_others(remote_endpoint_, packet_copy);
     }
 
     void handle_redundant_audio_message(unsigned char* packet_data, std::size_t bytes,
@@ -1456,23 +1525,22 @@ private:
 
         client_manager_.update_alive(remote_endpoint_, std::chrono::steady_clock::now());
         const uint32_t sender_id = client_manager_.get_client_id(remote_endpoint_);
-        auto packet_copy = std::make_shared<std::vector<unsigned char>>(packet_data,
-                                                                        packet_data + bytes);
+        auto* packet_copy = acquire_fan_out_buffer(packet_data, bytes);
         if (!audio_packet::embed_sender_id_in_redundant_audio_packet(
-                packet_copy->data(), packet_copy->size(), sender_id, &reason)) {
+                packet_copy->bytes.data(), packet_copy->bytes.size(), sender_id, &reason)) {
             record_invalid_audio_drop();
             spdlog::warn("Dropping redundant audio that could not be stamped: reason={}", reason);
+            release_fan_out_buffer(packet_copy);
             return;
         }
 
         audio_packet::for_each_redundant_audio_child_reverse(
-            packet_copy->data(), packet_copy->size(),
+            packet_copy->bytes.data(), packet_copy->bytes.size(),
             [&](const unsigned char* child, size_t child_len, uint8_t index) {
                 record_audio_ingress(sender_id, remote_endpoint_, child, child_len,
                                      index == 0);
             });
-        forward_audio_to_others(remote_endpoint_, packet_copy->data(), packet_copy->size(),
-                                packet_copy);
+        forward_audio_to_others(remote_endpoint_, packet_copy);
     }
 
     bool validate_complete_audio_packet(const unsigned char* packet_data, std::size_t bytes) {
@@ -1523,9 +1591,8 @@ private:
 
         auto packet_copy = std::make_shared<std::vector<unsigned char>>(
             recv_buf_.data(), recv_buf_.data() + sizeof(MetronomeSyncHdr));
-        auto endpoints = client_manager_.get_room_endpoints_except(remote_endpoint_);
-        endpoints.push_back(remote_endpoint_);
-        for (const auto& endpoint: endpoints) {
+        const auto endpoints = client_manager_.get_cached_room_endpoints(remote_endpoint_);
+        for (const auto& endpoint: *endpoints) {
             send(packet_copy->data(), packet_copy->size(), endpoint, packet_copy);
         }
     }
@@ -1706,10 +1773,9 @@ private:
         });
         auto buf = packet_builder::create_participant_info_packet(
             participant_id, profile_id, display_name, capabilities, key_public);
-        auto endpoints = client_manager_.get_room_endpoints_except(joined_endpoint);
-        endpoints.push_back(joined_endpoint);
+        const auto endpoints = client_manager_.get_cached_room_endpoints(joined_endpoint);
 
-        for (const auto& endpoint: endpoints) {
+        for (const auto& endpoint: *endpoints) {
             send(buf->data(), buf->size(), endpoint, buf);
         }
     }
@@ -1727,36 +1793,47 @@ private:
         }
     }
 
-    void forward_audio_to_others(
-        const udp::endpoint& sender, void* packet_data, std::size_t packet_size,
-        const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
+    void forward_audio_to_others(const udp::endpoint& sender, FanOutBuffer* buffer) {
         // Forward the audio packet to clients in the same room except the sender
         // keep_alive ensures packet data remains valid during async sends
 
-        auto endpoints = client_manager_.get_room_endpoints_except(sender);
+        const auto endpoints = client_manager_.get_cached_room_endpoints(sender);
         const uint32_t sender_id = client_manager_.get_client_id(sender);
         const bool secure_audio =
-            packet_magic(static_cast<const unsigned char*>(packet_data), packet_size) ==
+            packet_magic(buffer->bytes.data(), buffer->bytes.size()) ==
             SECURE_AUDIO_MAGIC;
 
-        for (const auto& endpoint: endpoints) {
+        for (const auto& endpoint: *endpoints) {
+            if (endpoint == sender) {
+                continue;
+            }
             if (secure_audio) {
                 if (client_manager_.has_authenticated_session(endpoint)) {
-                    record_audio_forward_datagram(sender_id, endpoint, packet_data, packet_size);
-                    send(packet_data, packet_size, endpoint, keep_alive);
+                    if (send_media(buffer, endpoint)) {
+                        record_audio_forward_datagram(sender_id, endpoint, buffer->bytes.data(),
+                                                      buffer->bytes.size());
+                    }
                 }
             } else if (!client_manager_.has_authenticated_session(endpoint)) {
-                record_audio_forward_datagram(sender_id, endpoint, packet_data, packet_size);
-                send(packet_data, packet_size, endpoint, keep_alive);
+                if (send_media(buffer, endpoint)) {
+                    record_audio_forward_datagram(sender_id, endpoint, buffer->bytes.data(),
+                                                  buffer->bytes.size());
+                }
             }
+        }
+        if (buffer->pending_sends == 0) {
+            release_fan_out_buffer(buffer);
         }
     }
 
     void forward_secure_control_to_others(
         const udp::endpoint& sender, void* packet_data, std::size_t packet_size,
         const std::shared_ptr<std::vector<unsigned char>>& keep_alive = nullptr) {
-        auto endpoints = client_manager_.get_room_endpoints_except(sender);
-        for (const auto& endpoint: endpoints) {
+        const auto endpoints = client_manager_.get_cached_room_endpoints(sender);
+        for (const auto& endpoint: *endpoints) {
+            if (endpoint == sender) {
+                continue;
+            }
             if (client_manager_.has_authenticated_session(endpoint)) {
                 send(packet_data, packet_size, endpoint, keep_alive);
             }
@@ -2059,6 +2136,8 @@ private:
         snapshot.drops.invalid_audio_total = invalid_audio_drops_total_;
         snapshot.drops.rate_limited_audio_interval = rate_limited_audio_drops_interval_;
         snapshot.drops.rate_limited_audio_total = rate_limited_audio_drops_total_;
+        snapshot.drops.sfu_send_cap_interval = sfu_send_cap_drops_interval_;
+        snapshot.drops.sfu_send_cap_total = sfu_send_cap_drops_total_;
 
         snapshot.ingress.reserve(audio_ingress_stats_.size());
         for (const auto& [sender_id, stats]: audio_ingress_stats_) {
@@ -2097,6 +2176,7 @@ private:
         unknown_audio_drops_interval_ = 0;
         invalid_audio_drops_interval_ = 0;
         rate_limited_audio_drops_interval_ = 0;
+        sfu_send_cap_drops_interval_ = 0;
     }
 
     void log_audio_forward_summary() {
@@ -2231,6 +2311,10 @@ private:
     std::unordered_map<uint32_t, AudioIngressStats> audio_ingress_stats_;
     std::unordered_map<uint64_t, AudioForwardStats> audio_forward_stats_;
     std::unordered_map<uint32_t, PingStats> ping_stats_;
+    std::unordered_map<udp::endpoint, std::atomic<size_t>, endpoint_hash>
+        outstanding_media_sends_;
+    std::vector<std::unique_ptr<FanOutBuffer>> fan_out_buffers_;
+    std::vector<FanOutBuffer*> free_fan_out_buffers_;
     server_rate_limiter::ProtocolRateLimiter rate_limiter_;
     udp_network::UdpSocketQos socket_qos_;
     uint64_t unknown_audio_drops_since_log_ = 0;
@@ -2241,6 +2325,8 @@ private:
     uint64_t invalid_audio_drops_total_ = 0;
     uint64_t rate_limited_audio_drops_interval_ = 0;
     uint64_t rate_limited_audio_drops_total_ = 0;
+    uint64_t sfu_send_cap_drops_interval_ = 0;
+    uint64_t sfu_send_cap_drops_total_ = 0;
     uint32_t metronome_sequence_ = 0;
     std::chrono::steady_clock::time_point last_unknown_audio_summary_ =
         std::chrono::steady_clock::now();

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -42,6 +43,8 @@ public:
 
         RegistrationResult result;
         auto existing = clients_.find(ep);
+        const std::string previous_room_id =
+            existing != clients_.end() ? existing->second.room_id : std::string{};
         const bool can_reuse_existing =
             existing != clients_.end() && existing->second.room_id == room_id &&
             existing->second.room_instance_id == room_instance_id &&
@@ -105,6 +108,9 @@ public:
             }
         }
 
+        invalidate_room_endpoint_cache(previous_room_id);
+        invalidate_room_endpoint_cache(room_id);
+
         return result;
     }
 
@@ -125,6 +131,7 @@ public:
         }
         ClientInfo info = it->second;
         clients_.erase(it);
+        invalidate_room_endpoint_cache(info.room_id);
         return info;
     }
 
@@ -135,6 +142,7 @@ public:
             if (it->second.room_id == room_id && it->second.client_id == client_id) {
                 auto removed = std::make_pair(it->first, it->second);
                 clients_.erase(it);
+                invalidate_room_endpoint_cache(room_id);
                 return removed;
             }
         }
@@ -152,6 +160,9 @@ public:
             } else {
                 ++it;
             }
+        }
+        if (!removed.empty()) {
+            invalidate_room_endpoint_cache(room_id);
         }
         return removed;
     }
@@ -225,22 +236,30 @@ public:
         return counts;
     }
 
-    std::vector<endpoint> get_room_endpoints_except(const endpoint& exclude) const {
+    std::shared_ptr<const std::vector<endpoint>> get_cached_room_endpoints(
+        const endpoint& member) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<endpoint>       endpoints;
-        auto                        sender_it = clients_.find(exclude);
-        if (sender_it == clients_.end()) {
-            return endpoints;
+        auto member_it = clients_.find(member);
+        if (member_it == clients_.end()) {
+            return empty_room_endpoints_;
         }
 
-        const std::string& room_id = sender_it->second.room_id;
-        endpoints.reserve(clients_.size());
+        const std::string& room_id = member_it->second.room_id;
+        auto cached = room_endpoint_cache_.find(room_id);
+        if (cached != room_endpoint_cache_.end()) {
+            return cached->second;
+        }
+
+        auto endpoints = std::make_shared<std::vector<endpoint>>();
+        endpoints->reserve(clients_.size());
         for (const auto& [ep, info]: clients_) {
-            if (ep != exclude && info.room_id == room_id) {
-                endpoints.push_back(ep);
+            if (info.room_id == room_id) {
+                endpoints->push_back(ep);
             }
         }
-        return endpoints;
+        auto immutable = std::shared_ptr<const std::vector<endpoint>>(std::move(endpoints));
+        room_endpoint_cache_[room_id] = immutable;
+        return immutable;
     }
 
     std::vector<std::pair<endpoint, ClientInfo>> get_room_clients_except(
@@ -312,6 +331,7 @@ public:
         for (auto it = clients_.begin(); it != clients_.end();) {
             if (now - it->second.last_alive > timeout) {
                 timed_out_ids.push_back(it->second.client_id);
+                invalidate_room_endpoint_cache(it->second.room_id);
                 it = clients_.erase(it);
             } else {
                 ++it;
@@ -342,6 +362,12 @@ public:
     }
 
 private:
+    void invalidate_room_endpoint_cache(const std::string& room_id) const {
+        if (!room_id.empty()) {
+            room_endpoint_cache_.erase(room_id);
+        }
+    }
+
     static void apply_security(ClientInfo& client,
                                const std::optional<ClientSecurityConfig>& security) {
         if (!security.has_value()) {
@@ -356,5 +382,10 @@ private:
 
     mutable std::mutex                                      mutex_;
     std::unordered_map<endpoint, ClientInfo, endpoint_hash> clients_;
+    mutable std::unordered_map<std::string,
+                               std::shared_ptr<const std::vector<endpoint>>>
+        room_endpoint_cache_;
+    const std::shared_ptr<const std::vector<endpoint>> empty_room_endpoints_ =
+        std::make_shared<const std::vector<endpoint>>();
     uint32_t                                                next_client_id_;
 };

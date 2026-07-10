@@ -30,6 +30,8 @@ struct DropCounters {
     uint64_t invalid_audio_total = 0;
     uint64_t rate_limited_audio_interval = 0;
     uint64_t rate_limited_audio_total = 0;
+    uint64_t sfu_send_cap_interval = 0;
+    uint64_t sfu_send_cap_total = 0;
 };
 
 struct IngressMetric {
@@ -146,7 +148,9 @@ inline std::string to_json_line(const Snapshot& snapshot) {
         << ",\"rate_limited_audio_interval\":"
         << snapshot.drops.rate_limited_audio_interval
         << ",\"rate_limited_audio_total\":"
-        << snapshot.drops.rate_limited_audio_total << '}';
+        << snapshot.drops.rate_limited_audio_total
+        << ",\"sfu_send_cap_interval\":" << snapshot.drops.sfu_send_cap_interval
+        << ",\"sfu_send_cap_total\":" << snapshot.drops.sfu_send_cap_total << '}';
 
     out << ",\"ingress\":[";
     for (size_t i = 0; i < snapshot.ingress.size(); ++i) {

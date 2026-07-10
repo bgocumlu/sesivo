@@ -830,13 +830,13 @@ by scanning all clients (`client_manager.h:212-228`), and posts one
 bound and every room inherits the induced jitter.
 
 **Bounded fix (in order of value, all in one task):**
-1. Track outstanding async sends per recipient endpoint (a small map of atomic
+1. [x] Track outstanding async sends per recipient endpoint (a small map of atomic
    counters in the server); above a cap (e.g. 64), drop that recipient's *new*
    media datagram instead of queueing it (stale audio must lose to fresh audio),
    and count the drops in `server_metrics`.
-2. Cache the per-room recipient list in `ClientManager`, invalidated on
+2. [x] Cache the per-room recipient list in `ClientManager`, invalidated on
    join/leave/room-change, instead of rebuilding a vector per datagram.
-3. Reuse send buffers from a simple free-list pool instead of a fresh
+3. [x] Reuse send buffers from a simple free-list pool instead of a fresh
    `make_shared<vector>` per datagram.
 
 Keep the single io thread — sharding is capacity work the audits explicitly gated
@@ -1027,6 +1027,6 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 8 — Wall-clock rate recovery | ☑ complete | `fix: make post-drop rate recovery wall-clock based` |
 | 9 — Stall backlog flush | ☑ complete | `fix: flush stale receive backlog after delivery stalls` |
 | 10 — Non-blocking media send | ☑ complete | `fix: make client media send non-blocking with counted drops` |
-| 11 — Bounded SFU fan-out | ☐ not started | |
+| 11 — Bounded SFU fan-out | ☑ complete | `fix: cap SFU outstanding sends and reuse fan-out buffers` |
 | C.1–C.8 — Preset UI | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

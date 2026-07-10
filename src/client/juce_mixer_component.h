@@ -127,6 +127,7 @@ private:
     juce::String invite_text() const;
     bool has_pending_audio_changes() const;
     bool pending_stream_restart_needed() const;
+    void update_apply_audio_button(bool controls_enabled);
     void set_device_status(const juce::String& text);
     void set_room_admin_status(const juce::String& text);
 

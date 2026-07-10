@@ -1686,7 +1686,7 @@ void JuceMixerComponent::refresh_live_state() {
 
     start_stop_audio_button_.setButtonText(client_.is_audio_stream_active() ? "Stop"
                                                                             : "Start");
-    apply_audio_button_.setEnabled(device_controls_loaded_ && has_pending_audio_changes());
+    update_apply_audio_button(device_controls_loaded_);
 
     updating_from_client_ = false;
 
@@ -1960,7 +1960,7 @@ void JuceMixerComponent::set_device_controls_enabled(bool enabled) {
     output_combo_.setEnabled(enabled);
     buffer_combo_.setEnabled(enabled);
     opus_packet_combo_.setEnabled(enabled);
-    apply_audio_button_.setEnabled(enabled && has_pending_audio_changes());
+    update_apply_audio_button(enabled);
     start_stop_audio_button_.setEnabled(enabled);
     reset_audio_button_.setEnabled(enabled);
     refresh_devices_button_.setEnabled(enabled);
@@ -2194,7 +2194,7 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
     }
 
     update_latency_preset_buttons(latency_preset_id_for_current_settings());
-    apply_audio_button_.setEnabled(device_controls_loaded_ && has_pending_audio_changes());
+    update_apply_audio_button(device_controls_loaded_);
 }
 
 void JuceMixerComponent::auto_match_buffer_to_packet_frames(int packet_frames) {
@@ -2886,6 +2886,18 @@ bool JuceMixerComponent::pending_stream_restart_needed() const {
            pending_output_ != client_.get_selected_output_device() ||
            pending_input_channel_ != client_.get_input_channel_index() ||
            pending_buffer_frames_ != client_.get_audio_config().frames_per_buffer;
+}
+
+void JuceMixerComponent::update_apply_audio_button(bool controls_enabled) {
+    const bool pending = has_pending_audio_changes();
+    apply_audio_button_.setEnabled(controls_enabled && pending);
+    if (pending) {
+        apply_audio_button_.setColour(juce::TextButton::buttonColourId,
+                                     juce_theme::colour::accent());
+    } else {
+        apply_audio_button_.removeColour(juce::TextButton::buttonColourId);
+    }
+    apply_audio_button_.repaint();
 }
 
 void JuceMixerComponent::set_device_status(const juce::String& text) {

@@ -140,7 +140,11 @@ void LookAndFeel::drawButtonBackground(juce::Graphics& g, juce::Button& button,
     }
     g.setColour(fill);
     g.fillRoundedRectangle(area, radius);
-    g.setColour(control_border(enabled, highlighted, active));
+    const bool accent_outline =
+        button.findColour(juce::TextButton::buttonColourId) == colour::accent();
+    g.setColour(accent_outline && enabled
+                    ? colour::accent()
+                    : control_border(enabled, highlighted, active));
     g.drawRoundedRectangle(area, radius, 1.0f);
 }
 

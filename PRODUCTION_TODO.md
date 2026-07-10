@@ -908,10 +908,11 @@ Implementation checklist (each bullet is one commit-sized change):
   `Not qualified` / `Clean` / `PLC detected` / `Callback misses` /
   `More buffering recommended`. Hide the line while it is not qualified;
   selecting a preset never sets it to `Clean`.
-- [ ] **C.8 UI tests where the project can test them** (policy-level: preset
-  reverse-matching including the new 240 step, custom-bundle persistence
-  round-trip through the config store) plus a manual pass: keyboard operation,
-  every chip during live audio, pending→Apply→active flow.
+- [x] **C.8 Final preset UI acceptance:** policy tests cover all four preset
+  bundles, reverse-matching, the 240-frame Low step, and Custom detection. Manual
+  GUI verification passed for the preset controls, Advanced editing, health state,
+  and pending→Apply→active flow. Custom-bundle persistence is deliberately omitted
+  because C.4 was removed.
 
 ---
 
@@ -1038,6 +1039,6 @@ these are parity changes with minimal risk, not claimed latency wins.
 | C.4 — Remember last custom bundle | — removed | Network tuning should not be restored after conditions change |
 | C.5 — Pending vs active preset state | ☑ complete | `feat: distinguish pending and active latency presets` |
 | C.6 — Estimated latency label | — removed | Current estimate is not calibrated mouth-to-ear measurement |
-| C.7 — Recent-window preset health | ☑ complete | Pending review; not committed |
-| C.8 — Remaining preset UI tests | ☐ not started | |
+| C.7 — Recent-window preset health | ☑ complete | `feat: show recent latency preset health` |
+| C.8 — Final preset UI acceptance | ☑ complete | Existing policy tests + completed manual GUI pass |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

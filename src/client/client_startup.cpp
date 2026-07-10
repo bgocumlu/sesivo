@@ -1,5 +1,7 @@
 #include "client_startup.h"
 
+#include "latency_preset_policy.h"
+
 #include "client_audio_devices.h"
 #include "udp_port.h"
 
@@ -152,6 +154,7 @@ StartupLatencyProfile resolve_startup_latency_profile(
         return profile;
     }
 
+    const bool ultra_profile = startup_options.startup_latency_profile == "ultra";
     const bool low_profile = startup_options.startup_latency_profile == "low";
     const bool stable_profile = startup_options.startup_latency_profile == "stable" ||
                                 startup_options.startup_latency_profile == "safe";
@@ -160,27 +163,29 @@ StartupLatencyProfile resolve_startup_latency_profile(
         startup_options.startup_latency_profile == "balanced" ||
         startup_options.startup_latency_profile == "current" ||
         startup_options.startup_latency_profile == "default";
-    if (!low_profile && !stable_profile && !adaptive_profile) {
+    if (!ultra_profile && !low_profile && !stable_profile && !adaptive_profile) {
         spdlog::error("Unknown latency profile '{}'", startup_options.startup_latency_profile);
         profile.valid = false;
         return profile;
     }
 
+    int preset_id = LATENCY_PRESET_BALANCED_ID;
+    if (ultra_profile) {
+        preset_id = LATENCY_PRESET_ULTRA_ID;
+    } else if (low_profile) {
+        preset_id = LATENCY_PRESET_LOW_ID;
+    } else if (stable_profile) {
+        preset_id = LATENCY_PRESET_STABLE_ID;
+    }
+    const auto& preset = *latency_preset_for_id(preset_id);
     profile.enabled = true;
-    profile.name = low_profile ? "low" : stable_profile ? "stable" : "adaptive";
-    profile.jitter_ms = low_profile ? 10
-                                    : stable_profile ? 80 : DEFAULT_OPUS_JITTER_MS;
-    profile.queue_limit_packets =
-        low_profile ? 24
-                    : stable_profile ? 96
-                                     : static_cast<int>(DEFAULT_OPUS_QUEUE_LIMIT_PACKETS);
-    profile.age_limit_ms =
-        low_profile ? 60 : stable_profile ? 250 : DEFAULT_JITTER_PACKET_AGE_MS;
-    profile.auto_jitter = false;
-    profile.opus_packet_frames =
-        low_profile      ? opus_network_clock::LOW_LATENCY_FRAME_COUNT
-        : stable_profile ? opus_network_clock::STABLE_FRAME_COUNT
-                         : opus_network_clock::DEFAULT_FRAME_COUNT;
+    profile.name = preset.label;
+    profile.jitter_ms = preset.jitter_ms;
+    profile.queue_limit_packets = preset.queue_limit_packets;
+    profile.age_limit_ms = preset.age_limit_ms;
+    profile.auto_jitter = preset.auto_jitter;
+    profile.opus_packet_frames = preset.packet_frames;
+    profile.redundancy_depth = preset.redundancy_depth;
     return profile;
 }
 

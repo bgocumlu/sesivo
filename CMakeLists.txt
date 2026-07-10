@@ -129,6 +129,8 @@ if(JAM_BUILD_TESTS)
 
     jam_add_self_test(jitter_policy_self_test jitter_policy_self_test.cpp)
 
+    jam_add_self_test(latency_preset_policy_self_test latency_preset_policy_self_test.cpp)
+
     jam_add_self_test(audio_callback_policy_self_test audio_callback_policy_self_test.cpp)
 
     jam_add_self_test(opus_tail_fade_self_test opus_tail_fade_self_test.cpp)
@@ -183,6 +185,7 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(udp_port_self_test)
     jam_add_executable_test(udp_socket_config_self_test)
     jam_add_executable_test(jitter_policy_self_test)
+    jam_add_executable_test(latency_preset_policy_self_test)
     jam_add_executable_test(audio_callback_policy_self_test)
     jam_add_executable_test(opus_tail_fade_self_test)
     jam_add_executable_test(post_drop_rate_recovery_self_test)

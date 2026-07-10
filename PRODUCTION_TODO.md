@@ -864,7 +864,7 @@ Custom (`latency_preset_id_for_current_settings`, near `:1962`),
 
 Implementation checklist (each bullet is one commit-sized change):
 
-- [ ] **C.1 Segmented preset control** replacing the combo: labeled chips
+- [x] **C.1 Segmented preset control** replacing the combo: labeled chips
   (Ultra / Low / Balanced / Stable), each step applying its bundle through the
   Task-6 transactional path. Add the missing 240-frame step. **The ladder values
   below are candidates, not verified claims** — implement them as data, and do not
@@ -876,6 +876,11 @@ Implementation checklist (each bullet is one commit-sized change):
   | Low | 240 (5 ms) | 15 ms | depth 2 |
   | Balanced | 480 (10 ms) | 20 ms | depth 2 |
   | Stable | 960 (20 ms) | 80 ms | depth 3 |
+
+  The standard soak now defaults to `ultra`: its pre-C.1 `low` profile was the
+  same 120-frame / 10 ms bundle that C.1 renamed Ultra. Keeping the harness on
+  `low` would instead test the new 240-frame / 15 ms product step and would no
+  longer be a like-for-like regression comparison.
 
   Every preset must **explicitly set auto-jitter mode** (currently all presets set
   `auto_jitter = false` while the compiled default is ON,
@@ -1028,5 +1033,6 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 9 — Stall backlog flush | ☑ complete | `fix: flush stale receive backlog after delivery stalls` |
 | 10 — Non-blocking media send | ☑ complete | `fix: make client media send non-blocking with counted drops` |
 | 11 — Bounded SFU fan-out | ☑ complete | `fix: cap SFU outstanding sends and reuse fan-out buffers` |
-| C.1–C.8 — Preset UI | ☐ not started | |
+| C.1 — Segmented preset control | ☑ complete | `feat: add segmented latency preset control` |
+| C.2–C.8 — Remaining preset UI | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

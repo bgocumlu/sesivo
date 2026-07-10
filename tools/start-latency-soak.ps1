@@ -3,7 +3,7 @@ param(
   [string]$ServerId = "local-dev",
   [string]$ServerHost = "127.0.0.1",
   [int]$Port = 9999,
-  [string]$LatencyProfile = "low",
+  [string]$LatencyProfile = "ultra",
   [int]$BufferFrames = 120,
   [int]$PacketFrames = 120,
   [string]$JoinSecret = "dev-secret",

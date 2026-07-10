@@ -1,6 +1,7 @@
 #include "juce_mixer_component.h"
 
 #include "juce_theme.h"
+#include "latency_preset_policy.h"
 #include "opus_network_clock.h"
 #include "packet_builder.h"
 #include "performer_join_token.h"
@@ -40,10 +41,7 @@ constexpr int ROW = juce_theme::row_height;
 constexpr int STATUS_HEIGHT = 66;
 constexpr int BOTTOM_HEIGHT = 170;
 constexpr std::array<int, 7> BUFFER_FRAME_OPTIONS{96, 120, 128, 240, 256, 480, 960};
-constexpr int LATENCY_PRESET_CUSTOM_ID = 1;
-constexpr int LATENCY_PRESET_LOW_ID = 2;
-constexpr int LATENCY_PRESET_BALANCED_ID = 3;
-constexpr int LATENCY_PRESET_STABLE_ID = 4;
+constexpr int LATENCY_PRESET_BUTTON_GROUP_ID = 1001;
 
 struct DockLayout {
     juce::Rectangle<int> local_audio;
@@ -53,35 +51,6 @@ struct DockLayout {
     juce::Rectangle<int> recording;
     juce::Rectangle<int> wav;
 };
-
-struct LatencyPreset {
-    int id = LATENCY_PRESET_CUSTOM_ID;
-    const char* label = "Custom";
-    int packet_frames = opus_network_clock::DEFAULT_FRAME_COUNT;
-    int jitter_ms = DEFAULT_OPUS_JITTER_MS;
-    int queue_limit_packets = static_cast<int>(DEFAULT_OPUS_QUEUE_LIMIT_PACKETS);
-    int age_limit_ms = DEFAULT_JITTER_PACKET_AGE_MS;
-    bool auto_jitter = false;
-};
-
-constexpr std::array<LatencyPreset, 3> LATENCY_PRESETS{{
-    {LATENCY_PRESET_LOW_ID, "Low", opus_network_clock::LOW_LATENCY_FRAME_COUNT, 10, 24, 60,
-     false},
-    {LATENCY_PRESET_BALANCED_ID, "Balanced", opus_network_clock::DEFAULT_FRAME_COUNT,
-     DEFAULT_OPUS_JITTER_MS, static_cast<int>(DEFAULT_OPUS_QUEUE_LIMIT_PACKETS),
-     DEFAULT_JITTER_PACKET_AGE_MS, false},
-    {LATENCY_PRESET_STABLE_ID, "Stable", opus_network_clock::STABLE_FRAME_COUNT, 80, 96, 250,
-     false},
-}};
-
-const LatencyPreset* latency_preset_for_id(int id) {
-    for (const auto& preset: LATENCY_PRESETS) {
-        if (preset.id == id) {
-            return &preset;
-        }
-    }
-    return nullptr;
-}
 
 DockLayout make_dock_layout(juce::Rectangle<int> bounds) {
     const int width = bounds.getWidth();
@@ -1035,7 +1004,7 @@ void JuceMixerComponent::configure_controls() {
     configure_caption(jitter_label_, "Jitter");
     configure_caption(queue_label_, "Queue");
     configure_caption(age_limit_label_, "Age");
-    configure_caption(preset_label_, "Preset");
+    configure_caption(preset_label_, "Latency");
     configure_caption(redundancy_label_, "Mode");
     configure_caption(wav_position_label_, "0:00 / 0:00");
     configure_caption(wav_gain_label_, "Gain 1.00x");
@@ -1058,7 +1027,7 @@ void JuceMixerComponent::configure_controls() {
     configure_linear_slider(queue_limit_slider_, 1.0, MAX_OPUS_QUEUE_LIMIT_PACKETS, 1.0,
                             " pkt");
     configure_linear_slider(age_limit_slider_, 1.0, MAX_JITTER_PACKET_AGE_MS, 1.0, " ms");
-    populate_latency_preset_combo();
+    configure_latency_preset_buttons();
     auto_jitter_toggle_.setButtonText("Auto jitter");
 
     bpm_editor_.setInputRestrictions(6, "0123456789.");
@@ -1100,7 +1069,8 @@ void JuceMixerComponent::configure_controls() {
     add_all(network_content_, {&network_label_, &packet_label_, &jitter_label_, &queue_label_,
                                &age_limit_label_, &preset_label_, &opus_packet_combo_,
                                &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
-                               &latency_preset_combo_,
+                               &latency_preset_ultra_button_, &latency_preset_low_button_,
+                               &latency_preset_balanced_button_, &latency_preset_stable_button_,
                                &redundancy_section_label_, &redundancy_label_,
                                &redundancy_combo_, &auto_jitter_toggle_, &diagnostics_label_});
 
@@ -1169,11 +1139,6 @@ void JuceMixerComponent::configure_controls() {
     auto_jitter_toggle_.onClick = [this]() {
         if (!updating_from_client_) {
             client_.set_opus_auto_jitter_default(auto_jitter_toggle_.getToggleState());
-        }
-    };
-    latency_preset_combo_.onChange = [this]() {
-        if (!updating_from_client_) {
-            apply_latency_preset(latency_preset_combo_.getSelectedId());
         }
     };
     redundancy_combo_.onChange = [this]() {
@@ -1473,7 +1438,15 @@ void JuceMixerComponent::layout_network_content() {
     network.removeFromTop(4);
     set_labeled_row(network.removeFromTop(ROW), age_limit_label_, age_limit_slider_, 52);
     network.removeFromTop(4);
-    set_labeled_row(network.removeFromTop(ROW), preset_label_, latency_preset_combo_, 52);
+    auto preset_row = network.removeFromTop(ROW);
+    preset_label_.setBounds(preset_row.removeFromLeft(52));
+    preset_row = preset_row.reduced(2);
+    const int preset_button_width = preset_row.getWidth() / 4;
+    latency_preset_ultra_button_.setBounds(preset_row.removeFromLeft(preset_button_width));
+    latency_preset_low_button_.setBounds(preset_row.removeFromLeft(preset_button_width));
+    latency_preset_balanced_button_.setBounds(
+        preset_row.removeFromLeft(preset_button_width));
+    latency_preset_stable_button_.setBounds(preset_row);
     network.removeFromTop(10);
     set_title(redundancy_section_label_, network);
     set_labeled_row(network.removeFromTop(ROW), redundancy_label_, redundancy_combo_, 52);
@@ -1560,13 +1533,13 @@ void JuceMixerComponent::refresh_live_state() {
                 client_.get_jitter_packet_age_limit_ms()),
             juce::dontSendNotification);
     }
-    latency_preset_combo_.setSelectedId(latency_preset_id_for_current_settings(),
-                                        juce::dontSendNotification);
+    update_latency_preset_buttons(latency_preset_id_for_current_settings());
     auto_jitter_toggle_.setToggleState(
         pending_network_auto_jitter_.value_or(client_.get_opus_auto_jitter_default()),
         juce::dontSendNotification);
 
-    const int redundancy_depth = client_.get_opus_redundancy_depth_setting();
+    const int redundancy_depth = pending_network_redundancy_depth_.value_or(
+        client_.get_opus_redundancy_depth_setting());
     redundancy_combo_.setText(redundancy_label(redundancy_depth,
                                                client_.get_effective_opus_redundancy_depth()),
                               juce::dontSendNotification);
@@ -1990,15 +1963,54 @@ void JuceMixerComponent::populate_opus_packet_combo() {
     updating_from_client_ = false;
 }
 
-void JuceMixerComponent::populate_latency_preset_combo() {
-    updating_from_client_ = true;
-    latency_preset_combo_.clear(juce::dontSendNotification);
-    latency_preset_combo_.addItem("Custom", LATENCY_PRESET_CUSTOM_ID);
-    for (const auto& preset: LATENCY_PRESETS) {
-        latency_preset_combo_.addItem(preset.label, preset.id);
+void JuceMixerComponent::configure_latency_preset_buttons() {
+    const std::array<std::pair<juce::TextButton*, int>, 4> buttons{{
+        {&latency_preset_ultra_button_, LATENCY_PRESET_ULTRA_ID},
+        {&latency_preset_low_button_, LATENCY_PRESET_LOW_ID},
+        {&latency_preset_balanced_button_, LATENCY_PRESET_BALANCED_ID},
+        {&latency_preset_stable_button_, LATENCY_PRESET_STABLE_ID},
+    }};
+
+    for (size_t index = 0; index < buttons.size(); ++index) {
+        auto* button = buttons[index].first;
+        const int preset_id = buttons[index].second;
+        const auto* preset = latency_preset_for_id(preset_id);
+        button->setButtonText(preset->label);
+        button->setClickingTogglesState(true);
+        button->setRadioGroupId(LATENCY_PRESET_BUTTON_GROUP_ID,
+                                juce::dontSendNotification);
+        int connected_edges = 0;
+        if (index > 0) {
+            connected_edges |= juce::Button::ConnectedOnLeft;
+        }
+        if (index + 1 < buttons.size()) {
+            connected_edges |= juce::Button::ConnectedOnRight;
+        }
+        button->setConnectedEdges(connected_edges);
+        button->setTooltip(juce::String(preset->packet_frames) + " frames / " +
+                           juce::String(preset->jitter_ms) + " ms jitter / depth " +
+                           juce::String(preset->redundancy_depth));
+        button->onClick = [this, preset_id]() {
+            if (!updating_from_client_) {
+                apply_latency_preset(preset_id);
+            }
+        };
     }
-    latency_preset_combo_.setSelectedId(LATENCY_PRESET_CUSTOM_ID, juce::dontSendNotification);
-    updating_from_client_ = false;
+
+    update_latency_preset_buttons(DEFAULT_LATENCY_PRESET_ID);
+}
+
+void JuceMixerComponent::update_latency_preset_buttons(int preset_id) {
+    const std::array<std::pair<juce::TextButton*, int>, 4> buttons{{
+        {&latency_preset_ultra_button_, LATENCY_PRESET_ULTRA_ID},
+        {&latency_preset_low_button_, LATENCY_PRESET_LOW_ID},
+        {&latency_preset_balanced_button_, LATENCY_PRESET_BALANCED_ID},
+        {&latency_preset_stable_button_, LATENCY_PRESET_STABLE_ID},
+    }};
+    for (const auto& [button, button_preset_id]: buttons) {
+        button->setToggleState(button_preset_id == preset_id,
+                               juce::dontSendNotification);
+    }
 }
 
 int JuceMixerComponent::latency_preset_id_for_current_settings() const {
@@ -2014,15 +2026,11 @@ int JuceMixerComponent::latency_preset_id_for_current_settings() const {
         client_.get_jitter_packet_age_limit_ms());
     const bool auto_jitter = pending_network_auto_jitter_.value_or(
         client_.get_opus_auto_jitter_default());
+    const int redundancy_depth = pending_network_redundancy_depth_.value_or(
+        client_.get_opus_redundancy_depth_setting());
 
-    for (const auto& preset: LATENCY_PRESETS) {
-        if (preset.packet_frames == packet_frames && preset.jitter_ms == jitter_ms &&
-            preset.queue_limit_packets == queue_limit_packets &&
-            preset.age_limit_ms == age_limit_ms && preset.auto_jitter == auto_jitter) {
-            return preset.id;
-        }
-    }
-    return LATENCY_PRESET_CUSTOM_ID;
+    return latency_preset_id_for_settings(packet_frames, jitter_ms, queue_limit_packets,
+                                          age_limit_ms, redundancy_depth, auto_jitter);
 }
 
 void JuceMixerComponent::apply_latency_preset(int preset_id) {
@@ -2040,6 +2048,8 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
     queue_limit_slider_.setValue(preset->queue_limit_packets, juce::dontSendNotification);
     age_limit_slider_.setValue(preset->age_limit_ms, juce::dontSendNotification);
     auto_jitter_toggle_.setToggleState(preset->auto_jitter, juce::dontSendNotification);
+    redundancy_combo_.setSelectedId(preset->redundancy_depth + 2,
+                                    juce::dontSendNotification);
 
     const bool stage_network_settings =
         pending_opus_frames_per_packet_ != client_.get_opus_network_frame_count() ||
@@ -2050,17 +2060,20 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
         pending_network_queue_limit_packets_ =
             static_cast<size_t>(preset->queue_limit_packets);
         pending_network_auto_jitter_ = preset->auto_jitter;
+        pending_network_redundancy_depth_ = preset->redundancy_depth;
         set_device_status(juce::String(preset->label) + " selected — Apply to activate");
     } else {
         pending_network_age_limit_ms_.reset();
         pending_network_jitter_ms_.reset();
         pending_network_queue_limit_packets_.reset();
         pending_network_auto_jitter_.reset();
+        pending_network_redundancy_depth_.reset();
         client_.set_jitter_packet_age_limit_ms(preset->age_limit_ms);
         client_.set_opus_jitter_buffer_ms(preset->jitter_ms);
         client_.set_opus_queue_limit_packets(
             static_cast<size_t>(preset->queue_limit_packets));
         client_.set_opus_auto_jitter_default(preset->auto_jitter);
+        client_.set_opus_redundancy_depth(preset->redundancy_depth);
         set_device_status(juce::String(preset->label) + " network preset selected");
     }
 
@@ -2109,10 +2122,12 @@ void JuceMixerComponent::apply_audio_settings() {
         client_.set_opus_jitter_buffer_ms(*pending_network_jitter_ms_);
         client_.set_opus_queue_limit_packets(*pending_network_queue_limit_packets_);
         client_.set_opus_auto_jitter_default(*pending_network_auto_jitter_);
+        client_.set_opus_redundancy_depth(*pending_network_redundancy_depth_);
         pending_network_age_limit_ms_.reset();
         pending_network_jitter_ms_.reset();
         pending_network_queue_limit_packets_.reset();
         pending_network_auto_jitter_.reset();
+        pending_network_redundancy_depth_.reset();
     }
     if (input_ok && output_ok) {
         client_.save_audio_device_preferences();

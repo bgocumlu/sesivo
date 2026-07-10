@@ -74,7 +74,8 @@ private:
     void populate_input_channel_combo();
     void populate_buffer_combo();
     void populate_opus_packet_combo();
-    void populate_latency_preset_combo();
+    void configure_latency_preset_buttons();
+    void update_latency_preset_buttons(int preset_id);
     void apply_latency_preset(int preset_id);
     int latency_preset_id_for_current_settings() const;
     void populate_redundancy_combo();
@@ -174,6 +175,7 @@ private:
     std::optional<int> pending_network_jitter_ms_;
     std::optional<size_t> pending_network_queue_limit_packets_;
     std::optional<bool> pending_network_auto_jitter_;
+    std::optional<int> pending_network_redundancy_depth_;
 
     juce::Label diagnostics_label_;
     juce::Component network_content_;
@@ -210,7 +212,10 @@ private:
     juce::Slider jitter_ms_slider_;
     juce::Slider queue_limit_slider_;
     juce::Slider age_limit_slider_;
-    juce::ComboBox latency_preset_combo_;
+    juce::TextButton latency_preset_ultra_button_;
+    juce::TextButton latency_preset_low_button_;
+    juce::TextButton latency_preset_balanced_button_;
+    juce::TextButton latency_preset_stable_button_;
     juce::ToggleButton auto_jitter_toggle_;
     juce::ComboBox redundancy_combo_;
 

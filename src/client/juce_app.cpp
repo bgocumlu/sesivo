@@ -67,6 +67,9 @@ bool apply_startup_latency_profile(ClientAppFacade& client,
         !startup_options.startup_disable_auto_jitter) {
         client.set_opus_auto_jitter_default(profile.auto_jitter);
     }
+    if (!startup_options.startup_redundancy_depth_packets.has_value()) {
+        client.set_opus_redundancy_depth(profile.redundancy_depth);
+    }
 
     spdlog::info("Startup latency profile: {}", profile.name);
     return true;

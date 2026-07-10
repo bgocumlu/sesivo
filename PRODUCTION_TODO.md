@@ -890,11 +890,12 @@ Implementation checklist (each bullet is one commit-sized change):
   age, redundancy, auto toggle, per-participant overrides. Persist the open/closed
   state in the config store (`client_config_store.*`). Label the queue limit
   **"RX capacity"** — it is a safety ceiling, not latency.
-- [ ] **C.3 Custom is a state, not a step:** touching anything in Advanced
-  deselects all chips and lights a "Custom" chip (the reverse-match logic already
-  returns `LATENCY_PRESET_CUSTOM_ID`). Clicking a chip overwrites Advanced values.
-- [ ] **C.4 Remember the last custom bundle** in the config store and offer
-  "Custom (last)" so one misclick doesn't destroy hand-tuned values.
+- [x] **C.3 Custom is a state, not a step:** changing a global setting in Advanced
+  immediately reverse-matches the resulting bundle. If it is custom, all preset
+  chips are deselected; there is deliberately no Custom chip. Clicking a preset
+  chip overwrites the Advanced values.
+- **C.4 Removed:** do not persist a last custom bundle. These values describe
+  current network conditions and may become stale as the server or network changes.
 - [ ] **C.5 Pending vs active state:** when a bundle needs a restart, the chip
   shows selected-but-pending ("Low selected — Apply and restart audio") and must
   not render as active until the whole bundle is live (Task 6 provides the
@@ -1035,5 +1036,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 11 — Bounded SFU fan-out | ☑ complete | `fix: cap SFU outstanding sends and reuse fan-out buffers` |
 | C.1 — Segmented preset control | ☑ complete | `feat: add segmented latency preset control` |
 | C.2 — Collapsible Advanced controls | ☑ complete | `feat: collapse advanced latency controls` |
-| C.3–C.8 — Remaining preset UI | ☐ not started | |
+| C.3 — Custom deselects preset chips | ☑ complete | `feat: represent custom latency settings with no preset selected` |
+| C.4 — Remember last custom bundle | — removed | Network tuning should not be restored after conditions change |
+| C.5–C.8 — Remaining preset UI | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

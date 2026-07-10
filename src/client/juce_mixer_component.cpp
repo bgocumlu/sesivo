@@ -1110,6 +1110,7 @@ void JuceMixerComponent::configure_controls() {
                 client_.set_opus_queue_limit_packets(
                     client_.get_opus_jitter_buffer_packets());
             }
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     jitter_ms_slider_.onDragEnd = [this]() {
@@ -1121,35 +1122,41 @@ void JuceMixerComponent::configure_controls() {
                 client_.set_opus_queue_limit_packets(
                     client_.get_opus_jitter_buffer_packets());
             }
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     queue_limit_slider_.onValueChange = [this]() {
         if (!updating_from_client_ && !queue_limit_slider_.isMouseButtonDown()) {
             client_.set_opus_queue_limit_packets(static_cast<size_t>(
                 std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue())))));
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     queue_limit_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
             client_.set_opus_queue_limit_packets(static_cast<size_t>(
                 std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue())))));
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     age_limit_slider_.onValueChange = [this]() {
         if (!updating_from_client_ && !age_limit_slider_.isMouseButtonDown()) {
             client_.set_jitter_packet_age_limit_ms(
                 std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue()))));
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     age_limit_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
             client_.set_jitter_packet_age_limit_ms(
                 std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue()))));
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     auto_jitter_toggle_.onClick = [this]() {
         if (!updating_from_client_) {
             client_.set_opus_auto_jitter_default(auto_jitter_toggle_.getToggleState());
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     redundancy_combo_.onChange = [this]() {
@@ -1162,6 +1169,7 @@ void JuceMixerComponent::configure_controls() {
         } else {
             client_.set_opus_redundancy_depth(selected - 2);
         }
+        update_latency_preset_buttons(latency_preset_id_for_current_settings());
     };
     bpm_editor_.onReturnKey = [this]() { commit_metronome_bpm(); };
     bpm_editor_.onFocusLost = [this]() { commit_metronome_bpm(); };
@@ -1256,6 +1264,7 @@ void JuceMixerComponent::configure_device_controls() {
         if (!updating_from_client_) {
             pending_opus_frames_per_packet_ = opus_packet_combo_.getSelectedId();
             auto_match_buffer_to_packet_frames(pending_opus_frames_per_packet_);
+            update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
 

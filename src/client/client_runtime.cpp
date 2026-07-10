@@ -739,6 +739,7 @@ public:
                 std::max(diagnostics.rx_queue_peak, participant.queue_size_max);
             diagnostics.underruns += participant.underrun_count;
             diagnostics.plc_frames += participant.plc_count;
+            diagnostics.age_drops += participant.jitter_age_drops;
             diagnostics.e2e_latency_avg_max_ms =
                 std::max(diagnostics.e2e_latency_avg_max_ms,
                          participant.capture_to_playout_latency_avg_ms);

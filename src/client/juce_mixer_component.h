@@ -128,6 +128,10 @@ private:
     bool has_pending_audio_changes() const;
     bool pending_stream_restart_needed() const;
     void update_apply_audio_button(bool controls_enabled);
+    void reset_latency_health_window();
+    void update_latency_health(const ClientAppFacade::PathDiagnostics& path,
+                               const ClientAppFacade::CallbackTimingInfo& callback_timing,
+                               double now_ms);
     void set_device_status(const juce::String& text);
     void set_room_admin_status(const juce::String& text);
 
@@ -148,6 +152,16 @@ private:
     int device_load_delay_ticks_ = 2;
     int connection_delay_ticks_ = 1;
     double last_participant_refresh_ms_ = 0.0;
+    double latency_health_window_start_ms_ = 0.0;
+    int latency_health_last_underruns_ = 0;
+    size_t latency_health_last_plc_frames_ = 0;
+    uint64_t latency_health_last_callback_misses_ = 0;
+    uint64_t latency_health_last_age_drops_ = 0;
+    int latency_health_window_underruns_ = 0;
+    size_t latency_health_window_plc_frames_ = 0;
+    uint64_t latency_health_window_callback_misses_ = 0;
+    uint64_t latency_health_window_age_drops_ = 0;
+    bool latency_health_audio_was_active_ = false;
     juce::String connection_status_ = "Connection will start after the window opens...";
     juce::String room_admin_status_ = "Creator controls";
     std::atomic<uint32_t> room_admin_request_id_{1};
@@ -197,6 +211,7 @@ private:
     juce::Label queue_label_;
     juce::Label age_limit_label_;
     juce::Label preset_label_;
+    juce::Label latency_health_label_;
     juce::Label redundancy_label_;
     juce::Label participant_overrides_label_;
     juce::Label wav_position_label_;

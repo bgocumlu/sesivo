@@ -900,16 +900,14 @@ Implementation checklist (each bullet is one commit-sized change):
   shows selected-but-pending ("Low selected — Apply and restart audio") and must
   not render as active until the whole bundle is live (Task 6 provides the
   staging; this is the visual layer).
-- [ ] **C.6 Latency label with evidence level:** show the estimate next to the
-  control (`total_estimate_ms` from `get_path_diagnostics()`), labeled
-  **"Estimated"**, plus a one-line summary ("10 ms packet / 20 ms jitter /
-  depth 2") when Advanced is collapsed. Never render an unlabeled number that
-  reads as a mouth-to-ear guarantee, and never show "Measured" (no calibration
-  exists in this codebase).
-- [ ] **C.7 Health line beside the preset** from a declared recent window using
+- **C.6 Removed:** do not show a latency estimate yet. The current calculation is
+  model-based rather than calibrated mouth-to-ear measurement and is not ready for
+  the primary preset UI.
+- [x] **C.7 Health line beside the preset** from a declared recent window using
   existing counters (PLC, underruns, callback deadline misses, age drops):
   `Not qualified` / `Clean` / `PLC detected` / `Callback misses` /
-  `More buffering recommended`. Selecting a preset never sets it to `Clean`.
+  `More buffering recommended`. Hide the line while it is not qualified;
+  selecting a preset never sets it to `Clean`.
 - [ ] **C.8 UI tests where the project can test them** (policy-level: preset
   reverse-matching including the new 240 step, custom-bundle persistence
   round-trip through the config store) plus a manual pass: keyboard operation,
@@ -1039,5 +1037,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | C.3 — Custom deselects preset chips | ☑ complete | `feat: represent custom latency settings with no preset selected` |
 | C.4 — Remember last custom bundle | — removed | Network tuning should not be restored after conditions change |
 | C.5 — Pending vs active preset state | ☑ complete | `feat: distinguish pending and active latency presets` |
-| C.6–C.8 — Remaining preset UI | ☐ not started | |
+| C.6 — Estimated latency label | — removed | Current estimate is not calibrated mouth-to-ear measurement |
+| C.7 — Recent-window preset health | ☑ complete | Pending review; not committed |
+| C.8 — Remaining preset UI tests | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

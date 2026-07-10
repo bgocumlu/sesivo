@@ -1008,6 +1008,9 @@ void JuceMixerComponent::configure_controls() {
     configure_caption(queue_label_, "RX capacity");
     configure_caption(age_limit_label_, "Age");
     configure_caption(preset_label_, "Latency");
+    configure_caption(latency_health_label_, {});
+    latency_health_label_.setJustificationType(juce::Justification::centredRight);
+    latency_health_label_.setTooltip("Audio health from the most recent 10-second window");
     configure_caption(advanced_latency_label_, "Advanced >");
     advanced_latency_label_.setJustificationType(juce::Justification::centredLeft);
     advanced_latency_label_.setMouseCursor(juce::MouseCursor::PointingHandCursor);
@@ -1080,9 +1083,11 @@ void JuceMixerComponent::configure_controls() {
                                &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
                                &latency_preset_ultra_button_, &latency_preset_low_button_,
                                &latency_preset_balanced_button_, &latency_preset_stable_button_,
-                               &advanced_latency_label_, &redundancy_label_,
+                               &advanced_latency_label_, &latency_health_label_,
+                               &redundancy_label_,
                                &redundancy_combo_, &auto_jitter_toggle_,
                                &participant_overrides_label_, &diagnostics_label_});
+    latency_health_label_.setVisible(false);
 
     leave_button_.onClick = [this]() { leave_room(); };
     room_settings_button_.onClick = [this]() { request_room_settings_dialog(); };
@@ -1503,7 +1508,9 @@ void JuceMixerComponent::layout_network_content() {
         preset_row.removeFromLeft(preset_button_width));
     latency_preset_stable_button_.setBounds(preset_row);
     network.removeFromTop(4);
-    advanced_latency_label_.setBounds(network.removeFromTop(24).reduced(2, 0));
+    auto advanced_row = network.removeFromTop(24).reduced(2, 0);
+    advanced_latency_label_.setBounds(advanced_row.removeFromLeft(92));
+    latency_health_label_.setBounds(advanced_row);
 
     if (advanced_latency_open_) {
         network.removeFromTop(6);
@@ -1682,6 +1689,7 @@ void JuceMixerComponent::refresh_live_state() {
             "Callback max " + juce::String(callback_timing.max_ms, 2) + " ms\n" +
             "Late " + juce::String(static_cast<int>(callback_timing.over_deadline_count)),
         juce::dontSendNotification);
+    update_latency_health(path, callback_timing, now_ms);
     layout_network_content();
 
     start_stop_audio_button_.setButtonText(client_.is_audio_stream_active() ? "Stop"
@@ -2153,6 +2161,8 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
     if (preset == nullptr) {
         return;
     }
+
+    reset_latency_health_window();
 
     pending_opus_frames_per_packet_ = preset->packet_frames;
     opus_packet_combo_.setSelectedId(pending_opus_frames_per_packet_,
@@ -2898,6 +2908,86 @@ void JuceMixerComponent::update_apply_audio_button(bool controls_enabled) {
         apply_audio_button_.removeColour(juce::TextButton::buttonColourId);
     }
     apply_audio_button_.repaint();
+}
+
+void JuceMixerComponent::reset_latency_health_window() {
+    latency_health_window_start_ms_ = 0.0;
+    latency_health_window_underruns_ = 0;
+    latency_health_window_plc_frames_ = 0;
+    latency_health_window_callback_misses_ = 0;
+    latency_health_window_age_drops_ = 0;
+    latency_health_audio_was_active_ = false;
+    latency_health_label_.setText({}, juce::dontSendNotification);
+    latency_health_label_.setColour(juce::Label::textColourId,
+                                    juce_theme::colour::text_faint());
+    latency_health_label_.setVisible(false);
+}
+
+void JuceMixerComponent::update_latency_health(
+    const ClientAppFacade::PathDiagnostics& path,
+    const ClientAppFacade::CallbackTimingInfo& callback_timing, double now_ms) {
+    const bool audio_active = client_.is_audio_stream_active();
+    if (!audio_active) {
+        if (latency_health_audio_was_active_) {
+            reset_latency_health_window();
+        }
+        latency_health_last_underruns_ = path.underruns;
+        latency_health_last_plc_frames_ = path.plc_frames;
+        latency_health_last_callback_misses_ = callback_timing.over_deadline_count;
+        latency_health_last_age_drops_ = path.age_drops;
+        return;
+    }
+
+    if (!latency_health_audio_was_active_) {
+        latency_health_audio_was_active_ = true;
+        latency_health_window_start_ms_ = now_ms;
+        latency_health_last_underruns_ = path.underruns;
+        latency_health_last_plc_frames_ = path.plc_frames;
+        latency_health_last_callback_misses_ = callback_timing.over_deadline_count;
+        latency_health_last_age_drops_ = path.age_drops;
+        return;
+    }
+
+    auto add_delta = [](auto current, auto& last, auto& window_total) {
+        window_total += current >= last ? current - last : current;
+        last = current;
+    };
+    add_delta(path.underruns, latency_health_last_underruns_,
+              latency_health_window_underruns_);
+    add_delta(path.plc_frames, latency_health_last_plc_frames_,
+              latency_health_window_plc_frames_);
+    add_delta(callback_timing.over_deadline_count,
+              latency_health_last_callback_misses_,
+              latency_health_window_callback_misses_);
+    add_delta(path.age_drops, latency_health_last_age_drops_,
+              latency_health_window_age_drops_);
+
+    juce::String status;
+    juce::Colour colour = juce_theme::colour::warning();
+    if (latency_health_window_callback_misses_ > 0) {
+        status = "Callback misses";
+    } else if (latency_health_window_plc_frames_ > 0) {
+        status = "PLC detected";
+    } else if (latency_health_window_underruns_ > 0 ||
+               latency_health_window_age_drops_ > 0) {
+        status = "More buffering recommended";
+    } else if (now_ms - latency_health_window_start_ms_ >= 10'000.0) {
+        status = "Clean";
+        colour = juce_theme::colour::success();
+    }
+
+    if (status.isNotEmpty()) {
+        latency_health_label_.setText("Health: " + status, juce::dontSendNotification);
+        latency_health_label_.setColour(juce::Label::textColourId, colour);
+        latency_health_label_.setVisible(true);
+    }
+    if (now_ms - latency_health_window_start_ms_ >= 10'000.0) {
+        latency_health_window_start_ms_ = now_ms;
+        latency_health_window_underruns_ = 0;
+        latency_health_window_plc_frames_ = 0;
+        latency_health_window_callback_misses_ = 0;
+        latency_health_window_age_drops_ = 0;
+    }
 }
 
 void JuceMixerComponent::set_device_status(const juce::String& text) {

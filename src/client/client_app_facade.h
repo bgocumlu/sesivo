@@ -51,6 +51,7 @@ struct ClientPathDiagnostics {
     size_t rx_queue_peak = 0;
     int underruns = 0;
     size_t plc_frames = 0;
+    uint64_t age_drops = 0;
     uint32_t udp_rebind_count = 0;
 };
 

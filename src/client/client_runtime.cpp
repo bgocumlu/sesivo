@@ -2266,9 +2266,12 @@ private:
             total_bytes_tx_.fetch_add(send_len, std::memory_order_relaxed);
             return;
         }
-        if (error_code != asio::error::would_block &&
-            error_code != asio::error::try_again &&
-            error_code != asio::error::operation_aborted &&
+        if (error_code == asio::error::would_block ||
+            error_code == asio::error::try_again) {
+            tx_socket_would_block_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (error_code != asio::error::operation_aborted &&
             outbound_enabled_.load(std::memory_order_acquire)) {
             spdlog::error("audio send error: {}", error_code.message());
         }
@@ -2282,6 +2285,13 @@ private:
                       UDP_SOCKET_BUFFER_BYTES);
         } else {
             spdlog::warn("Failed to set socket buffer sizes: {}", buffer_error.message());
+        }
+
+        std::error_code non_blocking_error;
+        socket.non_blocking(true, non_blocking_error);
+        if (non_blocking_error) {
+            throw std::runtime_error("Failed to make UDP socket non-blocking: " +
+                                     non_blocking_error.message());
         }
     }
 
@@ -3819,12 +3829,13 @@ private:
 
         spdlog::info(
             "Audio diag: frames={} tx_packets={} tx_drops opus={} "
-            "tx_malformed={} ({:.1f}/s) "
+            "tx_socket_would_block={} tx_malformed={} ({:.1f}/s) "
             "sendq_age_ms opus_last/avg/max/p99={:.2f}/{:.2f}/{:.2f}/{:.2f} "
             "rx_bytes={} tx_bytes={}",
                   current_audio_frames_per_buffer(),
                   audio_tx_sequence_.load(std::memory_order_relaxed),
                   opus_send_drops,
+                  tx_socket_would_block_drops_.load(std::memory_order_relaxed),
                   outbound_malformed_audio_drops,
                   outbound_malformed_audio_drop_rate,
                   ns_to_ms(opus_send_queue_age_last_ns_.load(std::memory_order_relaxed)),
@@ -5276,6 +5287,7 @@ private:
     std::mutex                                audio_sender_wait_mutex_;
     std::atomic<bool>                         audio_sender_wake_{false};
     std::atomic<uint64_t>                     opus_send_drops_{0};
+    std::atomic<uint64_t>                     tx_socket_would_block_drops_{0};
     // Written by the audio callback (relaxed atomics), drained and logged by
     // the io-thread cleanup timer. The callback itself must never log.
     std::atomic<uint64_t> rt_diag_mix_size_mismatches_{0};

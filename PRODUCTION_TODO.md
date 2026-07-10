@@ -1026,7 +1026,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 7 — Off-callback snapshot retirement | ☑ complete | `refactor: retire audio snapshots off the callback thread` |
 | 8 — Wall-clock rate recovery | ☑ complete | `fix: make post-drop rate recovery wall-clock based` |
 | 9 — Stall backlog flush | ☑ complete | `fix: flush stale receive backlog after delivery stalls` |
-| 10 — Non-blocking media send | ☐ not started | |
+| 10 — Non-blocking media send | ☑ complete | `fix: make client media send non-blocking with counted drops` |
 | 11 — Bounded SFU fan-out | ☐ not started | |
 | C.1–C.8 — Preset UI | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

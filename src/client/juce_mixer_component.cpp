@@ -1465,7 +1465,7 @@ void JuceMixerComponent::layout_network_content() {
         network.removeFromTop(4);
         set_labeled_row(network.removeFromTop(ROW), jitter_label_, jitter_ms_slider_, 90);
         network.removeFromTop(4);
-        set_labeled_row(network.removeFromTop(ROW), queue_label_, queue_limit_slider_, 205);
+        set_labeled_row(network.removeFromTop(ROW), queue_label_, queue_limit_slider_, 90);
         network.removeFromTop(4);
         set_labeled_row(network.removeFromTop(ROW), age_limit_label_, age_limit_slider_, 90);
         network.removeFromTop(4);

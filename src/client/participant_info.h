@@ -439,7 +439,7 @@ struct ParticipantData {
     size_t                                  opus_pcm_capture_chunk_count = 0;
     double                                  opus_resample_phase = 0.0;
     uint64_t                                opus_rate_last_queue_limit_drops = 0;
-    int                                     opus_rate_correction_callbacks = 0;
+    std::chrono::steady_clock::time_point   opus_rate_correction_deadline{};
     std::atomic<int64_t>                    opus_playout_rate_ratio_micros{1'000'000};
     std::atomic<int>                        opus_rate_correction_callbacks_observed{0};
     std::atomic<size_t>                     opus_pcm_buffered_frames_observed{0};

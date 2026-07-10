@@ -757,10 +757,10 @@ audible pitch shift on musical material, wall-clock dependent on an unrelated
 device setting.
 
 **Bounded fix (do NOT rebuild the rate controller):**
-- Make the burst wall-clock based: convert "400 callbacks at 120 frames" (= 1 s)
+- [x] Make the burst wall-clock based: convert "400 callbacks at 120 frames" (= 1 s)
   into a duration; store a deadline (`steady_clock`) instead of a callback
   countdown, so recovery lasts ~1 s at every buffer size.
-- Keep the existing exit condition (`queued_packets >= target * 0.5`) and the
+- [x] Keep the existing exit condition (`queued_packets >= target * 0.5`) and the
   normal proportional controller exactly as-is.
 
 This deliberately leaves the ±0.5 % steady-state correction untouched — replacing
@@ -1018,7 +1018,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 5 — 32-participant room limit | ☑ complete | `fix: enforce shared 32-participant room limit with explicit denial` |
 | 6 — Transactional live settings | ☑ complete | `fix: make live network setting changes transactional` |
 | 7 — Off-callback snapshot retirement | ☑ complete | `refactor: retire audio snapshots off the callback thread` |
-| 8 — Wall-clock rate recovery | ☐ not started | |
+| 8 — Wall-clock rate recovery | ☑ complete | `fix: make post-drop rate recovery wall-clock based` |
 | 9 — Stall backlog flush | ☐ not started | |
 | 10 — Non-blocking media send | ☐ not started | |
 | 11 — Bounded SFU fan-out | ☐ not started | |

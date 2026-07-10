@@ -69,6 +69,7 @@
 #include "participant_manager.h"
 #include "performer_join_token.h"
 #include "periodic_timer.h"
+#include "post_drop_rate_recovery.h"
 #include "protocol.h"
 #include "session_crypto.h"
 #include "udp_port.h"
@@ -3045,21 +3046,24 @@ private:
 
         const uint64_t queue_limit_drops =
             participant.opus_queue_limit_drops.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
         if (queue_limit_drops > participant.opus_rate_last_queue_limit_drops) {
             participant.opus_rate_last_queue_limit_drops = queue_limit_drops;
-            participant.opus_rate_correction_callbacks = 400;
+            participant.opus_rate_correction_deadline =
+                post_drop_rate_recovery::deadline(now);
         }
-        if (participant.opus_rate_correction_callbacks > 0) {
-            participant.opus_rate_correction_callbacks--;
-            if (queued_packets >= target_packets * 0.5) {
-                ratio = std::max(ratio, max_ratio);
-            }
+        if (post_drop_rate_recovery::active(
+                now, participant.opus_rate_correction_deadline,
+                queued_packets, target_packets)) {
+            ratio = std::max(ratio, max_ratio);
         }
 
         participant.opus_playout_rate_ratio_micros.store(
             static_cast<int64_t>(ratio * 1'000'000.0), std::memory_order_relaxed);
         participant.opus_rate_correction_callbacks_observed.store(
-            participant.opus_rate_correction_callbacks, std::memory_order_relaxed);
+            post_drop_rate_recovery::remaining_reference_callbacks(
+                now, participant.opus_rate_correction_deadline),
+            std::memory_order_relaxed);
         return ratio;
     }
 

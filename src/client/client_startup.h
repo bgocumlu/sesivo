@@ -16,7 +16,7 @@ struct ClientStartupOptions {
     std::string config_dir;
     int requested_frames = 0;
     std::optional<int> startup_input_channel_index;
-    std::string startup_latency_profile = "low";
+    std::string startup_latency_profile = "adaptive";
     std::optional<int> startup_opus_packet_frames;
     std::optional<int> startup_jitter_packets;
     std::optional<int> startup_jitter_ms;
@@ -41,7 +41,6 @@ struct StartupLatencyProfile {
     int age_limit_ms = DEFAULT_JITTER_PACKET_AGE_MS;
     bool auto_jitter = false;
     int opus_packet_frames = opus_network_clock::DEFAULT_FRAME_COUNT;
-    int redundancy_depth = DEFAULT_OPUS_REDUNDANCY_DEPTH_PACKETS;
 };
 
 const char* runtime_platform_name();

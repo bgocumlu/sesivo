@@ -6,11 +6,15 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include <spdlog/spdlog.h>
+
+#include "audio_callback_context.h"
 
 // Format parsing (can extract to class later)
 namespace wav_format {
@@ -225,14 +229,14 @@ public:
 
     // Allow moving (atomics initialized in body since they can't be copy-constructed)
     WavFilePlayback(WavFilePlayback&& other) noexcept
-        : loaded_wav_(std::atomic_load_explicit(&other.loaded_wav_, std::memory_order_acquire)),
-          playing_(other.playing_.load(std::memory_order_acquire)),
+        : playing_(other.playing_.load(std::memory_order_acquire)),
           read_position_(other.read_position_.load()),
           resample_ratio_(other.resample_ratio_.load()),
           resample_position_frac_(other.resample_position_frac_.load()) {
-        std::shared_ptr<const LoadedWav> cleared;
-        std::atomic_store_explicit(&other.loaded_wav_, std::move(cleared),
-                                   std::memory_order_release);
+        std::lock_guard<std::mutex> lock(other.retired_wavs_mutex_);
+        loaded_wav_.store(other.loaded_wav_.exchange(nullptr, std::memory_order_acq_rel),
+                          std::memory_order_release);
+        retired_wavs_ = std::move(other.retired_wavs_);
         other.playing_.store(false);
         other.read_position_.store(0);
         other.resample_ratio_.store(1.0F);
@@ -241,18 +245,21 @@ public:
 
     WavFilePlayback& operator=(WavFilePlayback&& other) noexcept {
         if (this != &other) {
-            auto loaded =
-                std::atomic_load_explicit(&other.loaded_wav_, std::memory_order_acquire);
-            std::atomic_store_explicit(&loaded_wav_, std::move(loaded),
-                                       std::memory_order_release);
+            std::scoped_lock lock(retired_wavs_mutex_, other.retired_wavs_mutex_);
+            auto incoming = other.loaded_wav_.exchange(nullptr, std::memory_order_acq_rel);
+            auto retired = loaded_wav_.exchange(std::move(incoming), std::memory_order_acq_rel);
+            if (retired) {
+                retired_wavs_.push_back(std::move(retired));
+            }
+            retired_wavs_.insert(retired_wavs_.end(),
+                                 std::make_move_iterator(other.retired_wavs_.begin()),
+                                 std::make_move_iterator(other.retired_wavs_.end()));
+            other.retired_wavs_.clear();
             playing_.store(other.playing_.load(std::memory_order_acquire));
             read_position_.store(other.read_position_.load());
             resample_ratio_.store(other.resample_ratio_.load());
             resample_position_frac_.store(other.resample_position_frac_.load());
 
-            std::shared_ptr<const LoadedWav> cleared;
-            std::atomic_store_explicit(&other.loaded_wav_, std::move(cleared),
-                                       std::memory_order_release);
             other.playing_.store(false);
             other.read_position_.store(0);
             other.resample_ratio_         = 1.0F;
@@ -300,7 +307,7 @@ public:
         }
 
         // Convert to float, always output as mono.
-        auto new_wav = std::make_shared<LoadedWav>();
+        auto new_wav = make_loaded_wav();
         new_wav->sample_rate = static_cast<int>(header.sample_rate);
         new_wav->channels = static_cast<int>(header.num_channels);
         new_wav->bits_per_sample = static_cast<int>(header.bits_per_sample);
@@ -319,9 +326,7 @@ public:
         resample_ratio_.store(1.0F);
         resample_position_frac_.store(0.0);
 
-        std::shared_ptr<const LoadedWav> published = std::move(new_wav);
-        std::atomic_store_explicit(&loaded_wav_, std::move(published),
-                                   std::memory_order_release);
+        publish_loaded_wav(std::move(new_wav));
 
         spdlog::info("Loaded WAV file: {} ({}Hz, {}ch, {}bits, {} frames)", path,
                      header.sample_rate, header.num_channels, header.bits_per_sample,
@@ -335,9 +340,28 @@ public:
         read_position_.store(0);
         resample_ratio_.store(1.0F);
         resample_position_frac_.store(0.0);
-        std::shared_ptr<const LoadedWav> cleared;
-        std::atomic_store_explicit(&loaded_wav_, std::move(cleared),
-                                   std::memory_order_release);
+        publish_loaded_wav(nullptr);
+    }
+
+    size_t reap_retired_wavs() {
+        std::vector<std::shared_ptr<const LoadedWav>> to_destroy;
+        {
+            std::lock_guard<std::mutex> lock(retired_wavs_mutex_);
+            for (auto it = retired_wavs_.begin(); it != retired_wavs_.end();) {
+                if (it->use_count() == 1) {
+                    to_destroy.push_back(std::move(*it));
+                    it = retired_wavs_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        return to_destroy.size();
+    }
+
+    size_t retired_wav_count() const {
+        std::lock_guard<std::mutex> lock(retired_wavs_mutex_);
+        return retired_wavs_.size();
     }
 
     bool is_loaded() const {
@@ -500,12 +524,30 @@ public:
     }
 
 private:
+    static std::shared_ptr<LoadedWav> make_loaded_wav() {
+        return std::shared_ptr<LoadedWav>(new LoadedWav(), [](LoadedWav* wav) {
+            AudioCallbackContext::assert_not_reclamation();
+            delete wav;
+        });
+    }
+
+    void publish_loaded_wav(std::shared_ptr<const LoadedWav> published) {
+        reap_retired_wavs();
+        auto retired = loaded_wav_.exchange(std::move(published), std::memory_order_acq_rel);
+        if (retired) {
+            std::lock_guard<std::mutex> lock(retired_wavs_mutex_);
+            retired_wavs_.push_back(std::move(retired));
+        }
+    }
+
     std::shared_ptr<const LoadedWav> loaded_wav() const {
-        return std::atomic_load_explicit(&loaded_wav_, std::memory_order_acquire);
+        return loaded_wav_.load(std::memory_order_acquire);
     }
 
     // Atomically published so the audio thread can keep an old file alive while UI loads/unloads.
-    std::shared_ptr<const LoadedWav> loaded_wav_;
+    std::atomic<std::shared_ptr<const LoadedWav>> loaded_wav_;
+    mutable std::mutex retired_wavs_mutex_;
+    std::vector<std::shared_ptr<const LoadedWav>> retired_wavs_;
 
     // Playback state
     std::atomic<bool>    playing_{false};

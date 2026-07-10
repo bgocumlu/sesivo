@@ -4079,6 +4079,7 @@ private:
 
         log_rt_callback_diagnostics();
         participant_manager_.reap_retired_participants();
+        media_state_.reap_retired_wavs();
     }
 
     void handle_audio_path_stats_message(std::size_t bytes, const char* recv_data) {

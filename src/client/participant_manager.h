@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 #include <spdlog/spdlog.h>
+#include "audio_callback_context.h"
 #include "participant_info.h"
 #include "protocol.h"
 
@@ -35,28 +36,18 @@ class ParticipantManager {
     using ParticipantMetadataSnapshot = std::unordered_map<uint32_t, ParticipantMetadata>;
     using ParticipantMetadataSnapshotPtr = std::shared_ptr<const ParticipantMetadataSnapshot>;
 
-    inline static thread_local bool in_audio_callback_ = false;
-
 public:
     static constexpr size_t MAX_AUDIO_CALLBACK_PARTICIPANTS = MAX_ROOM_PARTICIPANTS;
+    static constexpr auto RETIRED_SNAPSHOT_MIN_AGE = std::chrono::seconds(2);
 
-    class AudioCallbackReadScope {
-    public:
-        AudioCallbackReadScope()
-            : previous_(in_audio_callback_) {
-            in_audio_callback_ = true;
-        }
+    using AudioCallbackReadScope = AudioCallbackContext::Scope;
 
-        ~AudioCallbackReadScope() {
-            in_audio_callback_ = previous_;
-        }
-
-    private:
-        bool previous_;
-    };
+    static void assert_not_audio_callback_reclamation() {
+        AudioCallbackContext::assert_not_reclamation();
+    }
 
     ParticipantManager()
-        : audio_snapshot_(std::make_shared<ParticipantSnapshot>()),
+        : audio_snapshot_(make_participant_snapshot()),
           info_participant_snapshot_(std::make_shared<ParticipantSnapshot>()),
           metadata_snapshot_(std::make_shared<ParticipantMetadataSnapshot>()) {}
 
@@ -242,8 +233,27 @@ public:
     // Safety: once removed, a graveyard-only entry can only be referenced by
     // already-loaded published snapshots; new snapshots are built from the
     // active map, so use_count()==1 observed under the lock cannot race upward.
-    size_t reap_retired_participants() {
+    size_t reap_retired_participants(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
+        std::vector<ParticipantSnapshotPtr> retired_snapshots_to_destroy;
         std::vector<std::shared_ptr<ParticipantData>> to_destroy;
+        {
+            assert_not_audio_callback_lock();
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = retired_audio_snapshots_.begin();
+                 it != retired_audio_snapshots_.end();) {
+                if (now - it->retired_at >= RETIRED_SNAPSHOT_MIN_AGE &&
+                    it->snapshot.use_count() == 1) {
+                    retired_snapshots_to_destroy.push_back(std::move(it->snapshot));
+                    it = retired_audio_snapshots_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        retired_snapshots_to_destroy.clear();
+
         {
             assert_not_audio_callback_lock();
             std::lock_guard<std::mutex> lock(mutex_);
@@ -265,6 +275,12 @@ public:
         return graveyard_.size();
     }
 
+    size_t retired_snapshot_count() const {
+        assert_not_audio_callback_lock();
+        std::lock_guard<std::mutex> lock(mutex_);
+        return retired_audio_snapshots_.size();
+    }
+
     // Iterate over all participants (thread-safe, for audio mixing)
     template <typename Func>
     void for_each(Func&& func) {
@@ -278,11 +294,19 @@ public:
 
 private:
     static void assert_not_audio_callback_lock() {
-        assert(!in_audio_callback_);
+        AudioCallbackContext::assert_not_reclamation();
+    }
+
+    static std::shared_ptr<ParticipantSnapshot> make_participant_snapshot() {
+        return std::shared_ptr<ParticipantSnapshot>(
+            new ParticipantSnapshot(), [](ParticipantSnapshot* snapshot) {
+                assert_not_audio_callback_reclamation();
+                delete snapshot;
+            });
     }
 
     ParticipantSnapshotPtr load_audio_snapshot() const {
-        return std::atomic_load_explicit(&audio_snapshot_, std::memory_order_acquire);
+        return audio_snapshot_.load(std::memory_order_acquire);
     }
 
     ParticipantSnapshotPtr load_info_participant_snapshot() const {
@@ -294,7 +318,7 @@ private:
     }
 
     ParticipantSnapshotPtr build_participant_snapshot_locked(size_t max_participants) const {
-        auto snapshot = std::make_shared<ParticipantSnapshot>();
+        auto snapshot = make_participant_snapshot();
         snapshot->reserve(std::min(participants_.size(), max_participants));
         for (const auto& [id, participant]: participants_) {
             if (snapshot->size() >= max_participants) {
@@ -308,8 +332,11 @@ private:
     void publish_audio_snapshot_locked() {
         ParticipantSnapshotPtr published =
             build_participant_snapshot_locked(MAX_AUDIO_CALLBACK_PARTICIPANTS);
-        std::atomic_store_explicit(&audio_snapshot_, std::move(published),
-                                   std::memory_order_release);
+        auto retired = audio_snapshot_.exchange(std::move(published), std::memory_order_acq_rel);
+        if (retired) {
+            retired_audio_snapshots_.push_back(
+                {std::move(retired), std::chrono::steady_clock::now()});
+        }
     }
 
     void publish_info_participant_snapshot_locked() {
@@ -433,7 +460,12 @@ private:
 
     mutable std::mutex                                             mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<ParticipantData>> participants_;
-    ParticipantSnapshotPtr                                          audio_snapshot_;
+    struct RetiredParticipantSnapshot {
+        ParticipantSnapshotPtr snapshot;
+        std::chrono::steady_clock::time_point retired_at;
+    };
+
+    std::atomic<ParticipantSnapshotPtr>                              audio_snapshot_;
     ParticipantSnapshotPtr                                          info_participant_snapshot_;
     ParticipantMetadataSnapshotPtr                                  metadata_snapshot_;
     // Removed participants are parked here and destroyed only by
@@ -441,5 +473,6 @@ private:
     // snapshot references them. Destruction frees heap memory and destroys the
     // Opus decoder, so it must never run on the audio thread.
     std::vector<std::shared_ptr<ParticipantData>>                  graveyard_;
+    std::vector<RetiredParticipantSnapshot>                         retired_audio_snapshots_;
     std::unordered_map<uint32_t, ParticipantMetadata>               pending_metadata_;
 };

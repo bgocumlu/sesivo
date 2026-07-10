@@ -113,3 +113,7 @@ bool ClientMediaState::wav_loaded_and_playing() const {
 int ClientMediaState::read_wav(float* output, int frames_requested, int target_sample_rate) {
     return wav_playback_.read(output, frames_requested, target_sample_rate);
 }
+
+size_t ClientMediaState::reap_retired_wavs() {
+    return wav_playback_.reap_retired_wavs();
+}

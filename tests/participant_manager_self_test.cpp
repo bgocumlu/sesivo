@@ -90,8 +90,14 @@ void test_immediate_reap_without_snapshot() {
     require(manager.register_participant(1, 48000, 1), "register participant");
     manager.remove_participant(1);
     require(manager.retired_count() == 1, "removed participant is retired, not destroyed");
-    require(manager.reap_retired_participants() == 1, "unreferenced retiree is reaped");
+    require(manager.retired_snapshot_count() > 0, "replaced audio snapshots are retired");
+    require(manager.reap_retired_participants() == 0, "young snapshots are not reaped");
+    require(manager.reap_retired_participants(
+                std::chrono::steady_clock::now() +
+                ParticipantManager::RETIRED_SNAPSHOT_MIN_AGE) == 1,
+            "unreferenced retiree is reaped after snapshot grace period");
     require(manager.retired_count() == 0, "graveyard empty after reap");
+    require(manager.retired_snapshot_count() == 0, "retired snapshots are reaped");
 }
 
 void test_snapshot_defers_reclamation() {
@@ -115,14 +121,17 @@ void test_snapshot_defers_reclamation() {
 
     manager.remove_participant(7);
     require(manager.retired_count() == 1, "removed participant parked in graveyard");
-    require(manager.reap_retired_participants() == 0,
+    const auto after_grace = std::chrono::steady_clock::now() +
+                             ParticipantManager::RETIRED_SNAPSHOT_MIN_AGE;
+    require(manager.reap_retired_participants(after_grace) == 0,
             "participant referenced by a live snapshot is NOT reaped");
     require(manager.retired_count() == 1, "still retired while snapshot lives");
 
     release_snapshot.store(true, std::memory_order_release);
     holder.join();
 
-    require(manager.reap_retired_participants() == 1, "reaped after snapshot released");
+    require(manager.reap_retired_participants(after_grace) == 1,
+            "reaped after snapshot released");
     require(manager.retired_count() == 0, "graveyard empty at end");
 }
 
@@ -137,12 +146,18 @@ void test_timeout_and_clear_route_through_graveyard() {
     require(removed.size() == 2, "both participants timed out");
     require(manager.count() == 0, "map empty after timeout");
     require(manager.retired_count() == 2, "timed-out participants retired");
-    require(manager.reap_retired_participants() == 2, "timed-out participants reaped");
+    auto after_grace = std::chrono::steady_clock::now() +
+                       ParticipantManager::RETIRED_SNAPSHOT_MIN_AGE;
+    require(manager.reap_retired_participants(after_grace) == 2,
+            "timed-out participants reaped");
 
     require(manager.register_participant(4, 48000, 1), "register participant 4");
     manager.clear();
     require(manager.retired_count() == 1, "clear() retires instead of destroying");
-    require(manager.reap_retired_participants() == 1, "cleared participant reaped");
+    after_grace = std::chrono::steady_clock::now() +
+                  ParticipantManager::RETIRED_SNAPSHOT_MIN_AGE;
+    require(manager.reap_retired_participants(after_grace) == 1,
+            "cleared participant reaped");
 }
 
 }  // namespace

@@ -49,6 +49,7 @@ public:
     ClientWavState wav_state() const;
     bool wav_loaded_and_playing() const;
     int read_wav(float* output, int frames_requested, int target_sample_rate);
+    size_t reap_retired_wavs();
 
 private:
     RecordingWriter recording_writer_;

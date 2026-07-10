@@ -731,13 +731,13 @@ data blocks that are not.
 
 **Bounded fix (do NOT redesign the participant system):** keep the atomic-publish
 pattern, but make the *publisher* responsible for reclamation:
-- In `ParticipantManager`, when publishing a new snapshot, push the old
+- [x] In `ParticipantManager`, when publishing a new snapshot, push the old
   `shared_ptr` into a small retirement list owned by the io thread; the existing
   10-second reaper (`client_runtime.cpp:3921-3936` calls into the graveyard) also
   drains snapshots older than a few seconds. The callback's temporary reference is
   gone within one callback, so a seconds-scale delay guarantees the callback never
   holds the last reference.
-- Apply the same retirement pattern to `WavFilePlayback`'s `loaded_wav_`
+- [x] Apply the same retirement pattern to `WavFilePlayback`'s `loaded_wav_`
   (`wav_file_playback.h:504` load / publish sites).
 - C++23 is available: where it stays simple, prefer `std::atomic<std::shared_ptr<T>>`
   over the free-function forms, but the retirement list is the actual fix.
@@ -1017,7 +1017,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 4 — Underflow tail fade | ☑ complete | `fix: fade partial-underflow tail instead of holding last sample` |
 | 5 — 32-participant room limit | ☑ complete | `fix: enforce shared 32-participant room limit with explicit denial` |
 | 6 — Transactional live settings | ☑ complete | `fix: make live network setting changes transactional` |
-| 7 — Off-callback snapshot retirement | ☐ not started | |
+| 7 — Off-callback snapshot retirement | ☑ complete | `refactor: retire audio snapshots off the callback thread` |
 | 8 — Wall-clock rate recovery | ☐ not started | |
 | 9 — Stall backlog flush | ☐ not started | |
 | 10 — Non-blocking media send | ☐ not started | |

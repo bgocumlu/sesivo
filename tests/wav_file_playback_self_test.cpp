@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -184,6 +185,40 @@ bool wav_resampled_read_reports_partial_eof() {
            require(!playback.is_playing(), "partial EOF stops playback") &&
            require(playback.get_position() == 3, "partial EOF position");
 }
+
+bool wav_load_unload_churn_reclaims_on_the_publisher_thread() {
+    TempWav wav(unique_name("retirement"));
+    if (!require(write_mono_wav(wav.path, 48000, std::vector<int16_t>(480, 4096)),
+                 "write retirement temp wav")) {
+        return false;
+    }
+
+    WavFilePlayback playback;
+    std::atomic<bool> keep_reading{true};
+    std::thread reader([&]() {
+        std::array<float, 120> output{};
+        while (keep_reading.load(std::memory_order_acquire)) {
+            playback.read(output.data(), static_cast<int>(output.size()), 48000);
+        }
+    });
+
+    bool loaded = true;
+    for (int i = 0; i < 20; ++i) {
+        loaded = loaded && playback.load_file(wav.path.string());
+        playback.play();
+        playback.unload();
+    }
+    keep_reading.store(false, std::memory_order_release);
+    reader.join();
+
+    return require(loaded, "WAV churn loads succeed") &&
+           require(playback.retired_wav_count() > 0,
+                   "unloaded WAV is retained by the publisher") &&
+           require(playback.reap_retired_wavs() > 0,
+                   "publisher reaps retired WAV blocks") &&
+           require(playback.retired_wav_count() == 0,
+                   "retired WAV list is empty after reap");
+}
 }  // namespace
 
 int main() {
@@ -197,6 +232,9 @@ int main() {
         return 1;
     }
     if (!wav_resampled_read_reports_partial_eof()) {
+        return 1;
+    }
+    if (!wav_load_unload_churn_reclaims_on_the_publisher_thread()) {
         return 1;
     }
 

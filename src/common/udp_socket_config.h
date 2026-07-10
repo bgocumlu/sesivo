@@ -45,13 +45,15 @@ struct QosResult {
     bool          requested             = false;
     bool          newly_configured      = false;
     bool          socket_option_applied = false;
+    bool          service_type_applied  = false;
     bool          qwave_flow_added      = false;
     bool          explicit_dscp_applied = false;
     unsigned long error_code            = 0;
     std::string   detail;
 
     bool ok() const {
-        return socket_option_applied || qwave_flow_added || explicit_dscp_applied;
+        return socket_option_applied || service_type_applied || qwave_flow_added ||
+               explicit_dscp_applied;
     }
 };
 
@@ -161,6 +163,9 @@ public:
 
 private:
     bool socket_option_applied_ = false;
+#ifdef __APPLE__
+    bool service_type_applied_ = false;
+#endif
 
 #ifdef _WIN32
     HANDLE qos_handle_ = nullptr;
@@ -329,11 +334,26 @@ inline QosResult UdpSocketQos::ensure_flow(udp::socket& socket,
                                            const udp::endpoint&) {
     QosResult result;
     result.requested = true;
+#ifdef __APPLE__
+    if (socket_option_applied_ || service_type_applied_) {
+        result.socket_option_applied = socket_option_applied_;
+        result.service_type_applied = service_type_applied_;
+        if (socket_option_applied_ && service_type_applied_) {
+            result.detail = "DSCP EF and Wi-Fi voice service type already configured";
+        } else if (socket_option_applied_) {
+            result.detail = "DSCP EF socket option already configured";
+        } else {
+            result.detail = "Wi-Fi voice service type already configured";
+        }
+        return result;
+    }
+#else
     if (socket_option_applied_) {
         result.socket_option_applied = true;
         result.detail = "DSCP EF socket option already configured";
         return result;
     }
+#endif
 
     result.newly_configured = true;
     std::error_code ec;
@@ -359,17 +379,27 @@ inline QosResult UdpSocketQos::ensure_flow(udp::socket& socket,
         ::setsockopt(socket.native_handle(), SOL_SOCKET, SO_NET_SERVICE_TYPE,
                      &service_type, sizeof(service_type));
     const int service_type_errno = service_type_result == 0 ? 0 : errno;
+    result.service_type_applied = service_type_result == 0;
+    service_type_applied_ = result.service_type_applied;
 #endif
 
     if (applied) {
         socket_option_applied_ = true;
+#ifdef __APPLE__
+        result.detail = result.service_type_applied
+                            ? "DSCP EF and Wi-Fi voice service type configured"
+                            : "DSCP EF socket option configured";
+#else
         result.detail = "DSCP EF socket option configured";
+#endif
     } else if (result.detail.empty()) {
         result.detail = "DSCP EF socket option failed with errno " +
                         std::to_string(result.error_code);
     }
 #ifdef __APPLE__
-    if (service_type_errno != 0) {
+    if (result.service_type_applied && !applied) {
+        result.detail += "; Wi-Fi voice service type configured";
+    } else if (service_type_errno != 0) {
         result.detail += "; Wi-Fi voice service type failed with errno " +
                          std::to_string(service_type_errno);
     }
@@ -379,6 +409,9 @@ inline QosResult UdpSocketQos::ensure_flow(udp::socket& socket,
 
 inline void UdpSocketQos::reset() {
     socket_option_applied_ = false;
+#ifdef __APPLE__
+    service_type_applied_ = false;
+#endif
 }
 #endif
 

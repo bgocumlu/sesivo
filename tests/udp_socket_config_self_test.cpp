@@ -24,6 +24,12 @@ void test_dscp_constants() {
     require(udp_network::EF_TRAFFIC_CLASS == 0xB8, "EF traffic class must be 0xB8");
 }
 
+void test_service_type_counts_as_qos_success() {
+    udp_network::QosResult result;
+    result.service_type_applied = true;
+    require(result.ok(), "Wi-Fi voice service type must count as QoS success");
+}
+
 void test_endpoint_display_and_normalization() {
     asio::io_context io;
     udp::socket      socket(io);
@@ -99,6 +105,7 @@ void test_qos_is_non_fatal() {
 
 int main() {
     test_dscp_constants();
+    test_service_type_counts_as_qos_success();
     test_endpoint_display_and_normalization();
     test_dual_stack_ipv4_compatibility();
     test_qos_is_non_fatal();

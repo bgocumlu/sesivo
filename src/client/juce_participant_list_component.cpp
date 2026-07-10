@@ -24,6 +24,8 @@ constexpr float METER_PEAK_RELEASE = 0.78F;
 constexpr int CONTENT_MIN_WIDTH =
     PAD * 2 + NAME_WIDTH + 8 + LEVEL_WIDTH + BUTTONS_WIDTH + GAIN_WIDTH +
     PAN_WIDTH + QUEUE_WIDTH + STATUS_WIDTH + JITTER_WIDTH + MS_WIDTH + RESET_WIDTH;
+constexpr int CONTENT_BASIC_MIN_WIDTH =
+    CONTENT_MIN_WIDTH - JITTER_WIDTH - MS_WIDTH - RESET_WIDTH;
 
 juce::String participant_name(const ParticipantInfo& participant) {
     if (!participant.display_name.empty()) {
@@ -435,6 +437,14 @@ public:
         repaint();
     }
 
+    void set_latency_overrides_visible(bool visible) {
+        latency_overrides_visible_ = visible;
+        auto_jitter_toggle_.setVisible(visible);
+        jitter_ms_editor_.setVisible(visible);
+        reset_jitter_button_.setVisible(visible);
+        resized();
+    }
+
     void paint(juce::Graphics& g) override {
         auto area = getLocalBounds().toFloat();
         g.setColour(juce_theme::colour::row());
@@ -514,12 +524,14 @@ public:
         queue_text_bounds_ = queue.reduced(0, 0);
 
         status_bounds_ = area.removeFromLeft(STATUS_WIDTH).withSizeKeepingCentre(92, 24);
-        auto_jitter_toggle_.setBounds(
-            area.removeFromLeft(JITTER_WIDTH).withSizeKeepingCentre(66, 24));
-        jitter_ms_editor_.setBounds(
-            area.removeFromLeft(MS_WIDTH).withSizeKeepingCentre(54, 22));
-        reset_jitter_button_.setBounds(
-            area.removeFromLeft(RESET_WIDTH).withSizeKeepingCentre(62, 24));
+        if (latency_overrides_visible_) {
+            auto_jitter_toggle_.setBounds(
+                area.removeFromLeft(JITTER_WIDTH).withSizeKeepingCentre(66, 24));
+            jitter_ms_editor_.setBounds(
+                area.removeFromLeft(MS_WIDTH).withSizeKeepingCentre(54, 22));
+            reset_jitter_button_.setBounds(
+                area.removeFromLeft(RESET_WIDTH).withSizeKeepingCentre(62, 24));
+        }
     }
 
 private:
@@ -534,6 +546,7 @@ private:
     ClientAppFacade& client_;
     ParticipantInfo info_{};
     bool updating_ = false;
+    bool latency_overrides_visible_ = false;
     float displayed_audio_level_ = 0.0F;
     float displayed_audio_peak_ = 0.0F;
 
@@ -593,6 +606,7 @@ void JuceParticipantListComponent::refresh() {
 
     while (participant_rows_.size() < participants.size()) {
         auto row = std::make_unique<ParticipantRowComponent>(client_);
+        row->set_latency_overrides_visible(latency_overrides_visible_);
         participants_content_.addAndMakeVisible(row.get());
         participant_rows_.push_back(std::move(row));
     }
@@ -612,6 +626,18 @@ void JuceParticipantListComponent::refresh() {
     resized();
 }
 
+void JuceParticipantListComponent::set_latency_overrides_visible(bool visible) {
+    if (latency_overrides_visible_ == visible) {
+        return;
+    }
+    latency_overrides_visible_ = visible;
+    for (auto& row: participant_rows_) {
+        row->set_latency_overrides_visible(visible);
+    }
+    resized();
+    repaint();
+}
+
 void JuceParticipantListComponent::paint(juce::Graphics& g) {
     auto area = getLocalBounds();
     area.removeFromTop(28);
@@ -625,9 +651,11 @@ void JuceParticipantListComponent::paint(juce::Graphics& g) {
     draw_column_label(g, header.removeFromLeft(PAN_WIDTH), "Pan");
     draw_column_label(g, header.removeFromLeft(QUEUE_WIDTH), "Queue");
     draw_column_label(g, header.removeFromLeft(STATUS_WIDTH), "Status");
-    draw_column_label(g, header.removeFromLeft(JITTER_WIDTH), "Jitter");
-    draw_column_label(g, header.removeFromLeft(MS_WIDTH), "ms");
-    draw_column_label(g, header.removeFromLeft(RESET_WIDTH), "Reset");
+    if (latency_overrides_visible_) {
+        draw_column_label(g, header.removeFromLeft(JITTER_WIDTH), "Jitter");
+        draw_column_label(g, header.removeFromLeft(MS_WIDTH), "ms");
+        draw_column_label(g, header.removeFromLeft(RESET_WIDTH), "Reset");
+    }
 
     g.setColour(juce_theme::colour::border_soft());
     g.drawHorizontalLine(55, 10.0F, static_cast<float>(getWidth() - 10));
@@ -641,9 +669,11 @@ void JuceParticipantListComponent::resized() {
     empty_participants_label_.setBounds(area);
     participants_viewport_.setBounds(area);
 
+    const int minimum_content_width = latency_overrides_visible_ ? CONTENT_MIN_WIDTH
+                                                                 : CONTENT_BASIC_MIN_WIDTH;
     const int content_width =
         std::max(area.getWidth() - participants_viewport_.getScrollBarThickness(),
-                 CONTENT_MIN_WIDTH);
+                 minimum_content_width);
     const size_t visible_row_count =
         visible_participant_count_ + (local_participant_visible_ ? size_t{1} : size_t{0});
     participants_content_.setSize(content_width,

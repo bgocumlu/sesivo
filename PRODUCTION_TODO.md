@@ -886,7 +886,7 @@ Implementation checklist (each bullet is one commit-sized change):
   `auto_jitter = false` while the compiled default is ON,
   `client_runtime.cpp:5060` — a session behaves differently depending on whether a
   preset was ever clicked; the bundle owning its mode removes that trap).
-- [ ] **C.2 Advanced section, collapsed by default:** packet, jitter, RX capacity,
+- [x] **C.2 Advanced section, collapsed by default:** packet, jitter, RX capacity,
   age, redundancy, auto toggle, per-participant overrides. Persist the open/closed
   state in the config store (`client_config_store.*`). Label the queue limit
   **"RX capacity (max queued packets)"** — it is a safety ceiling, not latency.
@@ -1034,5 +1034,6 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 10 — Non-blocking media send | ☑ complete | `fix: make client media send non-blocking with counted drops` |
 | 11 — Bounded SFU fan-out | ☑ complete | `fix: cap SFU outstanding sends and reuse fan-out buffers` |
 | C.1 — Segmented preset control | ☑ complete | `feat: add segmented latency preset control` |
-| C.2–C.8 — Remaining preset UI | ☐ not started | |
+| C.2 — Collapsible Advanced controls | ☑ complete | `feat: collapse advanced latency controls` |
+| C.3–C.8 — Remaining preset UI | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

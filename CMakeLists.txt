@@ -79,6 +79,17 @@ if(JAM_BUILD_TESTS)
     )
     target_link_libraries(client_startup_self_test PRIVATE asio concurrentqueue spdlog::spdlog opus juce::juce_core)
 
+    add_executable(client_config_store_self_test
+        ${JAM_TEST_DIR}/client_config_store_self_test.cpp
+        ${JAM_CLIENT_DIR}/client_config_store.cpp
+    )
+    jam_add_project_includes(client_config_store_self_test)
+    target_compile_definitions(client_config_store_self_test PRIVATE
+        JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1
+        JUCE_USE_CURL=0
+    )
+    target_link_libraries(client_config_store_self_test PRIVATE spdlog::spdlog juce::juce_core)
+
     jam_add_self_test(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)
     target_link_libraries(server_rate_limiter_self_test PRIVATE asio)
 
@@ -168,6 +179,7 @@ if(JAM_BUILD_TESTS)
 
     jam_add_executable_test(client_manager_self_test)
     jam_add_executable_test(client_startup_self_test)
+    jam_add_executable_test(client_config_store_self_test)
     jam_add_executable_test(server_rate_limiter_self_test)
     jam_add_executable_test(server_options_self_test)
     jam_add_executable_test(room_registry_self_test)

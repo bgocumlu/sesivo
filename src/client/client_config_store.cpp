@@ -149,3 +149,36 @@ bool enqueue_client_config_write(
     return config_write_queue().enqueue(std::move(path), std::move(mutation),
                                         std::move(log_message));
 }
+
+ClientMixerUiState load_client_mixer_ui_state(const std::filesystem::path& path) {
+    ClientMixerUiState state;
+    auto root = read_client_config_root(path);
+    const auto* root_object = root.getDynamicObject();
+    if (root_object == nullptr) {
+        return state;
+    }
+
+    const auto mixer_value = root_object->getProperty("mixer");
+    const auto* mixer = mixer_value.getDynamicObject();
+    if (mixer != nullptr) {
+        state.advanced_latency_open =
+            static_cast<bool>(mixer->getProperty("advancedLatencyOpen"));
+    }
+    return state;
+}
+
+bool save_client_mixer_ui_state(const std::filesystem::path& path,
+                                const ClientMixerUiState& state) {
+    return enqueue_client_config_write(
+        path,
+        [state](juce::DynamicObject& object) {
+            const auto mixer_value = object.getProperty("mixer");
+            auto* mixer = mixer_value.getDynamicObject();
+            if (mixer == nullptr) {
+                mixer = new juce::DynamicObject();
+                object.setProperty("mixer", juce::var(mixer));
+            }
+            mixer->setProperty("advancedLatencyOpen", state.advanced_latency_open);
+        },
+        "Save mixer UI state");
+}

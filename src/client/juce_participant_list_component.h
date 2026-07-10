@@ -13,6 +13,7 @@ public:
     ~JuceParticipantListComponent() override;
 
     void refresh();
+    void set_latency_overrides_visible(bool visible);
     void paint(juce::Graphics& g) override;
     void resized() override;
 
@@ -31,4 +32,5 @@ private:
     std::vector<std::unique_ptr<ParticipantRowComponent>> participant_rows_;
     size_t visible_participant_count_ = 0;
     bool local_participant_visible_ = false;
+    bool latency_overrides_visible_ = false;
 };

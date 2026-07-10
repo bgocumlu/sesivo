@@ -81,6 +81,7 @@ private:
     void populate_redundancy_combo();
     void auto_match_buffer_to_packet_frames(int packet_frames);
     void layout_network_content();
+    void set_advanced_latency_open(bool open, bool persist);
     void apply_audio_settings();
     void start_or_stop_audio();
     void reset_audio_path();
@@ -141,6 +142,7 @@ private:
     bool connection_job_finished_ = false;
     bool room_admin_job_running_ = false;
     bool room_admin_job_finished_ = false;
+    bool advanced_latency_open_ = false;
     int device_load_delay_ticks_ = 2;
     int connection_delay_ticks_ = 1;
     double last_participant_refresh_ms_ = 0.0;
@@ -183,7 +185,6 @@ private:
     juce::Label device_status_label_;
     juce::Label local_audio_label_;
     juce::Label network_label_;
-    juce::Label redundancy_section_label_;
     juce::Label metronome_label_;
     juce::Label recording_label_;
     juce::Label wav_label_;
@@ -195,6 +196,7 @@ private:
     juce::Label age_limit_label_;
     juce::Label preset_label_;
     juce::Label redundancy_label_;
+    juce::Label participant_overrides_label_;
     juce::Label wav_position_label_;
     juce::Label wav_gain_label_;
 
@@ -216,6 +218,7 @@ private:
     juce::TextButton latency_preset_low_button_;
     juce::TextButton latency_preset_balanced_button_;
     juce::TextButton latency_preset_stable_button_;
+    juce::TextButton advanced_latency_button_;
     juce::ToggleButton auto_jitter_toggle_;
     juce::ComboBox redundancy_combo_;
 

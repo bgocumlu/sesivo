@@ -1,5 +1,6 @@
 #include "juce_mixer_component.h"
 
+#include "client_config_store.h"
 #include "juce_theme.h"
 #include "latency_preset_policy.h"
 #include "opus_network_clock.h"
@@ -959,6 +960,8 @@ JuceMixerComponent::JuceMixerComponent(
       startup_options_(std::move(startup_options)),
       leave_callback_(std::move(leave_callback)),
       participants_component_(client) {
+    advanced_latency_open_ =
+        load_client_mixer_ui_state(startup_options_.config_path).advanced_latency_open;
     configure_controls();
     configure_device_controls();
     startTimerHz(30);
@@ -995,17 +998,18 @@ void JuceMixerComponent::configure_controls() {
     };
     configure_section(local_audio_label_, "Local Audio");
     configure_section(network_label_, "Network");
-    configure_section(redundancy_section_label_, "Redundancy");
     configure_section(metronome_label_, "Metronome");
     configure_section(recording_label_, "Record");
     configure_section(wav_label_, "WAV");
     configure_section(room_admin_label_, "Room");
     configure_caption(packet_label_, "Packet");
     configure_caption(jitter_label_, "Jitter");
-    configure_caption(queue_label_, "Queue");
+    configure_caption(queue_label_, "RX capacity (max queued packets)");
     configure_caption(age_limit_label_, "Age");
     configure_caption(preset_label_, "Latency");
-    configure_caption(redundancy_label_, "Mode");
+    configure_caption(redundancy_label_, "Redundancy");
+    configure_caption(participant_overrides_label_,
+                      "Participant overrides: shown in mixer rows");
     configure_caption(wav_position_label_, "0:00 / 0:00");
     configure_caption(wav_gain_label_, "Gain 1.00x");
     room_admin_status_label_.setText(room_admin_status_, juce::dontSendNotification);
@@ -1028,6 +1032,7 @@ void JuceMixerComponent::configure_controls() {
                             " pkt");
     configure_linear_slider(age_limit_slider_, 1.0, MAX_JITTER_PACKET_AGE_MS, 1.0, " ms");
     configure_latency_preset_buttons();
+    advanced_latency_button_.setClickingTogglesState(true);
     auto_jitter_toggle_.setButtonText("Auto jitter");
 
     bpm_editor_.setInputRestrictions(6, "0123456789.");
@@ -1071,8 +1076,9 @@ void JuceMixerComponent::configure_controls() {
                                &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
                                &latency_preset_ultra_button_, &latency_preset_low_button_,
                                &latency_preset_balanced_button_, &latency_preset_stable_button_,
-                               &redundancy_section_label_, &redundancy_label_,
-                               &redundancy_combo_, &auto_jitter_toggle_, &diagnostics_label_});
+                               &advanced_latency_button_, &redundancy_label_,
+                               &redundancy_combo_, &auto_jitter_toggle_,
+                               &participant_overrides_label_, &diagnostics_label_});
 
     leave_button_.onClick = [this]() { leave_room(); };
     room_settings_button_.onClick = [this]() { request_room_settings_dialog(); };
@@ -1090,6 +1096,10 @@ void JuceMixerComponent::configure_controls() {
             client_.set_self_monitor_enabled(monitor_toggle_.getToggleState());
         }
     };
+    advanced_latency_button_.onClick = [this]() {
+        set_advanced_latency_open(advanced_latency_button_.getToggleState(), true);
+    };
+    set_advanced_latency_open(advanced_latency_open_, false);
     jitter_ms_slider_.onValueChange = [this]() {
         if (!updating_from_client_ && !jitter_ms_slider_.isMouseButtonDown()) {
             client_.set_opus_jitter_buffer_ms(
@@ -1430,14 +1440,6 @@ void JuceMixerComponent::layout_network_content() {
 
     auto network = juce::Rectangle<int>(0, 0, std::max(1, viewport.getWidth() - 20), 1000);
     set_title(network_label_, network);
-    set_labeled_row(network.removeFromTop(ROW), packet_label_, opus_packet_combo_, 52);
-    network.removeFromTop(4);
-    set_labeled_row(network.removeFromTop(ROW), jitter_label_, jitter_ms_slider_, 52);
-    network.removeFromTop(4);
-    set_labeled_row(network.removeFromTop(ROW), queue_label_, queue_limit_slider_, 52);
-    network.removeFromTop(4);
-    set_labeled_row(network.removeFromTop(ROW), age_limit_label_, age_limit_slider_, 52);
-    network.removeFromTop(4);
     auto preset_row = network.removeFromTop(ROW);
     preset_label_.setBounds(preset_row.removeFromLeft(52));
     preset_row = preset_row.reduced(2);
@@ -1447,11 +1449,24 @@ void JuceMixerComponent::layout_network_content() {
     latency_preset_balanced_button_.setBounds(
         preset_row.removeFromLeft(preset_button_width));
     latency_preset_stable_button_.setBounds(preset_row);
-    network.removeFromTop(10);
-    set_title(redundancy_section_label_, network);
-    set_labeled_row(network.removeFromTop(ROW), redundancy_label_, redundancy_combo_, 52);
     network.removeFromTop(4);
-    auto_jitter_toggle_.setBounds(network.removeFromTop(ROW).reduced(2));
+    advanced_latency_button_.setBounds(network.removeFromTop(ROW).reduced(2));
+
+    if (advanced_latency_open_) {
+        network.removeFromTop(6);
+        set_labeled_row(network.removeFromTop(ROW), packet_label_, opus_packet_combo_, 90);
+        network.removeFromTop(4);
+        set_labeled_row(network.removeFromTop(ROW), jitter_label_, jitter_ms_slider_, 90);
+        network.removeFromTop(4);
+        set_labeled_row(network.removeFromTop(ROW), queue_label_, queue_limit_slider_, 205);
+        network.removeFromTop(4);
+        set_labeled_row(network.removeFromTop(ROW), age_limit_label_, age_limit_slider_, 90);
+        network.removeFromTop(4);
+        set_labeled_row(network.removeFromTop(ROW), redundancy_label_, redundancy_combo_, 90);
+        network.removeFromTop(4);
+        auto_jitter_toggle_.setBounds(network.removeFromTop(ROW).reduced(2));
+        participant_overrides_label_.setBounds(network.removeFromTop(22).reduced(2));
+    }
     network.removeFromTop(10);
 
     const int diagnostics_height = diagnostics_label_height(diagnostics_label_.getText());
@@ -1459,6 +1474,30 @@ void JuceMixerComponent::layout_network_content() {
 
     const int content_height = std::max(viewport.getHeight(), diagnostics_label_.getBottom() + control_gap);
     network_content_.setSize(std::max(1, viewport.getWidth() - 20), content_height);
+}
+
+void JuceMixerComponent::set_advanced_latency_open(bool open, bool persist) {
+    advanced_latency_open_ = open;
+    advanced_latency_button_.setToggleState(open, juce::dontSendNotification);
+    advanced_latency_button_.setButtonText(open ? "Advanced v" : "Advanced >");
+
+    const std::array<juce::Component*, 11> advanced_controls{
+        &packet_label_,         &opus_packet_combo_, &jitter_label_,
+        &jitter_ms_slider_,     &queue_label_,       &queue_limit_slider_,
+        &age_limit_label_,      &age_limit_slider_,  &redundancy_label_,
+        &redundancy_combo_,     &auto_jitter_toggle_,
+    };
+    for (auto* control: advanced_controls) {
+        control->setVisible(open);
+    }
+    participant_overrides_label_.setVisible(open);
+    participants_component_.set_latency_overrides_visible(open);
+    layout_network_content();
+
+    if (persist) {
+        save_client_mixer_ui_state(startup_options_.config_path,
+                                   ClientMixerUiState{open});
+    }
 }
 
 void JuceMixerComponent::timerCallback() {

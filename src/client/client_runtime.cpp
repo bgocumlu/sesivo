@@ -175,6 +175,7 @@ public:
     void start_connection_on_io_context(const std::string& server_address,
                                         uint16_t server_port) {
         spdlog::info("Connecting to {}:{}...", server_address, server_port);
+        join_denied_room_full_.store(false, std::memory_order_release);
         receiving_enabled_.store(false, std::memory_order_release);
         outbound_enabled_.store(false, std::memory_order_release);
         outbound_generation_.fetch_add(1, std::memory_order_acq_rel);
@@ -413,6 +414,10 @@ public:
 
     bool consume_room_removed_by_server() {
         return room_removed_by_server_.exchange(false, std::memory_order_acq_rel);
+    }
+
+    bool consume_join_denied_room_full() {
+        return join_denied_room_full_.exchange(false, std::memory_order_acq_rel);
     }
 
     bool start_audio_stream(AudioStream::DeviceIndex input_device,
@@ -3970,6 +3975,20 @@ private:
                           chdr.participant_id, server_capabilities);
                 break;
             }
+            case CtrlHdr::Cmd::JOIN_DENIED: {
+                if (bytes < sizeof(JoinDeniedHdr)) {
+                    break;
+                }
+                JoinDeniedHdr denied{};
+                std::memcpy(&denied, recv_data, sizeof(JoinDeniedHdr));
+                if (denied.reason == 1) {
+                    spdlog::warn("JOIN denied: room is full ({} participants max)",
+                                 MAX_ROOM_PARTICIPANTS);
+                    join_denied_room_full_.store(true, std::memory_order_release);
+                    disconnect_from_server(false);
+                }
+                break;
+            }
             case CtrlHdr::Cmd::JOIN_REQUIRED: {
                 join_session_.mark_join_required();
                 OpusSendFrame discarded_opus;
@@ -5234,6 +5253,7 @@ private:
     std::atomic<uint64_t>                     receive_generation_{0};
     std::atomic<bool>                         outbound_enabled_{false};
     std::atomic<uint64_t>                     outbound_generation_{0};
+    std::atomic<bool>                         join_denied_room_full_{false};
     std::atomic<bool>                         room_removed_by_server_{false};
     std::atomic<int64_t>                      opus_send_queue_age_last_ns_{0};
     std::atomic<int64_t>                      opus_send_queue_age_avg_ns_{0};
@@ -5407,6 +5427,10 @@ public:
 
     bool is_join_confirmed() const override {
         return client_.is_join_confirmed();
+    }
+
+    bool consume_join_denied_room_full() override {
+        return client_.consume_join_denied_room_full();
     }
 
     bool consume_room_removed_by_server() override {

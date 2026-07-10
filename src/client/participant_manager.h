@@ -13,6 +13,7 @@
 #include <vector>
 #include <spdlog/spdlog.h>
 #include "participant_info.h"
+#include "protocol.h"
 
 // Thread-safe participant lifecycle manager for client-side
 // Manages remote participants (other clients) and their audio state
@@ -37,7 +38,7 @@ class ParticipantManager {
     inline static thread_local bool in_audio_callback_ = false;
 
 public:
-    static constexpr size_t MAX_AUDIO_CALLBACK_PARTICIPANTS = 32;
+    static constexpr size_t MAX_AUDIO_CALLBACK_PARTICIPANTS = MAX_ROOM_PARTICIPANTS;
 
     class AudioCallbackReadScope {
     public:

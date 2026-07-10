@@ -24,6 +24,7 @@ public:
     struct RegistrationResult {
         uint32_t              client_id = 0;
         std::vector<uint32_t> removed_client_ids;
+        bool                  rejected_room_full = false;
     };
 
     struct ClientSecurityConfig {
@@ -45,6 +46,21 @@ public:
             existing != clients_.end() && existing->second.room_id == room_id &&
             existing->second.room_instance_id == room_instance_id &&
             existing->second.profile_id == profile_id;
+
+        if (!can_reuse_existing) {
+            size_t room_member_count = 0;
+            for (const auto& [_, client]: clients_) {
+                if (client.room_id == room_id) {
+                    ++room_member_count;
+                }
+            }
+            const bool existing_member_of_room =
+                existing != clients_.end() && existing->second.room_id == room_id;
+            if (room_member_count >= MAX_ROOM_PARTICIPANTS && !existing_member_of_room) {
+                result.rejected_room_full = true;
+                return result;
+            }
+        }
 
         if (can_reuse_existing) {
             auto& client = existing->second;

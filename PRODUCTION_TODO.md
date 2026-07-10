@@ -575,7 +575,7 @@ fine, no compatibility shims.
 
 **Steps:**
 
-- [ ] **5.1** In `src/common/protocol.h`, near the other limits:
+- [x] **5.1** In `src/common/protocol.h`, near the other limits:
 
 ```cpp
 // One room limit shared by server admission, client mixing, and UI. The client
@@ -592,7 +592,7 @@ struct JoinDeniedHdr : CtrlHdr {
 };
 ```
 
-- [ ] **5.2** In `src/client/participant_manager.h:40`, replace the literal:
+- [x] **5.2** In `src/client/participant_manager.h:40`, replace the literal:
 
 ```cpp
     static constexpr size_t MAX_AUDIO_CALLBACK_PARTICIPANTS = MAX_ROOM_PARTICIPANTS;
@@ -600,7 +600,7 @@ struct JoinDeniedHdr : CtrlHdr {
 
   (include `protocol.h` if not already included — check the top of the file).
 
-- [ ] **5.3** In `ClientManager::register_client` (`client_manager.h:33`): before
+- [x] **5.3** In `ClientManager::register_client` (`client_manager.h:33`): before
   inserting a **new** endpoint into a room, count current members of `room_id`
   (the iteration pattern already exists at `client_manager.h:207`). If the count is
   already `MAX_ROOM_PARTICIPANTS` **and** this endpoint is not an existing member
@@ -608,25 +608,25 @@ struct JoinDeniedHdr : CtrlHdr {
   return a result with a new `bool rejected_room_full = true;` field added to
   `RegistrationResult` — and make no state change.
 
-- [ ] **5.4** In `server.cpp` `handle_join` (after `:1065`): when
+- [x] **5.4** In `server.cpp` `handle_join` (after `:1065`): when
   `registration.rejected_room_full`, log it and send `JoinDeniedHdr{reason=1}` to
   `remote_endpoint_` via the existing `send()` helper, then return (do not
   broadcast anything).
 
-- [ ] **5.5** Client side: find where `Cmd::JOIN_ACK` is handled in
+- [x] **5.5** Client side: find where `Cmd::JOIN_ACK` is handled in
   `client_runtime.cpp` (grep `JOIN_ACK`). Add a `JOIN_DENIED` case beside it that
   stops the pending join retry loop (see `join_session_` / `join_reliability.h`
   for how a join concludes) and surfaces the failure the same way other join
   failures reach the UI, with the message "Room is full (32 participants max)".
   Do not leave the client silently retrying a join the server will never accept.
 
-- [ ] **5.6 Tests** in `tests/client_manager_self_test.cpp`:
+- [x] **5.6 Tests** in `tests/client_manager_self_test.cpp`:
   - register 32 unique endpoints into room "a" → all succeed;
   - the 33rd unique endpoint into room "a" → `rejected_room_full`, room unchanged;
   - the 33rd endpoint into room "b" → succeeds (limit is per room);
   - an existing member of the full room re-registers → succeeds (not a new member).
 
-- [ ] **5.7** Run the standard verification block. **Commit:**
+- [x] **5.7** Run the standard verification block. **Commit:**
   `git commit -m "fix: enforce shared 32-participant room limit with explicit denial"`
 
 **Done when:** the server can never admit a member the client cannot mix; the 33rd
@@ -1015,7 +1015,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | 2 — Per-sender jitter milliseconds | ☑ complete | `fix: convert jitter ms per sender packet duration` |
 | 3 — Auto-jitter age ceiling | ☑ complete | `fix: clamp auto jitter target to the packet age ceiling` |
 | 4 — Underflow tail fade | ☑ complete | `fix: fade partial-underflow tail instead of holding last sample` |
-| 5 — 32-participant room limit | ☐ not started | |
+| 5 — 32-participant room limit | ☑ complete | `fix: enforce shared 32-participant room limit with explicit denial` |
 | 6 — Transactional live settings | ☐ not started | |
 | 7 — Off-callback snapshot retirement | ☐ not started | |
 | 8 — Wall-clock rate recovery | ☐ not started | |

@@ -17,6 +17,11 @@ constexpr uint32_t E2E_KEY_ENVELOPE_MAGIC = 0x4532454B;  // 'E2EK' sealed key ha
 constexpr size_t AUDIO_BUF_SIZE = 512;
 constexpr int UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
 
+// One room limit shared by server admission, client mixing, and UI. The client
+// audio callback publishes at most this many participants; the server must
+// never admit more than it, or extra members would be silently unheard.
+constexpr size_t MAX_ROOM_PARTICIPANTS = 32;
+
 // Jitter buffer configuration (client only - server just relays packets)
 constexpr size_t MAX_OPUS_QUEUE_SIZE       = 128; // Hard safety cap for Opus receive queue
 constexpr size_t TARGET_OPUS_QUEUE_SIZE    = 3;   // Target queue size for adaptive management
@@ -101,6 +106,7 @@ struct CtrlHdr : MsgHdr {
         ROOM_CHAT_SEND_REJECTED = 22, // Server rejects a chat send
         ROOM_CHAT_HISTORY_REQUEST = 23, // Client asks for retained chat tail
         ROOM_CHAT_HISTORY_RESPONSE = 24, // Server returns one retained chat message or done
+        JOIN_DENIED = 25,
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
@@ -117,6 +123,10 @@ struct JoinHdr : CtrlHdr {
 
 struct JoinAckHdr : CtrlHdr {
     uint32_t capabilities = 0;
+};
+
+struct JoinDeniedHdr : CtrlHdr {
+    uint8_t reason = 0;  // 1 = room full
 };
 
 struct ParticipantInfoHdr : CtrlHdr {

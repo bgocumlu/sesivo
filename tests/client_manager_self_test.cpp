@@ -117,5 +117,47 @@ int main() {
         return 12;
     }
 
+    ClientManager capacity_manager;
+    for (size_t index = 0; index < MAX_ROOM_PARTICIPANTS; ++index) {
+        const udp::endpoint endpoint(asio::ip::make_address("127.0.0.1"),
+                                     static_cast<unsigned short>(11000 + index));
+        const auto registration = capacity_manager.register_client(
+            endpoint, now, "room-a", "instance-a", 1,
+            "capacity-user-" + std::to_string(index),
+            "Capacity User " + std::to_string(index));
+        if (registration.client_id == 0 || registration.rejected_room_full) {
+            std::cerr << "room rejected a participant before reaching capacity\n";
+            return 13;
+        }
+    }
+
+    const udp::endpoint overflow(asio::ip::make_address("127.0.0.1"), 12000);
+    const auto overflow_registration = capacity_manager.register_client(
+        overflow, now, "room-a", "instance-a", 1, "overflow-user", "Overflow User");
+    const auto counts_after_overflow = capacity_manager.room_counts();
+    if (!overflow_registration.rejected_room_full || overflow_registration.client_id != 0 ||
+        capacity_manager.exists(overflow) || counts_after_overflow.at("room-a") !=
+                                                 MAX_ROOM_PARTICIPANTS) {
+        std::cerr << "room capacity rejection changed the full room\n";
+        return 14;
+    }
+
+    const auto other_room_registration = capacity_manager.register_client(
+        overflow, now, "room-b", "instance-b", 1, "overflow-user", "Overflow User");
+    if (other_room_registration.client_id == 0 ||
+        other_room_registration.rejected_room_full) {
+        std::cerr << "room capacity was not scoped per room\n";
+        return 15;
+    }
+
+    const udp::endpoint existing_member(asio::ip::make_address("127.0.0.1"), 11000);
+    const auto existing_registration = capacity_manager.register_client(
+        existing_member, now + 1s, "room-a", "instance-a", 1,
+        "capacity-user-0", "Capacity User 0");
+    if (existing_registration.client_id == 0 || existing_registration.rejected_room_full) {
+        std::cerr << "full room rejected an existing member re-registering\n";
+        return 16;
+    }
+
     return 0;
 }

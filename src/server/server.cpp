@@ -1066,6 +1066,17 @@ private:
             remote_endpoint_, now, room_id, room_snapshot.room_instance_id,
             room_snapshot.access_epoch, profile_id, display_name,
             registered_capabilities, join.key_public, security);
+        if (registration.rejected_room_full) {
+            spdlog::warn("Rejecting JOIN from {}:{} room '{}': room is full ({} participants max)",
+                         remote_endpoint_.address().to_string(), remote_endpoint_.port(),
+                         room_id, MAX_ROOM_PARTICIPANTS);
+            JoinDeniedHdr denied{};
+            denied.magic = CTRL_MAGIC;
+            denied.type = CtrlHdr::Cmd::JOIN_DENIED;
+            denied.reason = 1;
+            send(&denied, sizeof(denied), remote_endpoint_);
+            return;
+        }
         for (uint32_t removed_client_id: registration.removed_client_ids) {
             spdlog::info("Removed stale duplicate participant ID {} for room='{}' user='{}'",
                       removed_client_id, room_id, profile_id);

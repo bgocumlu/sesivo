@@ -1469,6 +1469,9 @@ void JuceMixerComponent::timerCallback() {
     poll_connection_start();
     poll_audio_device_refresh();
     poll_room_admin_job();
+    if (client_.consume_join_denied_room_full()) {
+        connection_status_ = "Room is full (32 participants max)";
+    }
     if (client_.consume_room_removed_by_server()) {
         if (leave_callback_) {
             auto callback = leave_callback_;

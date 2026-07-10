@@ -113,6 +113,7 @@ public:
     virtual bool approve_waiting_participant(uint32_t participant_id) = 0;
     virtual std::vector<ParticipantInfo> get_waiting_participant_info() const = 0;
     virtual bool is_join_confirmed() const = 0;
+    virtual bool consume_join_denied_room_full() = 0;
     virtual bool consume_room_removed_by_server() = 0;
     virtual std::string get_server_address() const = 0;
     virtual unsigned short get_server_port() const = 0;

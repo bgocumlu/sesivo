@@ -73,6 +73,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+rm -rf "$app_path"
 cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE="$config" -DJAM_BUILD_CLIENT=ON
 cmake --build "$build_dir" --target client --config "$config"
 

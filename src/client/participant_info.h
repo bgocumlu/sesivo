@@ -463,6 +463,7 @@ struct ParticipantData {
     std::atomic<size_t>                   jitter_buffer_min_packets{MIN_JITTER_BUFFER_PACKETS};
     std::atomic<size_t>                   opus_queue_limit_packets{MAX_OPUS_QUEUE_SIZE};
     std::atomic<bool>                     opus_jitter_manual_override{false};
+    std::atomic<int>                      opus_jitter_override_ms{0};
     std::atomic<bool>                     opus_jitter_auto_enabled{false};
     std::atomic<size_t>                   opus_jitter_auto_floor_packets{DEFAULT_OPUS_JITTER_PACKETS};
     std::atomic<int>                      opus_jitter_auto_stable_callbacks{0};

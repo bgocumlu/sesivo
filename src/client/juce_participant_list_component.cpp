@@ -1,5 +1,6 @@
 #include "juce_participant_list_component.h"
 
+#include "jitter_policy.h"
 #include "juce_theme.h"
 
 #include <algorithm>
@@ -417,9 +418,15 @@ public:
         pan_slider_.setValue(info.pan, juce::dontSendNotification);
         auto_jitter_toggle_.setToggleState(info.opus_jitter_auto_enabled,
                                            juce::dontSendNotification);
-        const auto jitter_ms = static_cast<int>(std::lround(
-            static_cast<double>(info.jitter_buffer_floor_packets) *
-            client_.get_opus_network_packet_ms()));
+        const auto jitter_ms = info.last_packet_frame_count > 0
+                                   ? opus_jitter_ms_for_packets(
+                                         info.jitter_buffer_floor_packets,
+                                         opus_network_clock::SAMPLE_RATE,
+                                         static_cast<uint16_t>(info.last_packet_frame_count))
+                                   : static_cast<int>(std::lround(
+                                         static_cast<double>(
+                                             info.jitter_buffer_floor_packets) *
+                                         client_.get_opus_network_packet_ms()));
         jitter_ms_editor_.setText(juce::String(jitter_ms), false);
 
         stats_label_.setText(profile_subtitle(info), juce::dontSendNotification);

@@ -78,8 +78,9 @@ inline size_t opus_auto_start_jitter_packets_for_audio(
         std::max(configured_opus_jitter_floor_packets, auto_start_packets));
 }
 
-inline size_t jitter_floor_packets_for_audio(uint16_t, size_t configured_opus_jitter_packets) {
-    return clamp_opus_jitter_packets(configured_opus_jitter_packets);
+inline size_t jitter_floor_packets_for_audio(uint16_t frame_count, int jitter_ms,
+                                             uint32_t sample_rate) {
+    return opus_jitter_packets_for_ms(jitter_ms, sample_rate, frame_count);
 }
 
 inline bool jitter_target_should_snap_to_floor(bool opus_manual_override,

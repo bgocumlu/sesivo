@@ -312,7 +312,7 @@ currently asserts this wrong behavior as correct.
 
 **Steps:**
 
-- [ ] **2.1 Replace the wrong test first.** In `tests/jitter_policy_self_test.cpp`,
+- [x] **2.1 Replace the wrong test first.** In `tests/jitter_policy_self_test.cpp`,
   delete `test_configured_opus_jitter_applies_to_all_supported_frame_sizes`
   (lines 17-26) and its call in `main()`. Add:
 
@@ -341,7 +341,7 @@ void test_jitter_floor_converts_ms_using_the_senders_frame_count() {
   Run the suite; this new test must **fail** against the current helper (it has a
   different signature, so it fails at compile — that is the expected "red" state).
 
-- [ ] **2.2 Fix the helper** in `src/client/jitter_policy.h` — replace lines 81-83:
+- [x] **2.2 Fix the helper** in `src/client/jitter_policy.h` — replace lines 81-83:
 
 ```cpp
 inline size_t jitter_floor_packets_for_audio(uint16_t frame_count, int jitter_ms,
@@ -353,7 +353,7 @@ inline size_t jitter_floor_packets_for_audio(uint16_t frame_count, int jitter_ms
   (`opus_jitter_packets_for_ms` already exists at `jitter_policy.h:20`, already
   rounds up, and already clamps to `[MIN, MAX]_OPUS_JITTER_PACKETS`.)
 
-- [ ] **2.3 Update every call site in `client_runtime.cpp`.** Compile errors from
+- [x] **2.3 Update every call site in `client_runtime.cpp`.** Compile errors from
   the signature change will find them; the required conversions are:
 
   | Site (current line) | What it does today | Required change |
@@ -364,7 +364,7 @@ inline size_t jitter_floor_packets_for_audio(uint16_t frame_count, int jitter_ms
   | auto-start path (`opus_auto_start_jitter_packets_for_audio` call, near `:3381`) | mixes a locally-converted floor with a per-sender auto-start conversion | pass the **per-sender** floor packets from 2.2's helper so both terms of the internal `max()` are in the same sender's units |
   | `:819` and `:1036` (age-ceiling conversions inside `opus_jitter_packets_for_target_ms` / `set_jitter_packet_age_limit_ms`) | convert the age ceiling with the local frame count | when clamping a *specific participant's* target, convert the age limit with that participant's frame count (this pairs with Task 3; the global-setting clamp for the local default may keep local units) |
 
-- [ ] **2.4 Grep for leftovers.** `grep -n "get_opus_jitter_buffer_packets\|opus_jitter_packets_for_target_ms" src/client/*.cpp src/client/*.h`
+- [x] **2.4 Grep for leftovers.** `grep -n "get_opus_jitter_buffer_packets\|opus_jitter_packets_for_target_ms" src/client/*.cpp src/client/*.h`
   and check each remaining caller against the unit rule. UI display code
   (`juce_mixer_component.cpp:1123-1127` raising the queue limit) may keep local
   units — it is a global capacity heuristic, not a per-sender floor — but the
@@ -372,17 +372,17 @@ inline size_t jitter_floor_packets_for_audio(uint16_t frame_count, int jitter_ms
   ms computed from *that* participant's frame count via `opus_jitter_ms_for_packets`
   (`jitter_policy.h:60`).
 
-- [ ] **2.5 Run the full suite** — the new mixed-duration test and all pre-existing
+- [x] **2.5 Run the full suite** — the new mixed-duration test and all pre-existing
   tests must pass.
 
-- [ ] **2.6 Manual mixed-size check (this is the bug's real reproducer):** start the
+- [x] **2.6 Manual mixed-size check (this is the bug's real reproducer):** start the
   server and two clients on localhost. Set client A's packet size to 120 frames and
   leave client B at 480. Both directions must keep clean audio, and each
   participant's displayed jitter must reflect the configured ms (not 4x / 0.25x).
   Before this fix, B's reception of A runs 4x too shallow (PLC) while A's reception
   of B runs 4x too deep.
 
-- [ ] **2.7 Run the standard verification block, then commit:**
+- [x] **2.7 Run the standard verification block, then commit:**
 
 ```powershell
 git add src/client/jitter_policy.h src/client/client_runtime.cpp src/client/participant_info.h tests/jitter_policy_self_test.cpp src/client/juce_participant_list_component.cpp PRODUCTION_TODO.md
@@ -1012,7 +1012,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 | Task | Status | Commit |
 |---|---|---|
 | 1 — Callback stack-overflow clamp | ☑ complete | `fix: clamp audio callback processing to 960 frames` |
-| 2 — Per-sender jitter milliseconds | ☐ not started | |
+| 2 — Per-sender jitter milliseconds | ☑ complete | `fix: convert jitter ms per sender packet duration` |
 | 3 — Auto-jitter age ceiling | ☐ not started | |
 | 4 — Underflow tail fade | ☐ not started | |
 | 5 — 32-participant room limit | ☐ not started | |

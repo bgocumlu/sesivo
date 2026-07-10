@@ -863,6 +863,36 @@ public:
             get_opus_network_frame_count());
     }
 
+    uint16_t opus_frame_count_for_participant(const ParticipantData& participant) const {
+        const size_t sender_frame_count =
+            participant.last_packet_frame_count.load(std::memory_order_relaxed);
+        return sender_frame_count > 0
+                   ? static_cast<uint16_t>(sender_frame_count)
+                   : get_opus_network_frame_count();
+    }
+
+    size_t opus_jitter_packets_for_participant_ms(
+        const ParticipantData& participant, int target_ms) const {
+        const uint16_t frame_count = opus_frame_count_for_participant(participant);
+        size_t packets = jitter_floor_packets_for_audio(
+            frame_count, target_ms, opus_network_clock::SAMPLE_RATE);
+        const int age_limit_ms = get_jitter_packet_age_limit_ms();
+        if (age_limit_ms > 0) {
+            packets = std::min(
+                packets,
+                opus_jitter_packets_within_ms(
+                    age_limit_ms, opus_network_clock::SAMPLE_RATE, frame_count));
+        }
+        return packets;
+    }
+
+    size_t opus_auto_start_jitter_packets_for_participant(
+        const ParticipantData& participant, size_t floor_packets) const {
+        return opus_auto_start_jitter_packets_for_audio(
+            floor_packets, opus_network_clock::SAMPLE_RATE,
+            opus_frame_count_for_participant(participant));
+    }
+
     int get_opus_auto_start_jitter_ms() const {
         return opus_jitter_effective_ms_for_packets(get_opus_auto_start_jitter_packets());
     }
@@ -990,9 +1020,7 @@ public:
     void apply_opus_jitter_buffer_ms(int clamped_ms) {
         opus_jitter_buffer_ms_.store(clamped_ms, std::memory_order_release);
 
-        const size_t clamped = opus_jitter_packets_for_target_ms(clamped_ms);
-        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
-        participant_manager_.for_each([clamped, auto_start_packets](
+        participant_manager_.for_each([this, clamped_ms](
                                           uint32_t, ParticipantData& participant) {
             if (participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
                 return;
@@ -1000,8 +1028,13 @@ public:
             if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::Opus ||
                 participant.jitter_buffer_floor_packets.load(std::memory_order_relaxed) >=
                     DEFAULT_OPUS_JITTER_PACKETS) {
+                const size_t floor_packets =
+                    opus_jitter_packets_for_participant_ms(participant, clamped_ms);
+                const size_t auto_start_packets =
+                    opus_auto_start_jitter_packets_for_participant(participant,
+                                                                   floor_packets);
                 apply_opus_jitter_policy_to_participant(
-                    participant, clamped, auto_start_packets,
+                    participant, floor_packets, auto_start_packets,
                     participant.opus_jitter_auto_enabled.load(std::memory_order_relaxed),
                     true);
             }
@@ -1034,8 +1067,11 @@ public:
                       previous_jitter_ms, clamped);
         }
 
-        const size_t max_packets = opus_jitter_packets_for_target_ms(clamped);
-        participant_manager_.for_each([max_packets](uint32_t, ParticipantData& participant) {
+        participant_manager_.for_each([this, clamped](uint32_t,
+                                                      ParticipantData& participant) {
+            const size_t max_packets = opus_jitter_packets_within_ms(
+                clamped, opus_network_clock::SAMPLE_RATE,
+                opus_frame_count_for_participant(participant));
             const size_t current_target =
                 participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
             if (current_target <= max_packets) {
@@ -1058,13 +1094,16 @@ public:
 
     void set_opus_auto_jitter_default(bool enabled) {
         opus_auto_jitter_default_.store(enabled, std::memory_order_release);
-        const size_t global_default = get_opus_jitter_buffer_packets();
-        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
-        participant_manager_.for_each([enabled, global_default, auto_start_packets](
+        participant_manager_.for_each([this, enabled](
                                           uint32_t, ParticipantData& participant) {
             if (participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
                 return;
             }
+            const size_t global_default = opus_jitter_packets_for_participant_ms(
+                participant, get_opus_jitter_buffer_ms());
+            const size_t auto_start_packets =
+                opus_auto_start_jitter_packets_for_participant(participant,
+                                                               global_default);
             apply_opus_jitter_policy_to_participant(
                 participant, global_default, auto_start_packets, enabled, !enabled);
         });
@@ -1074,11 +1113,15 @@ public:
         return opus_auto_jitter_default_.load(std::memory_order_acquire);
     }
 
-    void set_participant_opus_jitter_buffer_packets(uint32_t id, size_t packets) {
-        const size_t clamped =
-            std::clamp(packets, MIN_OPUS_JITTER_PACKETS, MAX_OPUS_JITTER_PACKETS);
-        participant_manager_.with_participant(id, [clamped](ParticipantData& participant) {
+    void set_participant_opus_jitter_buffer_ms(uint32_t id, int target_ms) {
+        const int clamped_ms =
+            clamp_opus_jitter_ms_for_age_limit(target_ms, get_jitter_packet_age_limit_ms());
+        participant_manager_.with_participant(id, [this, clamped_ms](
+                                                      ParticipantData& participant) {
+            const size_t clamped =
+                opus_jitter_packets_for_participant_ms(participant, clamped_ms);
             participant.opus_jitter_manual_override.store(true, std::memory_order_relaxed);
+            participant.opus_jitter_override_ms.store(clamped_ms, std::memory_order_relaxed);
             participant.opus_jitter_auto_enabled.store(false, std::memory_order_relaxed);
             participant.jitter_buffer_floor_packets.store(clamped, std::memory_order_relaxed);
             participant.jitter_buffer_min_packets.store(clamped, std::memory_order_relaxed);
@@ -1093,31 +1136,31 @@ public:
         });
     }
 
-    void set_participant_opus_jitter_buffer_ms(uint32_t id, int target_ms) {
-        const int clamped_ms =
-            clamp_opus_jitter_ms_for_age_limit(target_ms, get_jitter_packet_age_limit_ms());
-        const size_t clamped = opus_jitter_packets_for_target_ms(clamped_ms);
-        set_participant_opus_jitter_buffer_packets(id, clamped);
-    }
-
     void reset_participant_opus_jitter_buffer_packets(uint32_t id) {
-        const size_t global_default = get_opus_jitter_buffer_packets();
-        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
-        participant_manager_.with_participant(id, [global_default, auto_start_packets](
+        participant_manager_.with_participant(id, [this](
                                                   ParticipantData& participant) {
+            const size_t global_default = opus_jitter_packets_for_participant_ms(
+                participant, get_opus_jitter_buffer_ms());
+            const size_t auto_start_packets =
+                opus_auto_start_jitter_packets_for_participant(participant,
+                                                               global_default);
             participant.opus_jitter_manual_override.store(false, std::memory_order_relaxed);
+            participant.opus_jitter_override_ms.store(0, std::memory_order_relaxed);
             apply_opus_jitter_policy_to_participant(
                 participant, global_default, auto_start_packets, false, true);
         });
     }
 
     void set_participant_opus_auto_jitter(uint32_t id, bool enabled) {
-        const size_t global_default = get_opus_jitter_buffer_packets();
-        const size_t auto_start_packets = get_opus_auto_start_jitter_packets();
-        participant_manager_.with_participant(id, [enabled, global_default,
-                                                   auto_start_packets](
+        participant_manager_.with_participant(id, [this, enabled](
                                                   ParticipantData& participant) {
+            const size_t global_default = opus_jitter_packets_for_participant_ms(
+                participant, get_opus_jitter_buffer_ms());
+            const size_t auto_start_packets =
+                opus_auto_start_jitter_packets_for_participant(participant,
+                                                               global_default);
             participant.opus_jitter_manual_override.store(false, std::memory_order_relaxed);
+            participant.opus_jitter_override_ms.store(0, std::memory_order_relaxed);
             apply_opus_jitter_policy_to_participant(
                 participant, global_default, auto_start_packets, enabled, !enabled);
         });
@@ -1127,9 +1170,13 @@ public:
         if (participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
             return;
         }
+        // Before the first remote packet, use the local frame count. The arrival
+        // path re-derives this policy as soon as the sender's duration is known.
+        const size_t floor_packets = opus_jitter_packets_for_participant_ms(
+            participant, get_opus_jitter_buffer_ms());
         apply_opus_jitter_policy_to_participant(
-            participant, get_opus_jitter_buffer_packets(),
-            get_opus_auto_start_jitter_packets(),
+            participant, floor_packets,
+            opus_auto_start_jitter_packets_for_participant(participant, floor_packets),
             opus_auto_jitter_default_.load(std::memory_order_acquire), true);
     }
 
@@ -3351,7 +3398,18 @@ private:
     }
 
     size_t jitter_floor_for_packet(const OpusPacket& packet) const {
-        return jitter_floor_packets_for_audio(packet.frame_count, get_opus_jitter_buffer_packets());
+        size_t packets = jitter_floor_packets_for_audio(
+            packet.frame_count, get_opus_jitter_buffer_ms(),
+            opus_network_clock::SAMPLE_RATE);
+        const int age_limit_ms = get_jitter_packet_age_limit_ms();
+        if (age_limit_ms > 0) {
+            packets = std::min(
+                packets,
+                opus_jitter_packets_within_ms(
+                    age_limit_ms, opus_network_clock::SAMPLE_RATE,
+                    packet.frame_count));
+        }
+        return packets;
     }
 
     static size_t opus_latency_trim_threshold_packets(const ParticipantData& participant) {
@@ -3387,12 +3445,50 @@ private:
     }
 
     void update_jitter_floor(ParticipantData& participant, const OpusPacket& packet) {
-        const size_t floor_packets = jitter_floor_for_packet(packet);
-        if (packet.codec == AudioCodec::Opus &&
-            participant.opus_jitter_manual_override.load(std::memory_order_relaxed)) {
-            participant.jitter_buffer_floor_packets.store(
-                participant.jitter_buffer_min_packets.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
+        const bool manual_override =
+            packet.codec == AudioCodec::Opus &&
+            participant.opus_jitter_manual_override.load(std::memory_order_relaxed);
+        size_t floor_packets = manual_override
+                                   ? jitter_floor_packets_for_audio(
+                                         packet.frame_count,
+                                         participant.opus_jitter_override_ms.load(
+                                             std::memory_order_relaxed),
+                                         opus_network_clock::SAMPLE_RATE)
+                                   : jitter_floor_for_packet(packet);
+        const int age_limit_ms = get_jitter_packet_age_limit_ms();
+        if (manual_override && age_limit_ms > 0) {
+            floor_packets = std::min(
+                floor_packets,
+                opus_jitter_packets_within_ms(
+                    age_limit_ms, opus_network_clock::SAMPLE_RATE,
+                    packet.frame_count));
+        }
+
+        const size_t previous_frame_count =
+            participant.last_packet_frame_count.load(std::memory_order_relaxed);
+        if (manual_override) {
+            const size_t current_target =
+                participant.jitter_buffer_min_packets.load(std::memory_order_relaxed);
+            participant.jitter_buffer_floor_packets.store(floor_packets,
+                                                          std::memory_order_relaxed);
+            participant.jitter_buffer_min_packets.store(floor_packets,
+                                                        std::memory_order_relaxed);
+            if (current_target != floor_packets &&
+                participant.opus_queue.size_approx() < std::max<size_t>(1, floor_packets)) {
+                participant.buffer_ready.store(false, std::memory_order_relaxed);
+            }
+            return;
+        }
+
+        participant.opus_jitter_auto_floor_packets.store(floor_packets,
+                                                         std::memory_order_relaxed);
+        if (previous_frame_count == 0 || previous_frame_count != packet.frame_count) {
+            const size_t auto_start_packets = opus_auto_start_jitter_packets_for_audio(
+                floor_packets, opus_network_clock::SAMPLE_RATE, packet.frame_count);
+            apply_opus_jitter_policy_to_participant(
+                participant, floor_packets, auto_start_packets,
+                participant.opus_jitter_auto_enabled.load(std::memory_order_relaxed),
+                true);
             return;
         }
         participant.jitter_buffer_floor_packets.store(floor_packets,

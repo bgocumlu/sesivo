@@ -14,19 +14,29 @@ void require(bool condition, const char* message) {
     }
 }
 
-void test_configured_opus_jitter_applies_to_all_supported_frame_sizes() {
-    for (const uint16_t frame_count:
-         {opus_network_clock::LOW_LATENCY_FRAME_COUNT,
-          opus_network_clock::FAST_FRAME_COUNT,
-          opus_network_clock::BALANCED_FRAME_COUNT,
-          opus_network_clock::STABLE_FRAME_COUNT}) {
-        require(jitter_floor_packets_for_audio(frame_count, 12) == 12,
-                "configured Opus jitter should apply to every supported Opus frame size");
-    }
+void test_jitter_floor_converts_ms_using_the_senders_frame_count() {
+    // A 20 ms floor must protect every sender for 20 ms of *that sender's* packets.
+    require(jitter_floor_packets_for_audio(
+                opus_network_clock::LOW_LATENCY_FRAME_COUNT, 20,
+                opus_network_clock::SAMPLE_RATE) == 8,
+            "20 ms must be 8 packets for a 2.5 ms (120-frame) sender");
+    require(jitter_floor_packets_for_audio(
+                opus_network_clock::FAST_FRAME_COUNT, 20,
+                opus_network_clock::SAMPLE_RATE) == 4,
+            "20 ms must be 4 packets for a 5 ms (240-frame) sender");
+    require(jitter_floor_packets_for_audio(
+                opus_network_clock::BALANCED_FRAME_COUNT, 20,
+                opus_network_clock::SAMPLE_RATE) == 2,
+            "20 ms must be 2 packets for a 10 ms (480-frame) sender");
+    require(jitter_floor_packets_for_audio(
+                opus_network_clock::STABLE_FRAME_COUNT, 20,
+                opus_network_clock::SAMPLE_RATE) == 1,
+            "20 ms must be 1 packet for a 20 ms (960-frame) sender");
 }
 
 void test_configured_opus_jitter_is_clamped() {
-    require(jitter_floor_packets_for_audio(opus_network_clock::FAST_FRAME_COUNT, 999) ==
+    require(jitter_floor_packets_for_audio(opus_network_clock::FAST_FRAME_COUNT, 999,
+                                           opus_network_clock::SAMPLE_RATE) ==
                 MAX_OPUS_JITTER_PACKETS,
             "configured Opus jitter should be clamped to the maximum");
 }
@@ -144,7 +154,7 @@ void test_manual_opus_target_is_owned_by_manual_override() {
 }  // namespace
 
 int main() {
-    test_configured_opus_jitter_applies_to_all_supported_frame_sizes();
+    test_jitter_floor_converts_ms_using_the_senders_frame_count();
     test_configured_opus_jitter_is_clamped();
     test_auto_start_jitter_uses_larger_startup_cushion();
     test_auto_start_jitter_respects_higher_configured_floor();

@@ -418,7 +418,7 @@ this task reintroduces it on top of Task 2's per-sender units.
 
 **Steps:**
 
-- [ ] **3.1** Thread the age limit into the controller. The chain is three static
+- [x] **3.1** Thread the age limit into the controller. The chain is three static
   functions that take only `ParticipantData&`:
   `observe_auto_jitter_instability` (`:3325`) and `observe_auto_jitter_stable`
   (`:3335`) → `observe_auto_jitter_window_callback` (`:3315`) →
@@ -442,21 +442,21 @@ this task reintroduces it on top of Task 2's per-sender units.
         }
 ```
 
-- [ ] **3.2** Clamp **both** paths with it:
+- [x] **3.2** Clamp **both** paths with it:
   - the increase path (`:3283-3285`): `next_target = std::min(max_target, std::max<size_t>(3, current_target + 1));` and skip the store entirely when `current_target >= max_target`;
   - the current target: if `current_target > max_target` (age limit was lowered, or the sender's packet duration grew), store `max_target` into `jitter_buffer_min_packets` / `jitter_buffer_floor_packets` immediately — never leave an unsatisfiable target in place.
 
-- [ ] **3.3** Also re-clamp when the user changes the age limit:
+- [x] **3.3** Also re-clamp when the user changes the age limit:
   `set_jitter_packet_age_limit_ms` (`:1013-1047`) already clamps targets — verify
   after Task 2 that its per-participant clamp uses each participant's frame count,
   not the local TX size.
 
-- [ ] **3.4** Run the standard verification block. For a stronger check (optional
+- [x] **3.4** Run the standard verification block. For a stronger check (optional
   but recommended): with two localhost clients and auto-jitter ON, set the age
   limit to 30 ms and packet size to 10 ms; the auto target must plateau at 3
   packets, and `opus_age_limit_drops` must stop growing once adapted.
 
-- [ ] **3.5 Commit:** `git commit -m "fix: clamp auto jitter target to the packet age ceiling"`
+- [x] **3.5 Commit:** `git commit -m "fix: clamp auto jitter target to the packet age ceiling"`
 
 **Done when:** the auto target can never exceed the packet count the age limit
 permits for that sender's packet duration; lowering the age limit pulls existing
@@ -1013,7 +1013,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 |---|---|---|
 | 1 — Callback stack-overflow clamp | ☑ complete | `fix: clamp audio callback processing to 960 frames` |
 | 2 — Per-sender jitter milliseconds | ☑ complete | `fix: convert jitter ms per sender packet duration` |
-| 3 — Auto-jitter age ceiling | ☐ not started | |
+| 3 — Auto-jitter age ceiling | ☑ complete | `fix: clamp auto jitter target to the packet age ceiling` |
 | 4 — Underflow tail fade | ☐ not started | |
 | 5 — 32-participant room limit | ☐ not started | |
 | 6 — Transactional live settings | ☐ not started | |

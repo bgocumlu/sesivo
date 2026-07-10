@@ -47,6 +47,7 @@
 #include <spdlog/spdlog.h>
 
 #include "audio_analysis.h"
+#include "audio_callback_policy.h"
 #include "audio_packet.h"
 #include "audio_stream.h"
 #include "client_audio_devices.h"
@@ -4548,6 +4549,14 @@ private:
         // Initialize output buffer to silence
         std::memset(output_buffer, 0, bytes_to_copy);
 
+        // Fixed 960-float buffers below cannot hold larger driver callbacks.
+        // The full device buffer was already zeroed above, so the unprocessed
+        // tail stays silent instead of overflowing the stack.
+        if (audio_callback_frames_clamped(frame_count)) {
+            client->callback_frame_clamp_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+        frame_count = audio_callback_process_frame_count(frame_count);
+
         // Mix audio from all active participants (thread-safe iteration)
         int active_count = 0;
         const auto playout_start = std::chrono::steady_clock::now();
@@ -5156,6 +5165,7 @@ private:
     std::atomic<int64_t>  callback_deadline_ns_{0};
     std::atomic<uint64_t> callback_count_{0};
     std::atomic<uint64_t> callback_over_deadline_count_{0};
+    std::atomic<uint64_t> callback_frame_clamp_count_{0};
 
     struct ParticipantDropSnapshot {
         uint64_t jitter_depth_drops = 0;

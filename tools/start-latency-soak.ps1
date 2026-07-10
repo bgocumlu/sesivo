@@ -67,7 +67,11 @@ $aCfg = Join-Path $run "client-a-config"
 $bCfg = Join-Path $run "client-b-config"
 $clientBLog = Join-Path $run "client-b.log"
 $report = Join-Path $run "soak-report.json"
-$maxCallbackDeadlineMs = $BufferFrames * 1000.0 / 48000.0
+$minE2eSamples = 100000
+if ($Seconds -gt 0) {
+  $expectedE2eSamples = [Math]::Floor($Seconds * 48000.0 / $PacketFrames * 0.8)
+  $minE2eSamples = [Math]::Min($minE2eSamples, [Math]::Max(1, $expectedE2eSamples))
+}
 New-Item -ItemType Directory -Force -Path @($run, $aCfg, $bCfg) | Out-Null
 
 $tokenTtlSeconds = 90 * 60
@@ -143,7 +147,7 @@ try {
     Write-Host ""
     Write-Host "Started without auto-stop because -Seconds 0 was used."
     Write-Host "Diagnostics command:"
-    Write-Host "node tools\latency-measurement.mjs diagnostics --log `"$clientBLog`" --assert --min-e2e-samples 100000 --max-drift-ppm-abs 5000 --max-callback-over-deadline 0 --max-callback-deadline-ms $maxCallbackDeadlineMs --out `"$report`""
+    Write-Host "node tools\latency-measurement.mjs diagnostics --log `"$clientBLog`" --assert --min-e2e-samples $minE2eSamples --max-drift-ppm-abs 5000 --max-plc-frames 0 --max-underruns 0 --max-callback-over-deadline 0 --out `"$report`""
     return
   }
 
@@ -158,10 +162,11 @@ try {
   & node $latencyTool diagnostics `
     --log $clientBLog `
     --assert `
-    --min-e2e-samples 100000 `
+    --min-e2e-samples $minE2eSamples `
     --max-drift-ppm-abs 5000 `
+    --max-plc-frames 0 `
+    --max-underruns 0 `
     --max-callback-over-deadline 0 `
-    --max-callback-deadline-ms $maxCallbackDeadlineMs `
     --out $report
   if ($LASTEXITCODE -ne 0) {
     throw "latency diagnostics failed with exit code $LASTEXITCODE"

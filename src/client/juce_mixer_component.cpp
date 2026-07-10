@@ -150,6 +150,10 @@ juce::String buffer_match_suffix(const AudioStream::LatencyInfo& latency) {
 
 juce::String device_latency_warning(const AudioStream::LatencyInfo& latency,
                                     double device_path_ms) {
+    if (latency.actual_buffer_frames > opus_network_clock::STABLE_FRAME_COUNT) {
+        return "Device buffer " + juce::String(latency.actual_buffer_frames) +
+               " frames exceeds the supported 960 — audio is truncated; pick 960 or lower";
+    }
     if (latency.requested_buffer_frames > 0 && latency.actual_buffer_frames > 0 &&
         latency.requested_buffer_frames != latency.actual_buffer_frames) {
         return "Device changed buffer";

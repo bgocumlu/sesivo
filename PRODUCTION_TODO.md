@@ -134,6 +134,8 @@ care most about latency.
 - Modify: `src/client/client_runtime.cpp` (callback entry, ~line 4550; counter member ~line 5050s where other `callback_*_` atomics live)
 - Create: `tests/audio_callback_policy_self_test.cpp`
 - Modify: `CMakeLists.txt` (register the test)
+- Modify: `tools/start-latency-soak.ps1` (make the required 120-second verification
+  enforce its stated audio-health criteria)
 
 **Interfaces:**
 - Produces: `audio_callback_process_frame_count(unsigned long) -> unsigned long`
@@ -142,7 +144,7 @@ care most about latency.
 
 **Steps:**
 
-- [ ] **1.1 Write the policy header** `src/client/audio_callback_policy.h`:
+- [x] **1.1 Write the policy header** `src/client/audio_callback_policy.h`:
 
 ```cpp
 #pragma once
@@ -165,7 +167,7 @@ inline bool audio_callback_frames_clamped(unsigned long device_frame_count) {
 }
 ```
 
-- [ ] **1.2 Write the failing test** `tests/audio_callback_policy_self_test.cpp`
+- [x] **1.2 Write the failing test** `tests/audio_callback_policy_self_test.cpp`
   (same `require(...)`/`main()` pattern as `tests/jitter_policy_self_test.cpp`):
 
 ```cpp
@@ -205,18 +207,18 @@ int main() {
 }
 ```
 
-- [ ] **1.3 Register the test** in `CMakeLists.txt` next to
+- [x] **1.3 Register the test** in `CMakeLists.txt` next to
   `jam_add_self_test(jitter_policy_self_test jitter_policy_self_test.cpp)`:
 
 ```cmake
     jam_add_self_test(audio_callback_policy_self_test audio_callback_policy_self_test.cpp)
 ```
 
-- [ ] **1.4 Run it** — build + `ctest -R audio_callback_policy`; it must pass (the
+- [x] **1.4 Run it** — build + `ctest -R audio_callback_policy`; it must pass (the
   header is pure policy, so it passes as soon as it compiles; the point of the test
   is to pin the clamp forever).
 
-- [ ] **1.5 Apply the clamp in the callback.** In `src/client/client_runtime.cpp`,
+- [x] **1.5 Apply the clamp in the callback.** In `src/client/client_runtime.cpp`,
   add `#include "audio_callback_policy.h"` with the other client includes, then in
   `audio_callback` insert **immediately after** the
   `std::memset(output_buffer, 0, bytes_to_copy);` line (~4549):
@@ -238,14 +240,14 @@ int main() {
      is still computed from the device's real frame count.
   3. `frame_count` is a by-value parameter, so mutating it is safe.
 
-- [ ] **1.6 Add the counter member.** Next to the existing
+- [x] **1.6 Add the counter member.** Next to the existing
   `callback_over_deadline_count_` atomic in the Client member list:
 
 ```cpp
     std::atomic<uint64_t> callback_frame_clamp_count_{0};
 ```
 
-- [ ] **1.7 Surface an explicit warning at stream start (no silent degradation).**
+- [x] **1.7 Surface an explicit warning at stream start (no silent degradation).**
   The mixer already warns about high-latency devices
   (`src/client/juce_mixer_component.cpp:141-160`). Extend that same warning path:
   when the actual negotiated buffer (already read back after open —
@@ -254,12 +256,22 @@ int main() {
   pick 960 or lower"`. This keeps the out-of-envelope case *visible* instead of
   silently clamped.
 
-- [ ] **1.8 Run the standard verification block.**
+- [x] **1.8 Run the standard verification block.**
 
-- [ ] **1.9 Commit:**
+  **Verification harness correction (explicitly approved for Task 1):** the soak
+  script previously hard-coded the one-hour run's 100,000-sample minimum even when
+  invoked with the required `-Seconds 120`, and compared the actual callback
+  deadline against the *requested* buffer size even when the device negotiated a
+  different size. That made a clean 120-second run fail with 46,740 samples and a
+  valid 10 ms deadline for an actual 480-frame callback. The script now scales its
+  sample minimum to duration and packet rate, stops asserting requested size against
+  the negotiated deadline, and explicitly asserts the criteria required above:
+  zero underruns, zero PLC frames, and zero callback deadline misses.
+
+- [x] **1.9 Commit:**
 
 ```powershell
-git add src/client/audio_callback_policy.h src/client/client_runtime.cpp tests/audio_callback_policy_self_test.cpp CMakeLists.txt src/client/juce_mixer_component.cpp PRODUCTION_TODO.md
+git add src/client/audio_callback_policy.h src/client/client_runtime.cpp tests/audio_callback_policy_self_test.cpp CMakeLists.txt src/client/juce_mixer_component.cpp tools/start-latency-soak.ps1 PRODUCTION_TODO.md
 git commit -m "fix: clamp audio callback processing to 960 frames"
 ```
 
@@ -999,7 +1011,7 @@ these are parity changes with minimal risk, not claimed latency wins.
 
 | Task | Status | Commit |
 |---|---|---|
-| 1 — Callback stack-overflow clamp | ☐ not started | |
+| 1 — Callback stack-overflow clamp | ☑ complete | `fix: clamp audio callback processing to 960 frames` |
 | 2 — Per-sender jitter milliseconds | ☐ not started | |
 | 3 — Auto-jitter age ceiling | ☐ not started | |
 | 4 — Underflow tail fade | ☐ not started | |

@@ -2099,9 +2099,32 @@ void JuceMixerComponent::update_latency_preset_buttons(int preset_id) {
         {&latency_preset_balanced_button_, LATENCY_PRESET_BALANCED_ID},
         {&latency_preset_stable_button_, LATENCY_PRESET_STABLE_ID},
     }};
+    const bool preset_is_pending =
+        preset_id != LATENCY_PRESET_CUSTOM_ID &&
+        (pending_network_age_limit_ms_.has_value() ||
+         pending_opus_frames_per_packet_ != client_.get_opus_network_frame_count() ||
+         pending_stream_restart_needed());
+
     for (const auto& [button, button_preset_id]: buttons) {
-        button->setToggleState(button_preset_id == preset_id,
+        const auto* preset = latency_preset_for_id(button_preset_id);
+        const bool pending = preset_is_pending && button_preset_id == preset_id;
+        button->setButtonText(juce::String(preset->label) + (pending ? " •" : ""));
+        button->setToggleState(!preset_is_pending && button_preset_id == preset_id,
                                juce::dontSendNotification);
+        if (pending) {
+            button->setColour(juce::TextButton::buttonColourId,
+                              juce_theme::colour::accent().withAlpha(0.22F));
+            button->setColour(juce::TextButton::textColourOffId,
+                              juce_theme::colour::warning());
+            button->setTooltip(juce::String(preset->label) +
+                               " selected — Apply and restart audio");
+        } else {
+            button->removeColour(juce::TextButton::buttonColourId);
+            button->removeColour(juce::TextButton::textColourOffId);
+            button->setTooltip(juce::String(preset->packet_frames) + " frames / " +
+                               juce::String(preset->jitter_ms) + " ms jitter / depth " +
+                               juce::String(preset->redundancy_depth));
+        }
     }
 }
 
@@ -2153,7 +2176,8 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
             static_cast<size_t>(preset->queue_limit_packets);
         pending_network_auto_jitter_ = preset->auto_jitter;
         pending_network_redundancy_depth_ = preset->redundancy_depth;
-        set_device_status(juce::String(preset->label) + " selected — Apply to activate");
+        set_device_status(juce::String(preset->label) +
+                          " selected — Apply and restart audio");
     } else {
         pending_network_age_limit_ms_.reset();
         pending_network_jitter_ms_.reset();
@@ -2169,6 +2193,7 @@ void JuceMixerComponent::apply_latency_preset(int preset_id) {
         set_device_status(juce::String(preset->label) + " network preset selected");
     }
 
+    update_latency_preset_buttons(latency_preset_id_for_current_settings());
     apply_audio_button_.setEnabled(device_controls_loaded_ && has_pending_audio_changes());
 }
 

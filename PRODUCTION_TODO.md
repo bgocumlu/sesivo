@@ -896,7 +896,7 @@ Implementation checklist (each bullet is one commit-sized change):
   chip overwrites the Advanced values.
 - **C.4 Removed:** do not persist a last custom bundle. These values describe
   current network conditions and may become stale as the server or network changes.
-- [ ] **C.5 Pending vs active state:** when a bundle needs a restart, the chip
+- [x] **C.5 Pending vs active state:** when a bundle needs a restart, the chip
   shows selected-but-pending ("Low selected — Apply and restart audio") and must
   not render as active until the whole bundle is live (Task 6 provides the
   staging; this is the visual layer).
@@ -1038,5 +1038,6 @@ these are parity changes with minimal risk, not claimed latency wins.
 | C.2 — Collapsible Advanced controls | ☑ complete | `feat: collapse advanced latency controls` |
 | C.3 — Custom deselects preset chips | ☑ complete | `feat: represent custom latency settings with no preset selected` |
 | C.4 — Remember last custom bundle | — removed | Network tuning should not be restored after conditions change |
-| C.5–C.8 — Remaining preset UI | ☐ not started | |
+| C.5 — Pending vs active preset state | ☑ complete | `feat: distinguish pending and active latency presets` |
+| C.6–C.8 — Remaining preset UI | ☐ not started | |
 | 12 — macOS QoS + Wi-Fi voice class (needs a Mac) | ☐ not started | |

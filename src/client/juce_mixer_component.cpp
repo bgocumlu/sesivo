@@ -1103,59 +1103,94 @@ void JuceMixerComponent::configure_controls() {
     set_advanced_latency_open(advanced_latency_open_, false);
     jitter_ms_slider_.onValueChange = [this]() {
         if (!updating_from_client_ && !jitter_ms_slider_.isMouseButtonDown()) {
-            client_.set_opus_jitter_buffer_ms(
-                std::max(0, static_cast<int>(std::lround(jitter_ms_slider_.getValue()))));
-            if (client_.get_opus_queue_limit_packets() <
-                client_.get_opus_jitter_buffer_packets()) {
-                client_.set_opus_queue_limit_packets(
-                    client_.get_opus_jitter_buffer_packets());
+            const int jitter_ms =
+                std::max(0, static_cast<int>(std::lround(jitter_ms_slider_.getValue())));
+            if (pending_network_jitter_ms_.has_value()) {
+                pending_network_jitter_ms_ = jitter_ms;
+            } else {
+                client_.set_opus_jitter_buffer_ms(jitter_ms);
+                if (client_.get_opus_queue_limit_packets() <
+                    client_.get_opus_jitter_buffer_packets()) {
+                    client_.set_opus_queue_limit_packets(
+                        client_.get_opus_jitter_buffer_packets());
+                }
             }
             update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     jitter_ms_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
-            client_.set_opus_jitter_buffer_ms(
-                std::max(0, static_cast<int>(std::lround(jitter_ms_slider_.getValue()))));
-            if (client_.get_opus_queue_limit_packets() <
-                client_.get_opus_jitter_buffer_packets()) {
-                client_.set_opus_queue_limit_packets(
-                    client_.get_opus_jitter_buffer_packets());
+            const int jitter_ms =
+                std::max(0, static_cast<int>(std::lround(jitter_ms_slider_.getValue())));
+            if (pending_network_jitter_ms_.has_value()) {
+                pending_network_jitter_ms_ = jitter_ms;
+            } else {
+                client_.set_opus_jitter_buffer_ms(jitter_ms);
+                if (client_.get_opus_queue_limit_packets() <
+                    client_.get_opus_jitter_buffer_packets()) {
+                    client_.set_opus_queue_limit_packets(
+                        client_.get_opus_jitter_buffer_packets());
+                }
             }
             update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     queue_limit_slider_.onValueChange = [this]() {
         if (!updating_from_client_ && !queue_limit_slider_.isMouseButtonDown()) {
-            client_.set_opus_queue_limit_packets(static_cast<size_t>(
-                std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue())))));
+            const auto queue_limit = static_cast<size_t>(
+                std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue()))));
+            if (pending_network_queue_limit_packets_.has_value()) {
+                pending_network_queue_limit_packets_ = queue_limit;
+            } else {
+                client_.set_opus_queue_limit_packets(queue_limit);
+            }
             update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     queue_limit_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
-            client_.set_opus_queue_limit_packets(static_cast<size_t>(
-                std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue())))));
+            const auto queue_limit = static_cast<size_t>(
+                std::max(1, static_cast<int>(std::lround(queue_limit_slider_.getValue()))));
+            if (pending_network_queue_limit_packets_.has_value()) {
+                pending_network_queue_limit_packets_ = queue_limit;
+            } else {
+                client_.set_opus_queue_limit_packets(queue_limit);
+            }
             update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     age_limit_slider_.onValueChange = [this]() {
         if (!updating_from_client_ && !age_limit_slider_.isMouseButtonDown()) {
-            client_.set_jitter_packet_age_limit_ms(
-                std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue()))));
+            const int age_limit_ms =
+                std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue())));
+            if (pending_network_age_limit_ms_.has_value()) {
+                pending_network_age_limit_ms_ = age_limit_ms;
+            } else {
+                client_.set_jitter_packet_age_limit_ms(age_limit_ms);
+            }
             update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     age_limit_slider_.onDragEnd = [this]() {
         if (!updating_from_client_) {
-            client_.set_jitter_packet_age_limit_ms(
-                std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue()))));
+            const int age_limit_ms =
+                std::max(1, static_cast<int>(std::lround(age_limit_slider_.getValue())));
+            if (pending_network_age_limit_ms_.has_value()) {
+                pending_network_age_limit_ms_ = age_limit_ms;
+            } else {
+                client_.set_jitter_packet_age_limit_ms(age_limit_ms);
+            }
             update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
     auto_jitter_toggle_.onClick = [this]() {
         if (!updating_from_client_) {
-            client_.set_opus_auto_jitter_default(auto_jitter_toggle_.getToggleState());
+            const bool auto_jitter = auto_jitter_toggle_.getToggleState();
+            if (pending_network_auto_jitter_.has_value()) {
+                pending_network_auto_jitter_ = auto_jitter;
+            } else {
+                client_.set_opus_auto_jitter_default(auto_jitter);
+            }
             update_latency_preset_buttons(latency_preset_id_for_current_settings());
         }
     };
@@ -1164,10 +1199,12 @@ void JuceMixerComponent::configure_controls() {
             return;
         }
         const int selected = redundancy_combo_.getSelectedId();
-        if (selected == 1) {
-            client_.set_opus_redundancy_depth(OPUS_REDUNDANCY_DEPTH_AUTO);
+        const int redundancy_depth =
+            selected == 1 ? OPUS_REDUNDANCY_DEPTH_AUTO : selected - 2;
+        if (pending_network_redundancy_depth_.has_value()) {
+            pending_network_redundancy_depth_ = redundancy_depth;
         } else {
-            client_.set_opus_redundancy_depth(selected - 2);
+            client_.set_opus_redundancy_depth(redundancy_depth);
         }
         update_latency_preset_buttons(latency_preset_id_for_current_settings());
     };

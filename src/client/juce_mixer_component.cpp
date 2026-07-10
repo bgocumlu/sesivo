@@ -969,6 +969,7 @@ JuceMixerComponent::JuceMixerComponent(
 
 JuceMixerComponent::~JuceMixerComponent() {
     stopTimer();
+    advanced_latency_label_.removeMouseListener(this);
     if (connection_job_thread_.joinable()) {
         connection_job_thread_.join();
     }
@@ -1004,9 +1005,13 @@ void JuceMixerComponent::configure_controls() {
     configure_section(room_admin_label_, "Room");
     configure_caption(packet_label_, "Packet");
     configure_caption(jitter_label_, "Jitter");
-    configure_caption(queue_label_, "RX capacity (max queued packets)");
+    configure_caption(queue_label_, "RX capacity");
     configure_caption(age_limit_label_, "Age");
     configure_caption(preset_label_, "Latency");
+    configure_caption(advanced_latency_label_, "Advanced >");
+    advanced_latency_label_.setJustificationType(juce::Justification::centredLeft);
+    advanced_latency_label_.setMouseCursor(juce::MouseCursor::PointingHandCursor);
+    advanced_latency_label_.addMouseListener(this, false);
     configure_caption(redundancy_label_, "Redundancy");
     configure_caption(participant_overrides_label_,
                       "Participant overrides: shown in mixer rows");
@@ -1032,7 +1037,6 @@ void JuceMixerComponent::configure_controls() {
                             " pkt");
     configure_linear_slider(age_limit_slider_, 1.0, MAX_JITTER_PACKET_AGE_MS, 1.0, " ms");
     configure_latency_preset_buttons();
-    advanced_latency_button_.setClickingTogglesState(true);
     auto_jitter_toggle_.setButtonText("Auto jitter");
 
     bpm_editor_.setInputRestrictions(6, "0123456789.");
@@ -1076,7 +1080,7 @@ void JuceMixerComponent::configure_controls() {
                                &jitter_ms_slider_, &queue_limit_slider_, &age_limit_slider_,
                                &latency_preset_ultra_button_, &latency_preset_low_button_,
                                &latency_preset_balanced_button_, &latency_preset_stable_button_,
-                               &advanced_latency_button_, &redundancy_label_,
+                               &advanced_latency_label_, &redundancy_label_,
                                &redundancy_combo_, &auto_jitter_toggle_,
                                &participant_overrides_label_, &diagnostics_label_});
 
@@ -1095,9 +1099,6 @@ void JuceMixerComponent::configure_controls() {
         if (!updating_from_client_) {
             client_.set_self_monitor_enabled(monitor_toggle_.getToggleState());
         }
-    };
-    advanced_latency_button_.onClick = [this]() {
-        set_advanced_latency_open(advanced_latency_button_.getToggleState(), true);
     };
     set_advanced_latency_open(advanced_latency_open_, false);
     jitter_ms_slider_.onValueChange = [this]() {
@@ -1299,6 +1300,12 @@ void JuceMixerComponent::paint(juce::Graphics& g) {
     draw_separator(dock.wav);
 }
 
+void JuceMixerComponent::mouseUp(const juce::MouseEvent& event) {
+    if (event.eventComponent == &advanced_latency_label_) {
+        set_advanced_latency_open(!advanced_latency_open_, true);
+    }
+}
+
 void JuceMixerComponent::resized() {
     auto area = getLocalBounds().reduced(PAD);
     auto top = area.removeFromTop(STATUS_HEIGHT);
@@ -1450,7 +1457,7 @@ void JuceMixerComponent::layout_network_content() {
         preset_row.removeFromLeft(preset_button_width));
     latency_preset_stable_button_.setBounds(preset_row);
     network.removeFromTop(4);
-    advanced_latency_button_.setBounds(network.removeFromTop(ROW).reduced(2));
+    advanced_latency_label_.setBounds(network.removeFromTop(24).reduced(2, 0));
 
     if (advanced_latency_open_) {
         network.removeFromTop(6);
@@ -1466,20 +1473,19 @@ void JuceMixerComponent::layout_network_content() {
         network.removeFromTop(4);
         auto_jitter_toggle_.setBounds(network.removeFromTop(ROW).reduced(2));
         participant_overrides_label_.setBounds(network.removeFromTop(22).reduced(2));
+        network.removeFromTop(10);
+        const int diagnostics_height = diagnostics_label_height(diagnostics_label_.getText());
+        diagnostics_label_.setBounds(network.removeFromTop(diagnostics_height).reduced(2, 4));
     }
-    network.removeFromTop(10);
 
-    const int diagnostics_height = diagnostics_label_height(diagnostics_label_.getText());
-    diagnostics_label_.setBounds(network.removeFromTop(diagnostics_height).reduced(2, 4));
-
-    const int content_height = std::max(viewport.getHeight(), diagnostics_label_.getBottom() + control_gap);
+    const int content_height = std::max(viewport.getHeight(), network.getY() + control_gap);
     network_content_.setSize(std::max(1, viewport.getWidth() - 20), content_height);
 }
 
 void JuceMixerComponent::set_advanced_latency_open(bool open, bool persist) {
     advanced_latency_open_ = open;
-    advanced_latency_button_.setToggleState(open, juce::dontSendNotification);
-    advanced_latency_button_.setButtonText(open ? "Advanced v" : "Advanced >");
+    advanced_latency_label_.setText(open ? "Advanced v" : "Advanced >",
+                                    juce::dontSendNotification);
 
     const std::array<juce::Component*, 11> advanced_controls{
         &packet_label_,         &opus_packet_combo_, &jitter_label_,
@@ -1491,6 +1497,7 @@ void JuceMixerComponent::set_advanced_latency_open(bool open, bool persist) {
         control->setVisible(open);
     }
     participant_overrides_label_.setVisible(open);
+    diagnostics_label_.setVisible(open);
     participants_component_.set_latency_overrides_visible(open);
     layout_network_content();
 

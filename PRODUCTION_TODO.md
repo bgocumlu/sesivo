@@ -889,7 +889,7 @@ Implementation checklist (each bullet is one commit-sized change):
 - [x] **C.2 Advanced section, collapsed by default:** packet, jitter, RX capacity,
   age, redundancy, auto toggle, per-participant overrides. Persist the open/closed
   state in the config store (`client_config_store.*`). Label the queue limit
-  **"RX capacity (max queued packets)"** — it is a safety ceiling, not latency.
+  **"RX capacity"** — it is a safety ceiling, not latency.
 - [ ] **C.3 Custom is a state, not a step:** touching anything in Advanced
   deselects all chips and lights a "Custom" chip (the reverse-match logic already
   returns `LATENCY_PRESET_CUSTOM_ID`). Clicking a chip overwrites Advanced values.

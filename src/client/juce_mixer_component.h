@@ -27,6 +27,7 @@ public:
 
     void paint(juce::Graphics& g) override;
     void resized() override;
+    void mouseUp(const juce::MouseEvent& event) override;
 
 private:
     struct AudioDeviceRefreshResult {
@@ -218,7 +219,7 @@ private:
     juce::TextButton latency_preset_low_button_;
     juce::TextButton latency_preset_balanced_button_;
     juce::TextButton latency_preset_stable_button_;
-    juce::TextButton advanced_latency_button_;
+    juce::Label advanced_latency_label_;
     juce::ToggleButton auto_jitter_toggle_;
     juce::ComboBox redundancy_combo_;
 

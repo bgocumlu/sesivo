@@ -1677,8 +1677,8 @@ void JuceMixerComponent::refresh_live_state() {
     diagnostics_label_.setText(
         "Opus " + juce::String(client_.get_opus_network_frame_count()) + " frames / " +
             juce::String(client_.get_opus_network_packet_ms(), 1) + " ms\n" +
-            "E2E avg " + juce::String(path.e2e_latency_avg_max_ms, 1) + " ms\n" +
-            "E2E peak " + juce::String(path.e2e_latency_peak_ms, 1) + " ms\n" +
+            "App path avg " + juce::String(path.e2e_latency_avg_max_ms, 1) + " ms\n" +
+            "App path peak " + juce::String(path.e2e_latency_peak_ms, 1) + " ms\n" +
             "Samples " + format_sample_count(path.e2e_latency_samples) + "\n" +
             "Device " + juce::String(device_path_ms, 1) + " ms\n" +
             "In " + juce::String(latency.input_latency_ms, 1) + " / out " +
@@ -2637,6 +2637,28 @@ JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
         return result;
     }
 
+    const bool should_rotate_media_key =
+        command == ROOM_ADMIN_CHANGE_PASSWORD ||
+        command == ROOM_ADMIN_CHANGE_ACCESS ||
+        command == ROOM_ADMIN_KICK_PARTICIPANT ||
+        command == ROOM_ADMIN_ROTATE_MEDIA_KEY;
+    std::string new_media_secret;
+    std::string media_key_commitment;
+    if (should_rotate_media_key) {
+        if (client_.current_media_secret().empty()) {
+            result.status = "Room key unavailable";
+            return result;
+        }
+        new_media_secret = make_media_secret();
+        const auto commitment =
+            performer_join_token::try_sha256_hex(new_media_secret);
+        if (!commitment.has_value()) {
+            result.status = "Could not authorize the new room key";
+            return result;
+        }
+        media_key_commitment = *commitment;
+    }
+
     RoomAdminRequestHdr request{};
     request.magic = CTRL_MAGIC;
     request.type = CtrlHdr::Cmd::ROOM_ADMIN_REQUEST;
@@ -2647,6 +2669,7 @@ JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
     write_fixed(request.room_id, room_id);
     write_fixed(request.admin_token, startup_options_.room_admin_token);
     write_fixed(request.password_hash, hash);
+    write_fixed(request.media_key_commitment, media_key_commitment);
 
     try {
         const auto response =
@@ -2684,17 +2707,10 @@ JuceMixerComponent::RoomAdminResult JuceMixerComponent::run_room_admin_command(
                 break;
         }
 
-        const bool should_rotate_media_key =
-            command == ROOM_ADMIN_CHANGE_PASSWORD ||
-            command == ROOM_ADMIN_CHANGE_ACCESS ||
-            command == ROOM_ADMIN_KICK_PARTICIPANT ||
-            command == ROOM_ADMIN_ROTATE_MEDIA_KEY;
-        const auto current_secret = client_.current_media_secret();
-        if (should_rotate_media_key && !current_secret.empty()) {
-            const auto new_secret = make_media_secret();
-            if (client_.rotate_media_key(new_secret, result.access_epoch)) {
+        if (should_rotate_media_key) {
+            if (client_.rotate_media_key(new_media_secret, result.access_epoch)) {
                 result.media_key_rotated = true;
-                result.new_media_secret = new_secret;
+                result.new_media_secret = new_media_secret;
                 if (command != ROOM_ADMIN_ROTATE_MEDIA_KEY) {
                     result.status += "; room key rotated";
                 }

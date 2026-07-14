@@ -108,7 +108,7 @@ void test_large_gap_recovery_beyond_small_packet_window() {
             "split range recoveries should keep decrementing unresolved count");
 }
 
-void test_untracked_overflow_gap_does_not_stick_unresolved() {
+void test_range_overflow_expires_oldest_without_suppressing_totals() {
     SequenceArrivalTracker tracker;
 
     tracker.record(0);
@@ -122,24 +122,29 @@ void test_untracked_overflow_gap_does_not_stick_unresolved() {
     auto delta = tracker.record(130);
     require(delta.gaps_detected == 1, "overflow jump should still report detected gap");
     require(tracker.unresolved_gaps() == 64,
-            "untracked overflow gap should not inflate unresolved count");
+            "new gap should replace the oldest tracked gap");
+    require(tracker.total_gaps_detected() == 65,
+            "cumulative detected gaps must not be capped by tracking capacity");
 
     delta = tracker.record(129);
-    require(delta.late_or_duplicate, "late untracked packet should still be late");
-    require(delta.gaps_recovered == 0,
-            "untracked overflow packet should not report recovery");
-    require(tracker.unresolved_gaps() == 64,
-            "late untracked packet should not change unresolved count");
+    require(delta.late_or_duplicate, "late newest-gap packet should still be late");
+    require(delta.gaps_recovered == 1,
+            "newest gap must remain recoverable after range eviction");
+    require(tracker.unresolved_gaps() == 63,
+            "newest recovery should reduce unresolved count");
 
     for (uint32_t sequence = 1; sequence <= 127; sequence += 2) {
         delta = tracker.record(sequence);
-        require(delta.gaps_recovered == 1, "tracked separated gap should recover");
+        require(delta.gaps_recovered == (sequence == 1 ? 0U : 1U),
+                "only the expired oldest gap should be unrecoverable");
     }
     require(tracker.unresolved_gaps() == 0,
             "all tracked gaps should recover to zero unresolved");
+    require(tracker.total_gaps_recovered() == 64,
+            "cumulative recoveries should remain independent of range capacity");
 }
 
-void test_full_table_middle_split_drops_untracked_half_from_unresolved() {
+void test_full_table_middle_split_expires_an_older_range() {
     SequenceArrivalTracker tracker;
 
     tracker.record(0);
@@ -156,20 +161,22 @@ void test_full_table_middle_split_drops_untracked_half_from_unresolved() {
 
     delta = tracker.record(132);
     require(delta.gaps_recovered == 1, "middle packet should recover one gap");
-    require(tracker.unresolved_gaps() == 68,
-            "untracked right split should be dropped from unresolved count");
+    require(tracker.unresolved_gaps() == 71,
+            "middle split should preserve both halves and expire one older range");
 
     for (uint32_t sequence = 133; sequence <= 136; ++sequence) {
         delta = tracker.record(sequence);
         require(delta.late_or_duplicate, "right split packet should still be late");
-        require(delta.gaps_recovered == 0,
-                "untracked right split packet should not report recovery");
+        require(delta.gaps_recovered == 1,
+                "right split should remain tracked after older-range eviction");
     }
-    require(tracker.unresolved_gaps() == 68,
-            "untracked right split arrivals should not change unresolved count");
+    require(tracker.unresolved_gaps() == 67,
+            "right split recoveries should reduce unresolved count");
 
     for (uint32_t sequence = 1; sequence <= 125; sequence += 2) {
-        tracker.record(sequence);
+        delta = tracker.record(sequence);
+        require(delta.gaps_recovered == (sequence == 1 ? 0U : 1U),
+                "only the expired oldest separated range should be lost");
     }
     for (uint32_t sequence = 127; sequence <= 131; ++sequence) {
         tracker.record(sequence);
@@ -188,8 +195,8 @@ int main() {
     test_reordered_recovery_should_enqueue();
     test_wraparound_ordering();
     test_large_gap_recovery_beyond_small_packet_window();
-    test_untracked_overflow_gap_does_not_stick_unresolved();
-    test_full_table_middle_split_drops_untracked_half_from_unresolved();
+    test_range_overflow_expires_oldest_without_suppressing_totals();
+    test_full_table_middle_split_expires_an_older_range();
 
     std::cout << "sequence tracker self-test passed\n";
     return 0;

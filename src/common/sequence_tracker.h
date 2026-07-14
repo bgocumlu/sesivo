@@ -44,6 +44,7 @@ public:
         if (sequence_number_after(sequence, next_sequence_)) {
             const uint32_t gap = sequence - next_sequence_;
             delta.gaps_detected = gap;
+            total_gaps_detected_ += gap;
             unresolved_gaps_ += remember_missing_range(next_sequence_, gap);
             next_sequence_ = sequence + 1;
             return delta;
@@ -52,12 +53,21 @@ public:
         delta.late_or_duplicate = true;
         if (remove_missing(sequence)) {
             delta.gaps_recovered = 1;
+            ++total_gaps_recovered_;
         }
         return delta;
     }
 
     uint64_t unresolved_gaps() const {
         return unresolved_gaps_;
+    }
+
+    uint64_t total_gaps_detected() const {
+        return total_gaps_detected_;
+    }
+
+    uint64_t total_gaps_recovered() const {
+        return total_gaps_recovered_;
     }
 
     bool has_unresolved_gap(uint32_t sequence) const {
@@ -86,7 +96,10 @@ private:
         }
 
         if (missing_count_ >= missing_.size()) {
-            return 0;
+            const size_t oldest = oldest_range_index();
+            decrement_unresolved(missing_[oldest].count);
+            missing_[oldest] = MissingRange{first_sequence, count};
+            return count;
         }
         missing_[missing_count_++] = MissingRange{first_sequence, count};
         return count;
@@ -135,7 +148,15 @@ private:
                 missing_[missing_count_++] = right;
                 decrement_unresolved(1);
             } else {
-                decrement_unresolved(1 + right.count);
+                const size_t oldest = oldest_range_index(i);
+                if (oldest < missing_count_) {
+                    const uint32_t expired = missing_[oldest].count;
+                    erase_range(oldest);
+                    missing_[missing_count_++] = right;
+                    decrement_unresolved(1 + expired);
+                } else {
+                    decrement_unresolved(1 + right.count);
+                }
             }
             return true;
         }
@@ -153,9 +174,27 @@ private:
         unresolved_gaps_ = unresolved_gaps_ > count ? unresolved_gaps_ - count : 0;
     }
 
+    size_t oldest_range_index(size_t excluded = MAX_TRACKED_RANGES) const {
+        size_t oldest = missing_count_;
+        uint32_t greatest_age = 0;
+        for (size_t i = 0; i < missing_count_; ++i) {
+            if (i == excluded) {
+                continue;
+            }
+            const uint32_t age = next_sequence_ - missing_[i].first;
+            if (oldest == missing_count_ || age > greatest_age) {
+                oldest = i;
+                greatest_age = age;
+            }
+        }
+        return oldest;
+    }
+
     bool initialized_ = false;
     uint32_t next_sequence_ = 0;
     uint64_t unresolved_gaps_ = 0;
+    uint64_t total_gaps_detected_ = 0;
+    uint64_t total_gaps_recovered_ = 0;
     std::array<MissingRange, MAX_TRACKED_RANGES> missing_{};
     size_t missing_count_ = 0;
 };

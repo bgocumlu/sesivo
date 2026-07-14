@@ -37,7 +37,7 @@ const defaults = {
   frames: "120",
   ttlMs: "120000",
   roomInstance: "",
-  accessEpoch: "0",
+  accessEpoch: "1",
   mediaSecret: process.env.JAM_MEDIA_SECRET ?? "dev-media-secret",
   client: process.env.JAM_CLIENT_EXE ?? defaultClientPath(),
 };
@@ -119,14 +119,15 @@ const payload = [
   options.user,
   options.roomInstance,
   options.accessEpoch,
+  crypto.createHash("sha256").update(options.mediaSecret).digest("hex"),
   nonce,
 ];
 const encodedPayload = tokenPayload(payload);
 const signature = crypto
   .createHmac("sha256", options.secret)
-  .update(`v2|${encodedPayload}`)
+  .update(`v3|${encodedPayload}`)
   .digest("hex");
-const token = ["v2", base64Url(encodedPayload), signature].join(".");
+const token = ["v3", base64Url(encodedPayload), signature].join(".");
 
 const command = [
   options.client,

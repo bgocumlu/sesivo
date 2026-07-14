@@ -1,7 +1,9 @@
 #include "participant_info.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <thread>
 
 namespace {
 
@@ -164,8 +166,115 @@ void test_large_gap_caps_plc_and_resumes_real_packet() {
     for (size_t i = 0; i < MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS; ++i) {
         require_loss_concealment(queue, static_cast<uint32_t>(2 + i), 0);
     }
-    require_dequeue_with_reset(queue, 100, 0);
+    OpusPacket resumed{};
+    require(queue.try_dequeue(resumed, 0) && !resumed.loss_concealment &&
+                resumed.reset_decoder && resumed.sequence == 100,
+            "large gap cap should resume the real packet with a decoder reset");
+    require(resumed.abandoned_gap_packets ==
+                98 - MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS,
+            "large gap cap must expose every sequence abandoned without PLC");
     require(queue.size_approx() == 0, "large gap cap should leave no buffered packet");
+}
+
+void test_local_mute_drain_resets_playout_without_loss() {
+    ParticipantOpusPacketQueue queue;
+    require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
+    require(queue.enqueue(make_packet(100)), "future packet should enqueue");
+    require(queue.discard_all_for_local_mute() == 2,
+            "local mute should drain all actual media");
+    require(queue.size_approx() == 0, "local mute drain should empty the queue");
+    require(queue.enqueue(make_packet(200)), "post-mute packet should enqueue");
+    require_dequeue(queue, 200, 0);
+}
+
+void test_receiver_drop_is_not_reported_again_as_gap_loss() {
+    ParticipantOpusPacketQueue queue;
+    require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
+    require(queue.record_receiver_drop(make_packet(2)),
+            "receiver drop marker should enqueue");
+    require(queue.enqueue(make_packet(3)), "packet 3 should enqueue");
+    require_dequeue(queue, 1, 0);
+    require_dequeue_with_reset(queue, 3, 0);
+    require(queue.take_internal_receiver_drops() == 1,
+            "receiver-owned drops should be reported without extending playout");
+}
+
+void test_trimmed_future_packet_is_not_reported_again_as_gap_loss() {
+    ParticipantOpusPacketQueue queue;
+    require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
+    require(queue.enqueue(make_packet(3)), "packet 3 should enqueue");
+    require(queue.enqueue(make_packet(4)), "packet 4 should enqueue");
+    require_dequeue(queue, 1, 0);
+    bool receiver_drop_ready = true;
+    require(queue.discard_oldest_actual_packet_for_latency_trim(
+                &receiver_drop_ready) && !receiver_drop_ready,
+            "future latency trim should defer its receiver-drop outcome to playout");
+    OpusPacket concealment{};
+    require(queue.try_dequeue(concealment, 0) && concealment.loss_concealment &&
+                concealment.sequence == 2 && !concealment.receiver_drop_pending,
+            "real arrival gap should remain a new playout loss");
+    require_dequeue_with_reset(queue, 4, 0);
+    require(queue.take_internal_receiver_drops() == 1,
+            "trimmed future sequence should be reported without generating PLC");
+}
+
+void test_late_receiver_drop_is_discarded_after_playout() {
+    ParticipantOpusPacketQueue queue;
+    require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
+    require(queue.enqueue(make_packet(3)), "packet 3 should enqueue");
+    require_dequeue(queue, 1, 0);
+    OpusPacket concealment{};
+    require(queue.try_dequeue(concealment, 0) && concealment.loss_concealment &&
+                concealment.sequence == 2 && !concealment.receiver_drop_pending,
+            "missing sequence should first resolve as a playout gap");
+    require(!queue.record_receiver_drop(make_packet(2)),
+            "late receiver-drop publication must not replace a resolved playout gap");
+    require_dequeue(queue, 3, 0);
+}
+
+void test_receiver_drop_ranges_coalesce_without_marker_packets() {
+    ParticipantOpusPacketQueue queue;
+    require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
+    for (uint32_t sequence = 2; sequence < 100; ++sequence) {
+        require(queue.record_receiver_drop(make_packet(sequence)),
+                "contiguous receiver drops should coalesce in fixed storage");
+    }
+    require(queue.enqueue(make_packet(100)), "future packet should enqueue");
+    require_dequeue(queue, 1, 0);
+    require_dequeue_with_reset(queue, 100, 0);
+    require(queue.take_internal_receiver_drops() == 98,
+            "coalesced receiver drops should resolve once without generating PLC");
+}
+
+void test_receiver_drop_range_overflow_preserves_one_terminal_outcome() {
+    ParticipantOpusPacketQueue queue;
+    require(queue.enqueue(make_packet(1)), "packet 1 should enqueue");
+    for (uint32_t sequence = 2; sequence <= 130; sequence += 2) {
+        require(queue.record_receiver_drop(make_packet(sequence)),
+                "bounded receiver-drop storage should accept overflow by safe eviction");
+    }
+    require(queue.enqueue(make_packet(132)), "future packet should enqueue");
+    require_dequeue(queue, 1, 0);
+
+    uint32_t receiver_drops = 0;
+    uint32_t gap_losses = 0;
+    OpusPacket packet{};
+    for (size_t i = 0; i < MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS; ++i) {
+        require(queue.try_dequeue(packet, 0) && packet.loss_concealment,
+                "large gap should begin with bounded PLC");
+        if (packet.receiver_drop_pending) {
+            ++receiver_drops;
+        } else {
+            ++gap_losses;
+        }
+    }
+    require(queue.try_dequeue(packet, 0) && packet.sequence == 132,
+            "large gap should resume at the next real packet");
+    receiver_drops += static_cast<uint32_t>(queue.take_internal_receiver_drops());
+    receiver_drops += packet.abandoned_receiver_drop_packets;
+    gap_losses += packet.abandoned_gap_packets;
+    require(receiver_drops + gap_losses == 130,
+            "range eviction must leave exactly one terminal outcome per missing sequence");
 }
 
 void test_gap_wait_resets_when_missing_packet_arrives() {
@@ -406,6 +515,85 @@ void test_handles_sequence_wraparound() {
     require_dequeue(queue, 0, 3);
 }
 
+void test_clear_linearizes_with_concurrent_admission() {
+    ParticipantOpusPacketQueue queue;
+    std::atomic<bool> start{false};
+    std::thread producer([&]() {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (uint32_t sequence = 1; sequence <= 100'000; ++sequence) {
+            (void)queue.enqueue_bounded(make_packet(sequence), MAX_OPUS_QUEUE_SIZE);
+        }
+    });
+
+    start.store(true, std::memory_order_release);
+    for (size_t iteration = 0; iteration < 1'000; ++iteration) {
+        queue.clear();
+    }
+    producer.join();
+    queue.clear();
+
+    require(queue.size_approx() == 0,
+            "clear must leave no admission count from a concurrent producer");
+    require(queue.enqueue(make_packet(1)),
+            "queue admission must remain usable after concurrent clear");
+    require_dequeue(queue, 1, 0);
+    require(queue.size_approx() == 0,
+            "post-clear dequeue must not underflow the admission count");
+}
+
+void test_pcm_delivery_outcomes_cover_every_terminal_path() {
+    PcmDeliveryOutcomes outcomes;
+    require(outcomes.append(10, 100, true, true),
+            "received PCM chunk should append");
+    size_t observations = 0;
+    require(outcomes.consume(4, [&](const OpusPcmCaptureChunk&, size_t consumed) {
+                require(consumed == 4,
+                        "partial observer should receive its consumed frame weight");
+                ++observations;
+            }) == 0 &&
+                outcomes.pending_received() == 1 && outcomes.size() == 1,
+            "partial PCM consumption must not resolve delivery early");
+    require(outcomes.consume(6, [&](const OpusPcmCaptureChunk&, size_t consumed) {
+                require(consumed == 6,
+                        "terminal observer should receive its consumed frame weight");
+                ++observations;
+            }) == 1 &&
+                outcomes.pending_received() == 0 && outcomes.size() == 0,
+            "full PCM consumption must resolve delivery exactly once");
+    require(observations == 2,
+            "partial and terminal consumption should both expose capture metadata");
+
+    require(outcomes.append(10, 0, false, true),
+            "received reset candidate should append");
+    require(outcomes.append(10, 0, false, false),
+            "PLC reset candidate should append");
+    require(outcomes.discard_all_as_lost() == 1 && outcomes.size() == 0,
+            "reset must resolve only pending received media as lost");
+
+    for (size_t i = 0; i < PcmDeliveryOutcomes::capacity(); ++i) {
+        require(outcomes.append(1, 0, false, true),
+                "outcome tracker should fill to its fixed capacity");
+    }
+    require(!outcomes.append(1, 0, false, true),
+            "outcome tracker must reject rather than evict an unresolved identity");
+    const uint64_t overflow_losses = outcomes.discard_overflow_as_lost(true);
+    require(overflow_losses == PcmDeliveryOutcomes::capacity() + 1,
+            "overflow reset must resolve every pending and incoming packet once");
+}
+
+void test_latency_average_is_weighted_by_played_frames() {
+    FrameWeightedLatencyAccumulator latency;
+    latency.observe(30'000'000, 1, false);
+    latency.observe(20'000'000, 479, true);
+    require(latency.average_ns() == 20'020'833,
+            "a tiny partial chunk must not weigh the same as a full PCM chunk");
+    require(latency.max_latency_ns == 30'000'000 &&
+                latency.completed_samples == 1,
+            "frame weighting must retain peak latency and completed packet samples");
+}
+
 }  // namespace
 
 int main() {
@@ -415,6 +603,12 @@ int main() {
     test_skips_permanent_gap_after_wait_callbacks();
     test_burst_gap_waits_once_then_conceals_missing_run();
     test_large_gap_caps_plc_and_resumes_real_packet();
+    test_local_mute_drain_resets_playout_without_loss();
+    test_receiver_drop_is_not_reported_again_as_gap_loss();
+    test_trimmed_future_packet_is_not_reported_again_as_gap_loss();
+    test_late_receiver_drop_is_discarded_after_playout();
+    test_receiver_drop_ranges_coalesce_without_marker_packets();
+    test_receiver_drop_range_overflow_preserves_one_terminal_outcome();
     test_gap_wait_resets_when_missing_packet_arrives();
     test_discards_stale_packet_after_skip();
     test_rejects_duplicate_packet();
@@ -430,6 +624,9 @@ int main() {
     test_unsequenced_overflow_does_not_evict_sequenced_packet();
     test_hard_cap_still_accepts_startup_recovery_packet();
     test_handles_sequence_wraparound();
+    test_clear_linearizes_with_concurrent_admission();
+    test_pcm_delivery_outcomes_cover_every_terminal_path();
+    test_latency_average_is_weighted_by_played_frames();
 
     std::cout << "participant packet queue self-test passed\n";
     return 0;

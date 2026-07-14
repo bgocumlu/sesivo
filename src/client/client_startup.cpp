@@ -39,7 +39,7 @@ int parse_opus_redundancy_depth_option(const std::string& value) {
 }
 
 int silence_audio_callback(const void*, void* output, unsigned long frame_count,
-                           void* user_data) {
+                           void* user_data, AudioCallbackWorkBudget&) {
     auto* stream = static_cast<AudioStream*>(user_data);
     if (output == nullptr || stream == nullptr) {
         return 0;

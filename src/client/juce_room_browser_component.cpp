@@ -2671,6 +2671,13 @@ void JuceRoomBrowserComponent::start_create_flow() {
                 }
                 self->last_display_name_ = input.display_name;
                 const auto media_secret = make_media_secret();
+                const auto media_key_commitment =
+                    performer_join_token::try_sha256_hex(media_secret);
+                if (!media_key_commitment.has_value()) {
+                    self->status_text_ = "Could not authorize the room key";
+                    self->repaint();
+                    return;
+                }
                 const auto room_id = normalized_id(input.room_name, "room");
                 const auto profile_id =
                     self->profile_id_for_display_name(input.display_name);
@@ -2684,6 +2691,7 @@ void JuceRoomBrowserComponent::start_create_flow() {
                                  room_name = input.room_name, profile_id,
                                  display_name = input.display_name,
                                  password = input.password, media_secret,
+                                 media_key_commitment = *media_key_commitment,
                                  access_mode = input.access_mode, request_id]() {
                     BrowserJobResult result_value;
                     result_value.kind = JobKind::Create;
@@ -2704,6 +2712,8 @@ void JuceRoomBrowserComponent::start_create_flow() {
                                     self->password_hash(password));
                     }
                     request.access_mode = access_mode;
+                    write_fixed(request.media_key_commitment,
+                                media_key_commitment);
 
                     try {
                         double rtt = 0.0;

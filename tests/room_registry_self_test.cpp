@@ -1,4 +1,5 @@
 #include "room_registry.h"
+#include "packet_builder.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,13 +17,37 @@ void require(bool condition, const char* message) {
     }
 }
 
+std::string commitment(char digit) {
+    return std::string(MEDIA_KEY_COMMITMENT_HEX_BYTES, digit);
+}
+
+template <size_t N>
+std::string fixed_string(const Bytes<N>& bytes) {
+    const auto end = std::find(bytes.begin(), bytes.end(), '\0');
+    return std::string(bytes.begin(), end);
+}
+
+void test_media_key_commitment_control_serialization() {
+    const auto expected = commitment('a');
+
+    RoomCreateRequestHdr create{};
+    packet_builder::write_fixed(create.media_key_commitment, expected);
+    require(fixed_string(create.media_key_commitment) == expected,
+            "room create must preserve the complete 64-character key commitment");
+
+    RoomAdminRequestHdr admin{};
+    packet_builder::write_fixed(admin.media_key_commitment, expected);
+    require(fixed_string(admin.media_key_commitment) == expected,
+            "room admin must preserve the complete 64-character key commitment");
+}
+
 void test_create_join_and_password_change() {
     room_registry::RoomRegistry registry;
     const auto now = std::chrono::steady_clock::now();
 
     const auto created =
         registry.create_room("room-a", "Room A", "hash-a",
-                             ROOM_ACCESS_PASSWORD, now);
+                             ROOM_ACCESS_PASSWORD, commitment('a'), now);
     require(created.ok, "room should be created");
     require(created.created, "create result should mark new room");
     require(!created.admin_token.empty(), "admin token should be returned");
@@ -38,7 +63,8 @@ void test_create_join_and_password_change() {
     require(joined.ok, "matching password hash should authorize");
 
     const auto changed =
-        registry.change_password("room-a", created.admin_token, "hash-b", now);
+        registry.change_password("room-a", created.admin_token, "hash-b",
+                                 commitment('b'), now);
     require(changed.ok, "admin should change password");
     require(changed.room.access_epoch == 2, "password change should bump epoch");
 
@@ -50,23 +76,30 @@ void test_create_join_and_password_change() {
 
     const auto old_claims =
         registry.validate_claims("room-a", joined.room.room_instance_id,
-                                 joined.room.access_epoch, now);
+                                 joined.room.access_epoch, commitment('a'), now);
     require(!old_claims.ok, "old access epoch should reject");
 
     const auto current_claims =
         registry.validate_claims("room-a", changed.room.room_instance_id,
-                                 changed.room.access_epoch, now);
+                                 changed.room.access_epoch, commitment('b'), now);
     require(current_claims.ok, "current access epoch should validate");
 
     const auto rotated =
-        registry.rotate_access_epoch("room-a", created.admin_token, now);
+        registry.rotate_access_epoch("room-a", created.admin_token,
+                                     commitment('c'), now);
     require(rotated.ok, "admin should rotate access epoch");
     require(rotated.room.access_epoch == 3, "manual epoch rotation should bump epoch");
 
     const auto stale_after_rotation =
         registry.validate_claims("room-a", changed.room.room_instance_id,
-                                 changed.room.access_epoch, now);
+                                 changed.room.access_epoch, commitment('b'), now);
     require(!stale_after_rotation.ok, "rotated access epoch should reject old claims");
+
+    const auto wrong_commitment =
+        registry.validate_claims("room-a", rotated.room.room_instance_id,
+                                 rotated.room.access_epoch, commitment('d'), now);
+    require(!wrong_commitment.ok,
+            "current epoch with an unauthorized key commitment should reject");
 }
 
 void test_open_and_approve_ignore_password() {
@@ -75,7 +108,7 @@ void test_open_and_approve_ignore_password() {
 
     const auto open =
         registry.create_room("open-room", "Open Room", "ignored",
-                             ROOM_ACCESS_OPEN, now);
+                             ROOM_ACCESS_OPEN, commitment('1'), now);
     require(open.ok, "open room should be created");
     require(!open.room.locked, "open room should not be locked");
     require(open.room.access_mode == ROOM_ACCESS_OPEN,
@@ -85,7 +118,7 @@ void test_open_and_approve_ignore_password() {
 
     const auto approve =
         registry.create_room("approve-room", "Approve Room", "ignored",
-                             ROOM_ACCESS_APPROVE, now);
+                             ROOM_ACCESS_APPROVE, commitment('2'), now);
     require(approve.ok, "approve room should be created");
     require(!approve.room.locked, "approve room should not be password locked");
     require(approve.room.access_mode == ROOM_ACCESS_APPROVE,
@@ -98,7 +131,7 @@ void test_empty_rooms_disappear() {
     room_registry::RoomRegistry registry;
     const auto now = std::chrono::steady_clock::now();
 
-    registry.ensure_open_room("jam-room", now);
+    registry.ensure_open_room("jam-room", commitment('3'), now);
     std::unordered_map<std::string, size_t> counts{{"jam-room", 1}};
     require(registry.list_rooms(counts).size() == 1, "room should be listed while occupied");
 
@@ -124,7 +157,8 @@ void test_chat_ring_buffer_and_history() {
     room_registry::RoomRegistry registry;
     const auto now = std::chrono::steady_clock::now();
     const auto created =
-        registry.create_room("chat-room", "Chat Room", "", ROOM_ACCESS_OPEN, now);
+        registry.create_room("chat-room", "Chat Room", "", ROOM_ACCESS_OPEN,
+                             commitment('4'), now);
     require(created.ok, "chat room should be created");
 
     for (int i = 1; i <= 12; ++i) {
@@ -174,6 +208,7 @@ void test_chat_ring_buffer_and_history() {
 }  // namespace
 
 int main() {
+    test_media_key_commitment_control_serialization();
     test_create_join_and_password_change();
     test_open_and_approve_ignore_password();
     test_empty_rooms_disappear();

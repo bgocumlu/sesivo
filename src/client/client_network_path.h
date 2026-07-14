@@ -6,9 +6,9 @@
 namespace client_network_path {
 
 inline constexpr uint32_t PING_FEEDBACK_MIN_REPLIES = 8;
-inline constexpr uint32_t PING_TIMEOUT_PROMOTE_REPLIES = 10;
+inline constexpr uint32_t PING_TIMEOUT_PROMOTE_REPLIES = 4;
 inline constexpr double HIGH_RTT_MS = 250.0;
-inline constexpr auto UDP_REBIND_COOLDOWN = std::chrono::seconds(15);
+inline constexpr auto UDP_REBIND_COOLDOWN = std::chrono::seconds(3);
 
 double gap_rate(uint32_t received_packets, uint32_t missing_packets);
 double net_gap_rate(uint32_t received_packets, uint32_t sequence_gaps,

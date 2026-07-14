@@ -149,6 +149,13 @@ public:
         return actual_bitrate;
     }
 
+    bool set_bitrate(int bitrate) {
+        if (encoder_ == nullptr || bitrate <= 0) {
+            return false;
+        }
+        return opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(bitrate)) == OPUS_OK;
+    }
+
     static bool is_legal_frame_size(int sample_rate, int frame_size) {
         // Opus accepts 2.5, 5, 10, 20, 40, or 60 ms frames.
         constexpr int durations_per_400_ms[] = {1, 2, 4, 8, 16, 24};

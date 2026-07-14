@@ -1,18 +1,21 @@
 #pragma once
 
-#include <algorithm>
-
 #include "opus_network_clock.h"
 
-// The audio callback's fixed buffers (wav_buffer, opus_input, PLC output) hold
-// at most one 960-frame (20 ms @ 48 kHz) block. A driver can negotiate a larger
-// actual buffer than the UI ever offers; frames beyond 960 cannot be processed
-// safely and are left as already-zeroed silence.
-inline unsigned long audio_callback_process_frame_count(unsigned long device_frame_count) {
-    return std::min<unsigned long>(device_frame_count,
-                                   opus_network_clock::STABLE_FRAME_COUNT);
-}
-
-inline bool audio_callback_frames_clamped(unsigned long device_frame_count) {
-    return device_frame_count > opus_network_clock::STABLE_FRAME_COUNT;
+// Runtime scratch buffers are sized for one maximum Opus frame. Device callbacks
+// may be larger, so dispatch the complete callback as contiguous bounded chunks.
+// The caller owns the buffers and advances channel-interleaved pointers by the
+// reported offset; this helper performs no allocation or synchronization.
+template <typename Callback>
+inline void for_each_audio_callback_chunk(unsigned long device_frame_count,
+                                          Callback&& callback) {
+    constexpr auto max_chunk_frames =
+        static_cast<unsigned long>(opus_network_clock::STABLE_FRAME_COUNT);
+    unsigned long offset = 0;
+    while (offset < device_frame_count) {
+        const auto remaining = device_frame_count - offset;
+        const auto chunk_frames = remaining < max_chunk_frames ? remaining : max_chunk_frames;
+        callback(offset, chunk_frames);
+        offset += chunk_frames;
+    }
 }

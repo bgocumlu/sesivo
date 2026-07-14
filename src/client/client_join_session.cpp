@@ -3,6 +3,7 @@
 #include "packet_builder.h"
 #include "performer_join_token.h"
 
+#include <stdexcept>
 #include <utility>
 
 namespace {
@@ -19,6 +20,7 @@ void apply_unverified_token_claims(PerformerJoinOptions& options) {
     if (parsed->claims.room_id == options.room_id) {
         options.room_instance_id = parsed->claims.room_instance_id;
         options.access_epoch = parsed->claims.access_epoch;
+        options.media_key_commitment = parsed->claims.media_key_commitment;
     }
 }
 
@@ -52,6 +54,10 @@ const std::string& ClientJoinSession::media_secret() const {
     return options_.media_secret;
 }
 
+const std::string& ClientJoinSession::media_key_commitment() const {
+    return options_.media_key_commitment;
+}
+
 uint32_t ClientJoinSession::access_epoch() const {
     return options_.access_epoch;
 }
@@ -72,6 +78,11 @@ void ClientJoinSession::configure(PerformerJoinOptions options) {
 
 void ClientJoinSession::set_media_secret(std::string media_secret) {
     options_.media_secret = std::move(media_secret);
+}
+
+void ClientJoinSession::set_media_key_commitment(
+    std::string media_key_commitment) {
+    options_.media_key_commitment = std::move(media_key_commitment);
 }
 
 void ClientJoinSession::set_access_epoch(uint32_t access_epoch) {
@@ -98,7 +109,10 @@ JoinHdr ClientJoinSession::make_join_header() const {
     packet_builder::write_fixed(join.room_handle, options_.room_handle);
     packet_builder::write_fixed(join.profile_id, options_.user_id);
     packet_builder::write_fixed(join.display_name, options_.display_name);
-    packet_builder::write_fixed(join.join_token, options_.join_token);
+    if (!packet_builder::write_fixed_checked(join.join_token,
+                                             options_.join_token)) {
+        throw std::invalid_argument("join token exceeds wire limit");
+    }
     join.capabilities = AUDIO_SUPPORTED_CAPABILITIES;
     join.key_public = options_.key_public;
     return join;

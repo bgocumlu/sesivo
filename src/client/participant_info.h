@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include "delivery_stall_policy.h"
 #include "opus_decoder.h"
+#include "pcm_delivery_outcomes.h"
 #include "protocol.h"  // For AUDIO_BUF_SIZE
 #include "sequence_tracker.h"
 
@@ -25,7 +27,10 @@ struct OpusPacket {
     uint32_t                              sequence = 0;
     bool                                  sequence_valid = false;
     bool                                  loss_concealment = false;
+    bool                                  receiver_drop_pending = false;
     bool                                  reset_decoder = false;
+    uint32_t                              abandoned_gap_packets = 0;
+    uint32_t                              abandoned_receiver_drop_packets = 0;
     uint32_t                              sample_rate = 48000;
     uint16_t                              frame_count = 0;
     uint8_t                               channels = 1;
@@ -59,9 +64,21 @@ public:
     }
 
     bool enqueue_bounded(const OpusPacket& packet, size_t max_packets) {
+        if (admission_closed_.load(std::memory_order_seq_cst)) {
+            return false;
+        }
+        active_enqueuers_.fetch_add(1, std::memory_order_seq_cst);
+        if (admission_closed_.load(std::memory_order_seq_cst)) {
+            active_enqueuers_.fetch_sub(1, std::memory_order_seq_cst);
+            return false;
+        }
+        const auto finish = [this](bool result) {
+            active_enqueuers_.fetch_sub(1, std::memory_order_seq_cst);
+            return result;
+        };
         const size_t limit = admission_limit(packet, max_packets);
         if (limit == 0) {
-            return false;
+            return finish(false);
         }
 
         size_t count = buffered_count_.load(std::memory_order_acquire);
@@ -71,17 +88,37 @@ public:
                     std::memory_order_acquire)) {
                 if (incoming_.enqueue(packet)) {
                     record_admitted_packet(packet);
-                    return true;
+                    return finish(true);
                 }
                 decrement_buffered_count();
-                return false;
+                return finish(false);
             }
         }
-        return false;
+        return finish(false);
     }
 
     bool enqueue_bounded_or_reject_overflow(const OpusPacket& packet, size_t max_packets) {
         return enqueue_bounded(packet, max_packets);
+    }
+
+    bool record_receiver_drop(const OpusPacket& packet) {
+        if (!packet.sequence_valid ||
+            receiver_drop_publications_closed_.load(std::memory_order_seq_cst)) {
+            return false;
+        }
+        active_receiver_drop_publishers_.fetch_add(1, std::memory_order_seq_cst);
+        if (receiver_drop_publications_closed_.load(std::memory_order_seq_cst) ||
+            already_played(packet.sequence)) {
+            active_receiver_drop_publishers_.fetch_sub(1, std::memory_order_seq_cst);
+            return false;
+        }
+        const bool recorded = receiver_dropped_ranges_.record(packet.sequence);
+        active_receiver_drop_publishers_.fetch_sub(1, std::memory_order_seq_cst);
+        return recorded;
+    }
+
+    uint64_t take_internal_receiver_drops() {
+        return internal_receiver_drops_.exchange(0, std::memory_order_acq_rel);
     }
 
     bool try_dequeue(OpusPacket& packet) {
@@ -120,16 +157,29 @@ public:
         return false;
     }
 
-    bool discard_oldest_actual_packet_for_latency_trim() {
+    bool discard_oldest_actual_packet_for_latency_trim(
+        bool* receiver_drop_ready = nullptr) {
         drain_incoming_for_playout();
+        ReceiverDropPublicationGuard publication_guard(*this);
+        if (!publication_guard) {
+            return false;
+        }
         if (!unsequenced_.empty()) {
             unsequenced_.erase(unsequenced_.begin());
             decrement_buffered_count();
+            if (receiver_drop_ready != nullptr) {
+                *receiver_drop_ready = true;
+            }
             return true;
         }
         if (!sequenced_.empty()) {
             const size_t index = earliest_index_locked();
             const uint32_t sequence = sequenced_[index].sequence;
+            bool recorded = !playout_initialized_ || sequence == next_playout_sequence_;
+            const bool ready = recorded;
+            if (!recorded) {
+                recorded = receiver_dropped_ranges_.record(sequence);
+            }
             erase_sequenced_at(index);
             decrement_buffered_count();
             if (playout_initialized_ && sequence == next_playout_sequence_) {
@@ -137,9 +187,36 @@ public:
                 reset_gap_wait();
                 publish_playout_sequence();
             }
+            if (receiver_drop_ready != nullptr) {
+                *receiver_drop_ready = ready;
+            }
             return true;
         }
         return false;
+    }
+
+    size_t discard_all_for_local_mute() {
+        drain_incoming_for_playout();
+        ReceiverDropPublicationGuard publication_guard(*this);
+        if (!publication_guard) {
+            return 0;
+        }
+        const size_t discarded = unsequenced_.size() + sequenced_.size();
+        unsequenced_.clear();
+        sequenced_.clear();
+        for (size_t i = 0; i < discarded; ++i) {
+            decrement_buffered_count();
+        }
+        playout_initialized_ = false;
+        next_playout_sequence_ = 0;
+        reset_gap_wait();
+        gap_loss_run_active_ = false;
+        gap_loss_run_packets_ = 0;
+        receiver_dropped_ranges_.clear();
+        internal_receiver_drops_.store(0, std::memory_order_release);
+        playout_initialized_snapshot_.store(false, std::memory_order_release);
+        next_playout_sequence_snapshot_.store(0, std::memory_order_release);
+        return discarded;
     }
 
     size_t size_approx() const {
@@ -147,6 +224,12 @@ public:
     }
 
     void clear() {
+        admission_closed_.store(true, std::memory_order_seq_cst);
+        receiver_drop_publications_closed_.store(true, std::memory_order_seq_cst);
+        while (active_enqueuers_.load(std::memory_order_seq_cst) != 0 ||
+               active_receiver_drop_publishers_.load(std::memory_order_seq_cst) != 0) {
+            std::this_thread::yield();
+        }
         OpusPacket packet{};
         while (incoming_.try_dequeue(packet)) {
         }
@@ -158,15 +241,52 @@ public:
         reset_gap_wait();
         gap_loss_run_active_ = false;
         gap_loss_run_packets_ = 0;
+        receiver_dropped_ranges_.clear();
+        internal_receiver_drops_.store(0, std::memory_order_release);
         admission_tracker_ = SequenceArrivalTracker{};
         playout_initialized_snapshot_.store(false, std::memory_order_release);
         next_playout_sequence_snapshot_.store(0, std::memory_order_release);
+        receiver_drop_publications_closed_.store(false, std::memory_order_seq_cst);
+        admission_closed_.store(false, std::memory_order_seq_cst);
     }
 
 private:
     static bool sequence_before(uint32_t lhs, uint32_t rhs) {
         return sequence_number_before(lhs, rhs);
     }
+
+    bool try_close_receiver_drop_publications() {
+        receiver_drop_publications_closed_.store(true, std::memory_order_seq_cst);
+        if (active_receiver_drop_publishers_.load(std::memory_order_seq_cst) != 0) {
+            receiver_drop_publications_closed_.store(false, std::memory_order_seq_cst);
+            return false;
+        }
+        return true;
+    }
+
+    void reopen_receiver_drop_publications() {
+        receiver_drop_publications_closed_.store(false, std::memory_order_seq_cst);
+    }
+
+    class ReceiverDropPublicationGuard {
+    public:
+        explicit ReceiverDropPublicationGuard(ParticipantOpusPacketQueue& owner)
+            : owner_(owner), acquired_(owner_.try_close_receiver_drop_publications()) {}
+
+        ~ReceiverDropPublicationGuard() {
+            if (acquired_) {
+                owner_.reopen_receiver_drop_publications();
+            }
+        }
+
+        explicit operator bool() const {
+            return acquired_;
+        }
+
+    private:
+        ParticipantOpusPacketQueue& owner_;
+        bool acquired_ = false;
+    };
 
     void drain_incoming_for_playout() {
         OpusPacket packet{};
@@ -175,6 +295,7 @@ private:
             ++drained;
             if (!packet.sequence_valid) {
                 if (unsequenced_.size() >= MAX_OPUS_QUEUE_SIZE) {
+                    internal_receiver_drops_.fetch_add(1, std::memory_order_relaxed);
                     decrement_buffered_count();
                     continue;
                 }
@@ -196,7 +317,10 @@ private:
             if (sequenced_.size() >= MAX_OPUS_QUEUE_SIZE) {
                 const size_t latest = latest_index_locked();
                 if (sequence_before(packet.sequence, sequenced_[latest].sequence)) {
+                    record_internal_receiver_drop(sequenced_[latest]);
                     sequenced_[latest] = packet;
+                } else {
+                    record_internal_receiver_drop(packet);
                 }
                 decrement_buffered_count();
                 continue;
@@ -211,6 +335,11 @@ private:
         if (sequenced_.empty()) {
             reset_gap_wait();
             return ParticipantOpusDequeueStatus::Empty;
+        }
+
+        ReceiverDropPublicationGuard publication_guard(*this);
+        if (!publication_guard) {
+            return ParticipantOpusDequeueStatus::WaitingForGap;
         }
 
         if (!playout_initialized_) {
@@ -229,6 +358,29 @@ private:
         const auto next_index = earliest_index_locked();
         const auto next_sequence = sequenced_[next_index].sequence;
         if (next_sequence != next_playout_sequence_) {
+            uint32_t skipped_receiver_drops = 0;
+            while (next_playout_sequence_ != next_sequence &&
+                   receiver_dropped_ranges_.consume(next_playout_sequence_)) {
+                ++next_playout_sequence_;
+                ++skipped_receiver_drops;
+            }
+            if (skipped_receiver_drops > 0) {
+                internal_receiver_drops_.fetch_add(
+                    skipped_receiver_drops, std::memory_order_relaxed);
+                publish_playout_sequence();
+                reset_gap_wait();
+                if (next_playout_sequence_ == next_sequence) {
+                    packet = sequenced_[next_index];
+                    packet.reset_decoder = true;
+                    next_playout_sequence_ = packet.sequence + 1;
+                    publish_playout_sequence();
+                    gap_loss_run_active_ = false;
+                    gap_loss_run_packets_ = 0;
+                    erase_sequenced_at(next_index);
+                    decrement_buffered_count();
+                    return ParticipantOpusDequeueStatus::Packet;
+                }
+            }
             if (should_wait_for_gap(gap_wait_packets, sequenced_.size())) {
                 return ParticipantOpusDequeueStatus::WaitingForGap;
             }
@@ -236,6 +388,13 @@ private:
                 gap_loss_run_packets_ >= MAX_OPUS_CONSECUTIVE_GAP_PLC_PACKETS) {
                 packet = sequenced_[next_index];
                 packet.reset_decoder = true;
+                const uint32_t abandoned =
+                    packet.sequence - next_playout_sequence_;
+                packet.abandoned_receiver_drop_packets =
+                    receiver_dropped_ranges_.consume_range(
+                        next_playout_sequence_, abandoned);
+                packet.abandoned_gap_packets =
+                    abandoned - packet.abandoned_receiver_drop_packets;
                 next_playout_sequence_ = packet.sequence + 1;
                 publish_playout_sequence();
                 gap_loss_run_active_ = false;
@@ -247,6 +406,8 @@ private:
             }
             packet = make_loss_concealment_packet(sequenced_[next_index],
                                                   next_playout_sequence_);
+            packet.receiver_drop_pending =
+                receiver_dropped_ranges_.consume(next_playout_sequence_);
             next_playout_sequence_ = packet.sequence + 1;
             publish_playout_sequence();
             gap_loss_run_active_ = true;
@@ -289,6 +450,21 @@ private:
         packet.channels = reference.channels;
         packet.timestamp = std::chrono::steady_clock::now();
         return packet;
+    }
+
+    void record_internal_receiver_drop(const OpusPacket& packet) {
+        if (!packet.sequence_valid) {
+            internal_receiver_drops_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            (void)record_receiver_drop(packet);
+        }
+    }
+
+    bool already_played(uint32_t sequence) const {
+        return playout_initialized_snapshot_.load(std::memory_order_acquire) &&
+               sequence_before(
+                   sequence,
+                   next_playout_sequence_snapshot_.load(std::memory_order_acquire));
     }
 
     size_t admission_limit(const OpusPacket& packet, size_t max_packets) const {
@@ -407,8 +583,128 @@ private:
 
     moodycamel::ConcurrentQueue<OpusPacket> incoming_;
     std::atomic<size_t> buffered_count_{0};
+    std::atomic<bool> admission_closed_{false};
+    std::atomic<uint32_t> active_enqueuers_{0};
+    std::atomic<bool> receiver_drop_publications_closed_{false};
+    std::atomic<uint32_t> active_receiver_drop_publishers_{0};
     std::vector<OpusPacket> unsequenced_;
     std::vector<OpusPacket> sequenced_;
+    class ReceiverDroppedRanges {
+    public:
+        bool record(uint32_t sequence) {
+            for (auto& slot: slots_) {
+                uint64_t packed = slot.load(std::memory_order_acquire);
+                while (packed != 0) {
+                    const uint32_t first = static_cast<uint32_t>(packed >> 32U);
+                    const uint32_t count = static_cast<uint32_t>(packed);
+                    const uint32_t offset = sequence - first;
+                    if (offset < count) {
+                        return true;
+                    }
+                    uint64_t replacement = 0;
+                    if (offset == count && count != UINT32_MAX) {
+                        replacement = pack(first, count + 1);
+                    } else if (first - sequence == 1 && count != UINT32_MAX) {
+                        replacement = pack(sequence, count + 1);
+                    } else {
+                        break;
+                    }
+                    if (slot.compare_exchange_weak(
+                            packed, replacement, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        return true;
+                    }
+                }
+            }
+            for (auto& slot: slots_) {
+                uint64_t empty = 0;
+                if (slot.compare_exchange_strong(
+                        empty, pack(sequence, 1), std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    return true;
+                }
+            }
+            slots_[sequence % slots_.size()].store(
+                pack(sequence, 1), std::memory_order_release);
+            return true;
+        }
+
+        bool consume(uint32_t sequence) {
+            for (auto& slot: slots_) {
+                uint64_t packed = slot.load(std::memory_order_acquire);
+                while (packed != 0) {
+                    const uint32_t first = static_cast<uint32_t>(packed >> 32U);
+                    const uint32_t count = static_cast<uint32_t>(packed);
+                    const uint32_t offset = sequence - first;
+                    if (offset >= count) {
+                        break;
+                    }
+                    uint64_t replacement = packed;
+                    if (count == 1) {
+                        replacement = 0;
+                    } else if (offset == 0) {
+                        replacement = pack(first + 1, count - 1);
+                    } else if (offset == count - 1) {
+                        replacement = pack(first, count - 1);
+                    } else {
+                        // A fixed slot cannot split into two ranges. Dropping the
+                        // rest is safe because none of its outcomes were reported;
+                        // those sequences will resolve as ordinary gaps instead.
+                        replacement = 0;
+                    }
+                    if (slot.compare_exchange_weak(
+                            packed, replacement, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        uint32_t consume_range(uint32_t first, uint32_t count) {
+            uint32_t consumed = 0;
+            for (auto& slot: slots_) {
+                uint64_t packed = slot.load(std::memory_order_acquire);
+                while (packed != 0) {
+                    const uint32_t range_first = static_cast<uint32_t>(packed >> 32U);
+                    const uint32_t range_count = static_cast<uint32_t>(packed);
+                    const uint32_t start = range_first - first;
+                    if (start >= count) {
+                        break;
+                    }
+                    const uint32_t overlap = std::min(range_count, count - start);
+                    const uint32_t remaining = range_count - overlap;
+                    const uint64_t replacement =
+                        remaining == 0
+                            ? 0
+                            : pack(range_first + overlap, remaining);
+                    if (slot.compare_exchange_weak(
+                            packed, replacement, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        consumed += overlap;
+                        break;
+                    }
+                }
+            }
+            return consumed;
+        }
+
+        void clear() {
+            for (auto& slot: slots_) {
+                slot.store(0, std::memory_order_release);
+            }
+        }
+
+    private:
+        static uint64_t pack(uint32_t first, uint32_t count) {
+            return (static_cast<uint64_t>(first) << 32U) | count;
+        }
+
+        static constexpr size_t MAX_RECEIVER_DROP_RANGES = 64;
+        std::array<std::atomic<uint64_t>, MAX_RECEIVER_DROP_RANGES> slots_{};
+    } receiver_dropped_ranges_;
+    std::atomic<uint64_t> internal_receiver_drops_{0};
     bool playout_initialized_ = false;
     uint32_t next_playout_sequence_ = 0;
     bool gap_wait_initialized_ = false;
@@ -421,12 +717,6 @@ private:
     std::atomic<uint32_t> next_playout_sequence_snapshot_{0};
 };
 
-struct OpusPcmCaptureChunk {
-    size_t frames = 0;
-    int64_t capture_server_time_ns = 0;
-    bool valid = false;
-};
-
 // Per-participant audio data and state
 struct ParticipantData {
     // Audio processing - store OPUS packets, decode in audio callback
@@ -435,9 +725,7 @@ struct ParticipantData {
     std::array<float, 960>                  pcm_buffer;  // Preallocated decode buffer
     std::array<float, 1920>                 opus_pcm_buffer{};
     size_t                                  opus_pcm_buffered_frames = 0;
-    std::array<OpusPcmCaptureChunk, MAX_OPUS_QUEUE_SIZE> opus_pcm_capture_chunks{};
-    size_t                                  opus_pcm_capture_chunk_head = 0;
-    size_t                                  opus_pcm_capture_chunk_count = 0;
+    PcmDeliveryOutcomes                     opus_pcm_outcomes;
     double                                  opus_resample_phase = 0.0;
     uint64_t                                opus_rate_last_queue_limit_drops = 0;
     std::chrono::steady_clock::time_point   opus_rate_correction_deadline{};
@@ -449,6 +737,8 @@ struct ParticipantData {
     std::atomic<uint64_t>                   opus_age_limit_drops{0};
     std::atomic<uint64_t>                   opus_decode_buffer_overflow_drops{0};
     std::atomic<uint64_t>                   opus_target_trim_drops{0};
+    std::atomic<uint64_t>                   receiver_delivery_delivered{0};
+    std::atomic<uint64_t>                   receiver_delivery_drops{0};
     std::atomic<size_t>                     last_packet_frame_count{0};
     std::atomic<size_t>                     last_callback_frame_count{0};
     // Participant state
@@ -499,6 +789,7 @@ struct ParticipantData {
     std::atomic<uint64_t>   sequence_gaps{0};
     std::atomic<uint64_t>   sequence_gap_recoveries{0};
     std::atomic<uint64_t>   sequence_unresolved_gaps{0};
+    std::atomic<uint64_t>   sequence_gaps_declared_lost{0};
     std::atomic<uint64_t>   sequence_late_or_reordered{0};
     std::atomic<uint64_t>   jitter_depth_drops{0};
     std::atomic<uint64_t>   jitter_age_drops{0};

@@ -1,12 +1,19 @@
 #pragma once
 
+#include <atomic>
+#include <array>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace server_metrics {
@@ -32,6 +39,10 @@ struct DropCounters {
     uint64_t rate_limited_audio_total = 0;
     uint64_t sfu_send_cap_interval = 0;
     uint64_t sfu_send_cap_total = 0;
+    uint64_t sfu_pool_interval = 0;
+    uint64_t sfu_pool_total = 0;
+    uint64_t expired_media_interval = 0;
+    uint64_t expired_media_total = 0;
 };
 
 struct IngressMetric {
@@ -41,10 +52,10 @@ struct IngressMetric {
     uint16_t last_frame_count = 0;
 };
 
-struct ForwardMetric {
-    uint32_t sender_id = 0;
-    uint32_t target_id = 0;
-    TrafficCounters audio;
+struct LatencyHistogram {
+    std::array<uint64_t, 9> counts{};
+    uint64_t samples = 0;
+    uint64_t maximum_us = 0;
 };
 
 struct PingMetric {
@@ -56,18 +67,35 @@ struct PingMetric {
 };
 
 struct Snapshot {
-    std::string schema = "jam_server_metrics_v1";
+    std::string schema = "jam_server_metrics_v2";
     std::string server_id;
     int64_t timestamp_unix_ms = 0;
     int64_t uptime_ms = 0;
     uint64_t connected_clients = 0;
     uint64_t unknown_endpoint_count = 0;
     uint64_t token_nonce_count = 0;
+    uint64_t metrics_export_drops_total = 0;
+    uint64_t metrics_export_failures_total = 0;
     DropCounters drops;
+    LatencyHistogram receive_handler_us;
+    LatencyHistogram relay_dwell_us;
     std::vector<IngressMetric> ingress;
-    std::vector<ForwardMetric> forwards;
     std::vector<PingMetric> pings;
 };
+
+inline void append_latency_histogram(std::ostringstream& out,
+                                     const LatencyHistogram& histogram) {
+    out << "{\"upper_bounds_us\":[50,100,250,500,1000,2500,5000,10000,null],"
+        << "\"counts\":[";
+    for (size_t i = 0; i < histogram.counts.size(); ++i) {
+        if (i != 0) {
+            out << ',';
+        }
+        out << histogram.counts[i];
+    }
+    out << "],\"samples\":" << histogram.samples
+        << ",\"maximum_us\":" << histogram.maximum_us << '}';
+}
 
 inline void append_json_string(std::ostringstream& out, std::string_view value) {
     static constexpr char HEX[] = "0123456789abcdef";
@@ -138,7 +166,10 @@ inline std::string to_json_line(const Snapshot& snapshot) {
         << ",\"uptime_ms\":" << snapshot.uptime_ms
         << ",\"connected_clients\":" << snapshot.connected_clients
         << ",\"unknown_endpoint_count\":" << snapshot.unknown_endpoint_count
-        << ",\"token_nonce_count\":" << snapshot.token_nonce_count;
+        << ",\"token_nonce_count\":" << snapshot.token_nonce_count
+        << ",\"metrics_export_drops_total\":" << snapshot.metrics_export_drops_total
+        << ",\"metrics_export_failures_total\":"
+        << snapshot.metrics_export_failures_total;
 
     out << ",\"drops\":{\"unknown_audio_interval\":"
         << snapshot.drops.unknown_audio_interval
@@ -150,7 +181,16 @@ inline std::string to_json_line(const Snapshot& snapshot) {
         << ",\"rate_limited_audio_total\":"
         << snapshot.drops.rate_limited_audio_total
         << ",\"sfu_send_cap_interval\":" << snapshot.drops.sfu_send_cap_interval
-        << ",\"sfu_send_cap_total\":" << snapshot.drops.sfu_send_cap_total << '}';
+        << ",\"sfu_send_cap_total\":" << snapshot.drops.sfu_send_cap_total
+        << ",\"sfu_pool_interval\":" << snapshot.drops.sfu_pool_interval
+        << ",\"sfu_pool_total\":" << snapshot.drops.sfu_pool_total
+        << ",\"expired_media_interval\":" << snapshot.drops.expired_media_interval
+        << ",\"expired_media_total\":" << snapshot.drops.expired_media_total << '}';
+
+    out << ",\"receive_handler_us\":";
+    append_latency_histogram(out, snapshot.receive_handler_us);
+    out << ",\"relay_dwell_us\":";
+    append_latency_histogram(out, snapshot.relay_dwell_us);
 
     out << ",\"ingress\":[";
     for (size_t i = 0; i < snapshot.ingress.size(); ++i) {
@@ -162,19 +202,6 @@ inline std::string to_json_line(const Snapshot& snapshot) {
         append_json_string(out, metric.endpoint);
         out << ",\"last_frame_count\":" << metric.last_frame_count << ",\"audio\":";
         append_counter_set(out, metric.audio, "received_interval", "received_total");
-        out << '}';
-    }
-    out << ']';
-
-    out << ",\"forwards\":[";
-    for (size_t i = 0; i < snapshot.forwards.size(); ++i) {
-        const auto& metric = snapshot.forwards[i];
-        if (i > 0) {
-            out << ',';
-        }
-        out << "{\"sender_id\":" << metric.sender_id
-            << ",\"target_id\":" << metric.target_id << ",\"audio\":";
-        append_counter_set(out, metric.audio, "forwarded_interval", "forwarded_total");
         out << '}';
     }
     out << ']';
@@ -248,6 +275,142 @@ public:
 
 private:
     std::filesystem::path path_;
+};
+
+class AsyncJsonlExporter {
+public:
+    using Writer = std::function<bool(const Snapshot&, std::string*)>;
+    static constexpr std::size_t MAX_QUEUED_SNAPSHOTS = 2;
+
+    AsyncJsonlExporter() = default;
+
+    explicit AsyncJsonlExporter(std::filesystem::path path)
+        : path_(std::move(path)) {
+        if (!path_.empty()) {
+            const JsonlExporter exporter(path_);
+            writer_ = [exporter](const Snapshot& snapshot, std::string* error) {
+                return exporter.write(snapshot, error);
+            };
+            start_worker();
+        }
+    }
+
+    explicit AsyncJsonlExporter(Writer writer)
+        : writer_(std::move(writer)) {
+        if (writer_) {
+            start_worker();
+        }
+    }
+
+    AsyncJsonlExporter(const AsyncJsonlExporter&) = delete;
+    AsyncJsonlExporter& operator=(const AsyncJsonlExporter&) = delete;
+
+    ~AsyncJsonlExporter() {
+        stop();
+    }
+
+    bool enabled() const {
+        return static_cast<bool>(writer_);
+    }
+
+    const std::filesystem::path& path() const {
+        return path_;
+    }
+
+    // The media/event-loop producer never waits for the exporter thread. If the
+    // queue lock is briefly contended or both slots are occupied, discard stale
+    // telemetry and preserve media progress.
+    bool enqueue(Snapshot snapshot) {
+        if (!enabled()) {
+            return true;
+        }
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            dropped_snapshots_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        bool dropped = false;
+        if (queue_.size() >= MAX_QUEUED_SNAPSHOTS) {
+            queue_.pop_front();
+            dropped_snapshots_.fetch_add(1, std::memory_order_relaxed);
+            dropped = true;
+        }
+        queue_.push_back(std::move(snapshot));
+        lock.unlock();
+        work_ready_.notify_one();
+        return !dropped;
+    }
+
+    uint64_t dropped_snapshots() const {
+        return dropped_snapshots_.load(std::memory_order_relaxed);
+    }
+
+    uint64_t failed_writes() const {
+        return failed_writes_.load(std::memory_order_relaxed);
+    }
+
+    bool wait_for_idle(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return idle_.wait_for(lock, timeout,
+                              [this]() { return queue_.empty() && !write_active_; });
+    }
+
+private:
+    void start_worker() {
+        worker_ = std::thread([this]() { run(); });
+    }
+
+    void stop() {
+        if (!worker_.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        work_ready_.notify_one();
+        worker_.join();
+    }
+
+    void run() {
+        for (;;) {
+            Snapshot snapshot;
+            {
+                std::unique_lock lock(mutex_);
+                work_ready_.wait(lock, [this]() { return stopping_ || !queue_.empty(); });
+                if (stopping_ && queue_.empty()) {
+                    return;
+                }
+                snapshot = std::move(queue_.front());
+                queue_.pop_front();
+                write_active_ = true;
+            }
+
+            std::string error;
+            if (!writer_(snapshot, &error)) {
+                failed_writes_.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            {
+                std::lock_guard lock(mutex_);
+                write_active_ = false;
+            }
+            idle_.notify_all();
+        }
+    }
+
+    std::filesystem::path path_;
+    Writer writer_;
+    std::mutex mutex_;
+    std::condition_variable work_ready_;
+    std::condition_variable idle_;
+    std::deque<Snapshot> queue_;
+    std::thread worker_;
+    bool stopping_ = false;
+    bool write_active_ = false;
+    std::atomic<uint64_t> dropped_snapshots_{0};
+    std::atomic<uint64_t> failed_writes_{0};
 };
 
 }  // namespace server_metrics

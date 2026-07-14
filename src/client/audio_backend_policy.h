@@ -2,6 +2,7 @@
 
 #include "audio_backend.h"
 
+#include <algorithm>
 #include <limits>
 #include <string>
 #include <vector>
@@ -13,6 +14,35 @@ enum class Platform {
     macos,
     linux_os,
 };
+
+struct InputChannelPlan {
+    int opened_channel_count = 1;
+    int selected_device_channel = 0;
+    int callback_channel = 0;
+    bool preserve_native_layout = false;
+};
+
+inline bool requires_native_input_layout(const std::string& api_name) {
+    return api_name == "Windows Audio" ||
+           api_name == "Windows Audio (Low Latency Mode)" ||
+           api_name == "Windows Audio (Exclusive Mode)" ||
+           api_name.find("WASAPI") != std::string::npos;
+}
+
+inline InputChannelPlan plan_input_channels(const std::string& api_name,
+                                            int available_channel_count,
+                                            int requested_channel) {
+    const int device_channel_count = std::max(available_channel_count, 1);
+    const int selected_device_channel =
+        std::clamp(requested_channel, 0, device_channel_count - 1);
+    const bool preserve_native_layout = requires_native_input_layout(api_name);
+    return {
+        preserve_native_layout ? device_channel_count : 1,
+        selected_device_channel,
+        preserve_native_layout ? selected_device_channel : 0,
+        preserve_native_layout,
+    };
+}
 
 inline int rank_api_for_platform(Platform platform, const std::string& api_name) {
     switch (platform) {
@@ -56,6 +86,29 @@ inline int rank_api_for_platform(const std::string& api_name) {
     return rank_api_for_platform(Platform::macos, api_name);
 #else
     return rank_api_for_platform(Platform::linux_os, api_name);
+#endif
+}
+
+inline bool is_latency_certified_api_for_platform(Platform platform,
+                                                   const std::string& api_name) {
+    switch (platform) {
+    case Platform::windows:
+        return api_name == "ASIO";
+    case Platform::macos:
+        return api_name == "CoreAudio";
+    case Platform::linux_os:
+        return api_name == "JACK";
+    }
+    return false;
+}
+
+inline bool is_latency_certified_api(const std::string& api_name) {
+#if defined(_WIN32)
+    return is_latency_certified_api_for_platform(Platform::windows, api_name);
+#elif defined(__APPLE__)
+    return is_latency_certified_api_for_platform(Platform::macos, api_name);
+#else
+    return is_latency_certified_api_for_platform(Platform::linux_os, api_name);
 #endif
 }
 

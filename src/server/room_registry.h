@@ -31,6 +31,7 @@ struct RoomSnapshot {
     bool locked = false;
     uint8_t access_mode = ROOM_ACCESS_OPEN;
     uint32_t access_epoch = 1;
+    std::string media_key_commitment;
 };
 
 struct RoomListEntry : RoomSnapshot {
@@ -102,7 +103,7 @@ class RoomRegistry {
 public:
     CreateResult create_room(std::string room_id, std::string room_name,
                              std::string password_hash, uint8_t access_mode,
-                             time_point now) {
+                             std::string media_key_commitment, time_point now) {
         CreateResult result;
         if (!valid_room_id(room_id)) {
             result.reason = "invalid room id";
@@ -123,6 +124,10 @@ public:
             result.reason = "invalid access mode";
             return result;
         }
+        if (!performer_join_token::valid_sha256_hex(media_key_commitment)) {
+            result.reason = "invalid media key commitment";
+            return result;
+        }
         if (access_mode != ROOM_ACCESS_PASSWORD) {
             password_hash.clear();
         } else if (password_hash.empty()) {
@@ -137,6 +142,7 @@ public:
         room.room_instance_id = performer_join_token::random_nonce();
         room.password_hash = std::move(password_hash);
         room.access_mode = access_mode;
+        room.media_key_commitment = std::move(media_key_commitment);
         auto admin_token_hash = sha256_hex(admin_token);
         if (!admin_token_hash.has_value()) {
             result.reason = "crypto unavailable";
@@ -153,9 +159,14 @@ public:
         return result;
     }
 
-    RoomSnapshot ensure_open_room(const std::string& room_id, time_point now) {
+    RoomSnapshot ensure_open_room(const std::string& room_id,
+                                  const std::string& media_key_commitment,
+                                  time_point now) {
         auto it = rooms_.find(room_id);
         if (it != rooms_.end()) {
+            if (it->second.media_key_commitment != media_key_commitment) {
+                return {};
+            }
             it->second.ever_joined = true;
             it->second.last_activity = now;
             return snapshot_for(it->second);
@@ -166,6 +177,10 @@ public:
         room.room_name = room_id;
         room.room_instance_id = performer_join_token::random_nonce();
         room.access_mode = ROOM_ACCESS_OPEN;
+        if (!performer_join_token::valid_sha256_hex(media_key_commitment)) {
+            return {};
+        }
+        room.media_key_commitment = media_key_commitment;
         room.created_at = now;
         room.last_activity = now;
         room.ever_joined = true;
@@ -196,6 +211,7 @@ public:
     AuthorizeResult validate_claims(const std::string& room_id,
                                     const std::string& room_instance_id,
                                     uint32_t access_epoch,
+                                    const std::string& media_key_commitment,
                                     time_point now) {
         AuthorizeResult result;
         auto it = rooms_.find(room_id);
@@ -212,6 +228,10 @@ public:
             result.reason = "wrong room access epoch";
             return result;
         }
+        if (it->second.media_key_commitment != media_key_commitment) {
+            result.reason = "wrong media key commitment";
+            return result;
+        }
         it->second.last_activity = now;
         result.ok = true;
         result.room = snapshot_for(it->second);
@@ -221,17 +241,20 @@ public:
     AuthorizeResult change_password(const std::string& room_id,
                                     const std::string& admin_token,
                                     std::string password_hash,
+                                    std::string media_key_commitment,
                                     time_point now) {
         const uint8_t access_mode =
             password_hash.empty() ? ROOM_ACCESS_OPEN : ROOM_ACCESS_PASSWORD;
         return change_access_mode(room_id, admin_token, access_mode,
-                                  std::move(password_hash), now);
+                                  std::move(password_hash),
+                                  std::move(media_key_commitment), now);
     }
 
     AuthorizeResult change_access_mode(const std::string& room_id,
                                        const std::string& admin_token,
                                        uint8_t access_mode,
                                        std::string password_hash,
+                                       std::string media_key_commitment,
                                        time_point now) {
         auto result = authorize_admin(room_id, admin_token, now);
         if (!result.ok) {
@@ -247,12 +270,18 @@ public:
             result.reason = "missing room password";
             return result;
         }
+        if (!performer_join_token::valid_sha256_hex(media_key_commitment)) {
+            result.ok = false;
+            result.reason = "invalid media key commitment";
+            return result;
+        }
         auto& room = rooms_.at(room_id);
         if (access_mode != ROOM_ACCESS_PASSWORD) {
             password_hash.clear();
         }
         room.password_hash = std::move(password_hash);
         room.access_mode = access_mode;
+        room.media_key_commitment = std::move(media_key_commitment);
         ++room.access_epoch;
         room.last_activity = now;
         result.room = snapshot_for(room);
@@ -261,12 +290,19 @@ public:
 
     AuthorizeResult rotate_access_epoch(const std::string& room_id,
                                         const std::string& admin_token,
+                                        std::string media_key_commitment,
                                         time_point now) {
         auto result = authorize_admin(room_id, admin_token, now);
         if (!result.ok) {
             return result;
         }
+        if (!performer_join_token::valid_sha256_hex(media_key_commitment)) {
+            result.ok = false;
+            result.reason = "invalid media key commitment";
+            return result;
+        }
         auto& room = rooms_.at(room_id);
+        room.media_key_commitment = std::move(media_key_commitment);
         ++room.access_epoch;
         room.last_activity = now;
         result.room = snapshot_for(room);
@@ -307,6 +343,17 @@ public:
         result.ok = true;
         result.room = snapshot_for(it->second);
         return result;
+    }
+
+    bool authorizes_media_key(const std::string& room_id,
+                              const std::string& room_instance_id,
+                              uint32_t access_epoch,
+                              const std::string& media_key_commitment) const {
+        const auto it = rooms_.find(room_id);
+        return it != rooms_.end() &&
+               it->second.room_instance_id == room_instance_id &&
+               it->second.access_epoch == access_epoch &&
+               it->second.media_key_commitment == media_key_commitment;
     }
 
     StoreChatResult store_chat_message(const std::string& room_id,
@@ -486,6 +533,7 @@ private:
         std::string room_instance_id;
         std::string password_hash;
         std::string admin_token_hash;
+        std::string media_key_commitment;
         uint8_t access_mode = ROOM_ACCESS_OPEN;
         uint32_t access_epoch = 1;
         bool ever_joined = false;
@@ -503,6 +551,7 @@ private:
             room.access_mode == ROOM_ACCESS_PASSWORD,
             room.access_mode,
             room.access_epoch,
+            room.media_key_commitment,
         };
     }
 

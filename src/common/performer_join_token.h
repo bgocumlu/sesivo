@@ -22,6 +22,7 @@ struct Claims {
     std::string profile_id;
     std::string room_instance_id;
     uint32_t    access_epoch = 0;
+    std::string media_key_commitment;
     std::string nonce;
 };
 
@@ -133,6 +134,19 @@ inline std::optional<std::vector<unsigned char>> try_sha256(
     return digest;
 }
 
+inline bool valid_sha256_hex(const std::string& value) {
+    return value.size() == crypto_hash_sha256_BYTES * 2 &&
+           std::all_of(value.begin(), value.end(), [](unsigned char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+inline std::optional<std::string> try_sha256_hex(const std::string& value) {
+    const std::vector<unsigned char> bytes(value.begin(), value.end());
+    const auto digest = try_sha256(bytes);
+    return digest.has_value() ? std::optional<std::string>{hex(*digest)} : std::nullopt;
+}
+
 inline std::optional<std::string> try_hmac_sha256_hex(const std::string& secret,
                                                       const std::string& message) {
     if (!ensure_sodium_initialized()) {
@@ -163,6 +177,7 @@ inline std::string claims_payload(const Claims& claims) {
     append_claim_field(payload, claims.profile_id);
     append_claim_field(payload, claims.room_instance_id);
     append_claim_field(payload, std::to_string(claims.access_epoch));
+    append_claim_field(payload, claims.media_key_commitment);
     append_claim_field(payload, claims.nonce);
     return payload;
 }
@@ -197,7 +212,7 @@ inline bool read_claim_field(const std::string& payload, size_t& offset,
 
 inline std::optional<Claims> claims_from_payload(const std::string& payload,
                                                  std::string& reason) {
-    std::array<std::string, 7> fields;
+    std::array<std::string, 8> fields;
     size_t offset = 0;
     for (auto& field: fields) {
         if (!read_claim_field(payload, offset, field)) {
@@ -232,12 +247,21 @@ inline std::optional<Claims> claims_from_payload(const std::string& payload,
         reason = "malformed access epoch";
         return std::nullopt;
     }
-    claims.nonce = fields[6];
+    if (claims.access_epoch == 0) {
+        reason = "malformed access epoch";
+        return std::nullopt;
+    }
+    claims.media_key_commitment = fields[6];
+    if (!valid_sha256_hex(claims.media_key_commitment)) {
+        reason = "malformed media key commitment";
+        return std::nullopt;
+    }
+    claims.nonce = fields[7];
     return claims;
 }
 
 inline std::string signing_message(const Claims& claims) {
-    return "v2|" + claims_payload(claims);
+    return "v3|" + claims_payload(claims);
 }
 
 inline std::string random_nonce() {
@@ -262,7 +286,10 @@ inline std::optional<std::string> create(const Claims& claims, const std::string
     if (!signature.has_value()) {
         return std::nullopt;
     }
-    return "v2." + base64url_encode(claims_payload(claims)) + "." + *signature;
+    if (!valid_sha256_hex(claims.media_key_commitment)) {
+        return std::nullopt;
+    }
+    return "v3." + base64url_encode(claims_payload(claims)) + "." + *signature;
 }
 
 inline std::vector<std::string> split(const std::string& value, char delimiter) {
@@ -289,7 +316,7 @@ inline bool constant_time_equal(const std::string& left, const std::string& righ
 inline std::optional<ValidatedToken> parse_unverified(const std::string& token,
                                                       std::string& reason) {
     const auto parts = split(token, '.');
-    if (parts.size() != 3 || parts[0] != "v2") {
+    if (parts.size() != 3 || parts[0] != "v3") {
         reason = "malformed token";
         return std::nullopt;
     }

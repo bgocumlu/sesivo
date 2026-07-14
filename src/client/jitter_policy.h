@@ -99,3 +99,29 @@ inline bool jitter_target_should_snap_to_floor(bool opus_manual_override,
     }
     return !buffer_ready && current_target_packets > floor_packets;
 }
+
+inline size_t opus_latency_trim_goal_packets(size_t current_queue_packets,
+                                             size_t target_packets,
+                                             size_t high_water_packets) {
+    return current_queue_packets > high_water_packets
+               ? std::min(target_packets, current_queue_packets)
+               : current_queue_packets;
+}
+
+inline constexpr double OPUS_PLAYOUT_QUEUE_DEADBAND_PACKETS = 0.25;
+inline constexpr double OPUS_PLAYOUT_QUEUE_GAIN = 0.005;
+inline constexpr double OPUS_PLAYOUT_MIN_RATIO = 0.995;
+inline constexpr double OPUS_PLAYOUT_MAX_RATIO = 1.005;
+
+inline double opus_playout_ratio_for_queue_depth(double buffered_packets,
+                                                 double target_packets) {
+    const double queue_error = buffered_packets - target_packets;
+    double correction_error = 0.0;
+    if (queue_error > OPUS_PLAYOUT_QUEUE_DEADBAND_PACKETS) {
+        correction_error = queue_error - OPUS_PLAYOUT_QUEUE_DEADBAND_PACKETS;
+    } else if (queue_error < -OPUS_PLAYOUT_QUEUE_DEADBAND_PACKETS) {
+        correction_error = queue_error + OPUS_PLAYOUT_QUEUE_DEADBAND_PACKETS;
+    }
+    return std::clamp(1.0 + (correction_error * OPUS_PLAYOUT_QUEUE_GAIN),
+                      OPUS_PLAYOUT_MIN_RATIO, OPUS_PLAYOUT_MAX_RATIO);
+}

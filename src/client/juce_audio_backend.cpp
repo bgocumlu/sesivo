@@ -1,5 +1,6 @@
 #include "juce_audio_backend.h"
 
+#include "audio_callback_policy.h"
 #include "audio_backend_policy.h"
 #include "juce_audio_adapter.h"
 
@@ -220,8 +221,11 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
     stop_audio_stream();
 
     AudioConfig runtime_config = config;
+    const auto input_channel_plan = audio_backend::plan_input_channels(
+        input_info.api_name, input_info.max_input_channels,
+        runtime_config.input_channel_index);
     runtime_config.input_channel_index =
-        std::clamp(runtime_config.input_channel_index, 0, input_info.max_input_channels - 1);
+        input_channel_plan.selected_device_channel;
     if (!sample_rate_is_supported_or_unknown(input_info.sample_rates,
                                              runtime_config.sample_rate)) {
         last_error_ = "Selected input device does not report support for required 48000 Hz";
@@ -238,11 +242,11 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
     callback_user_data_.store(user_data, std::memory_order_release);
     const auto input_device_name = device_name_for_id(input_device);
     const auto output_device_name = device_name_for_id(output_device);
-    const auto clamped_input_channel = runtime_config.input_channel_index;
-
     input_channel_count_.store(1, std::memory_order_release);
-    opened_input_channel_count_.store(1, std::memory_order_release);
-    selected_input_channel_.store(clamped_input_channel, std::memory_order_release);
+    opened_input_channel_count_.store(input_channel_plan.opened_channel_count,
+                                      std::memory_order_release);
+    selected_input_channel_.store(input_channel_plan.callback_channel,
+                                  std::memory_order_release);
     output_channel_count_.store(output_info.max_output_channels >= 2 ? 2 : 1,
                                 std::memory_order_release);
     actual_buffer_frames_.store(std::max(runtime_config.frames_per_buffer, 0),
@@ -258,7 +262,18 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
     setup.useDefaultOutputChannels = false;
     setup.inputChannels.clear();
     setup.outputChannels.clear();
-    setup.inputChannels.setBit(clamped_input_channel);
+    if (input_channel_plan.preserve_native_layout) {
+        // Some WASAPI headset drivers return corrupt samples when JUCE asks
+        // them to negotiate a one-channel stream from a stereo endpoint.
+        setup.inputChannels.setRange(0, input_channel_plan.opened_channel_count,
+                                     true);
+    } else {
+        // ASIO and the other native APIs can open only the requested physical
+        // channel. JUCE compresses enabled channels in callback order, so the
+        // selected callback channel is zero for this path.
+        setup.inputChannels.setBit(input_channel_plan.selected_device_channel,
+                                   true);
+    }
     setup.outputChannels.setRange(0, output_channel_count_.load(std::memory_order_acquire), true);
 
     device_manager_.setCurrentAudioDeviceType(type->getTypeName(), true);
@@ -393,9 +408,19 @@ void JuceAudioBackend::audioDeviceIOCallbackWithContext(
 
     const auto callback = callback_.load(std::memory_order_acquire);
     if (callback != nullptr) {
-        callback(interleaved_input_.data(), interleaved_output_.data(),
-                 static_cast<unsigned long>(frames_to_process),
-                 callback_user_data_.load(std::memory_order_acquire));
+        auto* const user_data = callback_user_data_.load(std::memory_order_acquire);
+        AudioCallbackWorkBudget work_budget;
+        for_each_audio_callback_chunk(
+            static_cast<unsigned long>(frames_to_process),
+            [&](unsigned long frame_offset, unsigned long chunk_frames) {
+                const auto input_offset = static_cast<std::size_t>(frame_offset) *
+                                          static_cast<std::size_t>(input_channels);
+                const auto output_offset = static_cast<std::size_t>(frame_offset) *
+                                           static_cast<std::size_t>(output_channels);
+                callback(interleaved_input_.data() + input_offset,
+                         interleaved_output_.data() + output_offset, chunk_frames,
+                         user_data, work_budget);
+            });
     }
 
     juce_audio_adapter::copy_interleaved_to_outputs(

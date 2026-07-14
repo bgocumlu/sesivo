@@ -81,20 +81,21 @@ if ($Seconds -gt 0) {
 
 $tokenScript = @'
 const crypto = require("node:crypto");
-const [user, room, serverId, secret, ttlSeconds] = process.argv.slice(1);
+const [user, room, serverId, secret, ttlSeconds, mediaSecret] = process.argv.slice(1);
 const expiresAtMs = Date.now() + Number(ttlSeconds) * 1000;
 function field(v) {
   const s = String(v);
   return `${Buffer.byteLength(s, "utf8")}:${s}`;
 }
-const payload = [expiresAtMs, serverId, room, user, "", "0", crypto.randomBytes(16).toString("hex")].map(field).join("");
+const commitment = crypto.createHash("sha256").update(mediaSecret).digest("hex");
+const payload = [expiresAtMs, serverId, room, user, "", "1", commitment, crypto.randomBytes(16).toString("hex")].map(field).join("");
 const body = Buffer.from(payload, "utf8").toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
-const sig = crypto.createHmac("sha256", secret).update(`v2|${payload}`).digest("hex");
-console.log(`v2.${body}.${sig}`);
+const sig = crypto.createHmac("sha256", secret).update(`v3|${payload}`).digest("hex");
+console.log(`v3.${body}.${sig}`);
 '@
 
 function New-JoinToken([string]$User) {
-  return node -e $tokenScript $User $Room $ServerId $JoinSecret $tokenTtlSeconds
+  return node -e $tokenScript $User $Room $ServerId $JoinSecret $tokenTtlSeconds $MediaSecret
 }
 
 $tokenA = New-JoinToken "soak-a"

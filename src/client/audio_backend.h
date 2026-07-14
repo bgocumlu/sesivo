@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -8,10 +9,23 @@ using AudioDeviceId = std::uint32_t;
 
 inline constexpr AudioDeviceId AUDIO_NO_DEVICE = 0;
 
+struct AudioCallbackWorkBudget {
+    std::size_t remaining_decodes = 256;
+};
+
+inline bool consume_audio_decode_budget(AudioCallbackWorkBudget& budget) {
+    if (budget.remaining_decodes == 0) {
+        return false;
+    }
+    --budget.remaining_decodes;
+    return true;
+}
+
 using AudioCallback = int (*)(const void* input,
                               void* output,
                               unsigned long frame_count,
-                              void* user_data);
+                              void* user_data,
+                              AudioCallbackWorkBudget& work_budget);
 
 struct AudioConfig {
     static constexpr int DEFAULT_SAMPLE_RATE = 48000;

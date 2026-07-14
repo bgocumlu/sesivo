@@ -15,7 +15,9 @@ constexpr uint32_t E2E_KEY_ENVELOPE_MAGIC = 0x4532454B;  // 'E2EK' sealed key ha
 
 // Buffer sizes
 constexpr size_t AUDIO_BUF_SIZE = 512;
-constexpr int UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
+// Enough for measured scheduling bursts without concealing multi-second stale
+// media behind oversized kernel queues.
+constexpr int UDP_SOCKET_BUFFER_BYTES = 512 * 1024;
 
 // One room limit shared by server admission, client mixing, and UI. The client
 // audio callback publishes at most this many participants; the server must
@@ -49,14 +51,20 @@ constexpr int    MAX_OPUS_REDUNDANCY_DEPTH_PACKETS =
 // Endpoint capabilities negotiated in extended JOIN/JOIN_ACK packets.
 constexpr uint32_t AUDIO_CAP_REDUNDANCY = 1U << 0;
 constexpr uint32_t AUDIO_CAP_SECURE_AUDIO = 1U << 2;
+constexpr uint32_t AUDIO_CAP_DELIVERY_REPORTS = 1U << 3;
 constexpr uint32_t AUDIO_SUPPORTED_CAPABILITIES =
-    AUDIO_CAP_REDUNDANCY | AUDIO_CAP_SECURE_AUDIO;
+    AUDIO_CAP_REDUNDANCY | AUDIO_CAP_SECURE_AUDIO | AUDIO_CAP_DELIVERY_REPORTS;
 
 // Secure audio packet envelope uses a 96-bit AEAD nonce and a 16-byte
 // ChaCha20-Poly1305 tag. The packet header is cleartext authenticated metadata.
 constexpr size_t SECURE_PACKET_NONCE_BYTES = 12;
 constexpr size_t SECURE_PACKET_TAG_BYTES = 16;
 constexpr size_t MEDIA_SECRET_MAX_BYTES = 128;
+constexpr size_t MEDIA_KEY_COMMITMENT_HEX_BYTES = 64;
+// v3 tickets with every server-controlled claim at its maximum are currently
+// under 576 bytes. Keep headroom without pushing JOIN/control datagrams near
+// the usual internet MTU.
+constexpr size_t JOIN_TOKEN_WIRE_BYTES = 640;
 constexpr size_t E2E_PUBLIC_KEY_BYTES = 32;
 constexpr size_t E2E_SECRET_KEY_BYTES = 32;
 constexpr size_t E2E_KEY_ENVELOPE_MAX_BYTES = 256;
@@ -107,6 +115,7 @@ struct CtrlHdr : MsgHdr {
         ROOM_CHAT_HISTORY_REQUEST = 23, // Client asks for retained chat tail
         ROOM_CHAT_HISTORY_RESPONSE = 24, // Server returns one retained chat message or done
         JOIN_DENIED = 25,
+        ROOM_KEY_HANDOFF_ACK = 26, // Recipient confirms an E2E room-key envelope
     } type;
     uint32_t participant_id = 0;  // Used for PARTICIPANT_LEAVE to identify which participant left
 };
@@ -116,7 +125,7 @@ struct JoinHdr : CtrlHdr {
     Bytes<64>  room_handle;
     Bytes<64>  profile_id;
     Bytes<64>  display_name;
-    Bytes<512> join_token;
+    Bytes<JOIN_TOKEN_WIRE_BYTES> join_token;
     uint32_t   capabilities = 0;
     Bytes<E2E_PUBLIC_KEY_BYTES> key_public;
 };
@@ -142,8 +151,10 @@ struct ParticipantInfoCapsHdr : ParticipantInfoHdr {
 struct E2EKeyEnvelopeHdr : MsgHdr {
     uint32_t sender_id = 0;
     uint32_t target_id = 0;
+    uint32_t access_epoch = 0;
     uint16_t encrypted_bytes = 0;
     uint16_t reserved = 0;
+    Bytes<MEDIA_KEY_COMMITMENT_HEX_BYTES> media_key_commitment;
     Bytes<E2E_KEY_ENVELOPE_MAX_BYTES> encrypted;
 };
 
@@ -198,14 +209,24 @@ struct SecureAudioHdr : MsgHdr {
 constexpr size_t SECURE_PACKET_HEADER_BYTES = sizeof(SecureAudioHdr);
 
 constexpr uint8_t SECURE_CONTROL_ROTATE_MEDIA_KEY = 1;
+constexpr uint8_t SECURE_CONTROL_AUDIO_DELIVERY_REPORT = 2;
 
 struct SecureControlHdr : MsgHdr {
     uint32_t sender_id = 0;       // Sender-owned JOIN_ACK participant id
+    uint32_t target_id = 0;       // Zero broadcasts; nonzero routes within sender's room
     uint32_t sequence = 0;        // Sender-local secure control sequence
+    uint32_t access_epoch = 0;    // Server-authorized room key epoch
     uint16_t plaintext_bytes = 0; // Sealed control payload bytes
     uint16_t encrypted_bytes = 0; // Ciphertext plus AEAD tag bytes
     uint16_t reserved = 0;
+    Bytes<MEDIA_KEY_COMMITMENT_HEX_BYTES> media_key_commitment;
     Bytes<SECURE_PACKET_NONCE_BYTES> nonce;
+};
+
+struct RoomKeyHandoffAckHdr : CtrlHdr {
+    uint32_t target_id = 0;
+    uint32_t access_epoch = 0;
+    Bytes<MEDIA_KEY_COMMITMENT_HEX_BYTES> media_key_commitment;
 };
 
 constexpr size_t SECURE_CONTROL_HEADER_BYTES = sizeof(SecureControlHdr);
@@ -232,6 +253,14 @@ struct AudioPathStatsHdr : CtrlHdr {
     uint32_t total_unrecovered_sequence_gaps = 0;
     uint16_t observed_frame_count = 0;
     uint16_t reserved = 0;
+};
+
+struct AudioDeliveryReportPayload {
+    uint8_t command = SECURE_CONTROL_AUDIO_DELIVERY_REPORT;
+    uint8_t reserved[3] = {};
+    uint32_t report_epoch = 0;
+    uint64_t total_delivered = 0;
+    uint64_t total_lost = 0;
 };
 
 constexpr uint8_t ROOM_FLAG_LOCKED = 1 << 0;
@@ -292,6 +321,7 @@ struct RoomCreateRequestHdr : CtrlHdr {
     Bytes<64> profile_id;
     Bytes<64> display_name;
     Bytes<128> password_hash;
+    Bytes<MEDIA_KEY_COMMITMENT_HEX_BYTES + 1> media_key_commitment;
     uint8_t  access_mode = ROOM_ACCESS_OPEN;
     uint8_t  reserved[3] = {};
 };
@@ -307,7 +337,7 @@ struct RoomCreateResponseHdr : CtrlHdr {
     Bytes<64> room_name;
     Bytes<64> room_instance_id;
     Bytes<128> admin_token;
-    Bytes<512> join_token;
+    Bytes<JOIN_TOKEN_WIRE_BYTES> join_token;
     Bytes<128> reason;
 };
 
@@ -329,7 +359,7 @@ struct RoomJoinTokenResponseHdr : CtrlHdr {
     Bytes<64> room_id;
     Bytes<64> room_name;
     Bytes<64> room_instance_id;
-    Bytes<512> join_token;
+    Bytes<JOIN_TOKEN_WIRE_BYTES> join_token;
     Bytes<128> reason;
 };
 
@@ -342,6 +372,7 @@ struct RoomAdminRequestHdr : CtrlHdr {
     Bytes<64> room_id;
     Bytes<128> admin_token;
     Bytes<128> password_hash;
+    Bytes<MEDIA_KEY_COMMITMENT_HEX_BYTES + 1> media_key_commitment;
 };
 
 struct RoomAdminResponseHdr : CtrlHdr {
@@ -414,3 +445,8 @@ struct RoomChatHistoryResponseHdr : CtrlHdr {
 };
 
 #pragma pack(pop)
+
+static_assert(sizeof(JoinHdr) <= 1200,
+              "JOIN must remain below the control-datagram size budget");
+static_assert(sizeof(RoomCreateResponseHdr) <= 1200,
+              "room-create response must remain below the control-datagram size budget");

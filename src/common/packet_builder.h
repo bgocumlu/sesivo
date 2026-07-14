@@ -40,9 +40,21 @@ inline uint32_t extract_sender_id(const unsigned char* packet_data) {
 
 template <size_t N>
 inline void write_fixed(Bytes<N>& target, const std::string& value) {
+    static_assert(N > 0);
     const size_t copy_bytes = std::min(value.size(), target.size() - 1);
     std::memcpy(target.data(), value.data(), copy_bytes);
     target[copy_bytes] = '\0';
+}
+
+template <size_t N>
+inline bool write_fixed_checked(Bytes<N>& target, const std::string& value) {
+    static_assert(N > 0);
+    if (value.size() >= target.size()) {
+        return false;
+    }
+    std::memcpy(target.data(), value.data(), value.size());
+    target[value.size()] = '\0';
+    return true;
 }
 
 inline std::shared_ptr<std::vector<unsigned char>> create_participant_info_packet(

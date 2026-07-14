@@ -39,6 +39,9 @@ private:
     std::function<void()>                 callback_;
 
     void on_timeout(std::error_code error_code) {
+        if (error_code == asio::error::operation_aborted) {
+            return;
+        }
         if (error_code) {
             spdlog::error("Timer error: {}", error_code.message());
             return;

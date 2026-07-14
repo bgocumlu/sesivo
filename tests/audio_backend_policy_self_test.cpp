@@ -70,6 +70,32 @@ int main() {
     require(std::is_same_v<decltype(AudioDeviceInfo{}.sample_rates), std::vector<double>>,
             "AudioDeviceInfo::sample_rates must be vector<double>");
 
+    const auto stereo_first = audio_backend::plan_input_channels(
+        "Windows Audio", 2, 0);
+    require(stereo_first.opened_channel_count == 2 &&
+                stereo_first.selected_device_channel == 0 &&
+                stereo_first.callback_channel == 0 &&
+                stereo_first.preserve_native_layout,
+            "stereo input must retain its native layout when selecting channel 0");
+    const auto stereo_second = audio_backend::plan_input_channels(
+        "Windows Audio (Low Latency Mode)", 2, 1);
+    require(stereo_second.opened_channel_count == 2 &&
+                stereo_second.selected_device_channel == 1 &&
+                stereo_second.callback_channel == 1 &&
+                stereo_second.preserve_native_layout,
+            "stereo input must retain its native layout when selecting channel 1");
+    const auto asio_channel = audio_backend::plan_input_channels("ASIO", 32, 17);
+    require(asio_channel.opened_channel_count == 1 &&
+                asio_channel.selected_device_channel == 17 &&
+                asio_channel.callback_channel == 0 &&
+                !asio_channel.preserve_native_layout,
+            "ASIO must open only the requested physical input channel");
+    const auto invalid_input = audio_backend::plan_input_channels("ASIO", 0, 8);
+    require(invalid_input.opened_channel_count == 1 &&
+                invalid_input.selected_device_channel == 0 &&
+                invalid_input.callback_channel == 0,
+            "invalid input channel metadata must fall back to one selected channel");
+
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::windows, "ASIO")
                 <= audio_backend::rank_api_for_platform(audio_backend::Platform::windows,
                                                         "Windows Audio (Low Latency Mode)"),
@@ -100,6 +126,15 @@ int main() {
             "ALSA must be second on Linux");
     require(audio_backend::rank_api_for_platform(audio_backend::Platform::linux_os, "PulseAudio") == 100,
             "other APIs must be fallback-ranked on Linux");
+    require(audio_backend::is_latency_certified_api_for_platform(
+                audio_backend::Platform::windows, "ASIO"),
+            "ASIO must be latency-certified on Windows");
+    require(!audio_backend::is_latency_certified_api_for_platform(
+                audio_backend::Platform::windows, "Windows Audio"),
+            "shared Windows Audio must be explicitly degraded");
+    require(audio_backend::is_latency_certified_api_for_platform(
+                audio_backend::Platform::linux_os, "JACK"),
+            "JACK must be latency-certified on Linux");
 
     std::vector<AudioDeviceInfo> windows_devices{
         device(1, "Windows Audio", true, false, true, false),

@@ -78,8 +78,11 @@ struct SecureAudioMetadata {
 
 struct SecureControlMetadata {
     uint32_t sender_id = 0;
+    uint32_t target_id = 0;
     uint32_t sequence = 0;
+    uint32_t access_epoch = 0;
     uint16_t plaintext_bytes = 0;
+    std::string media_key_commitment;
 };
 
 struct ChatMetadata {
@@ -174,7 +177,11 @@ inline bool parse_secure_control_header(const unsigned char* packet, size_t pack
         }
         return false;
     }
-    if (hdr.sender_id == 0 || hdr.plaintext_bytes == 0 ||
+    const std::string media_key_commitment(hdr.media_key_commitment.begin(),
+                                           hdr.media_key_commitment.end());
+    if (hdr.sender_id == 0 || hdr.sequence == 0 || hdr.access_epoch == 0 ||
+        !performer_join_token::valid_sha256_hex(media_key_commitment) ||
+        hdr.plaintext_bytes == 0 ||
         hdr.encrypted_bytes < SECURE_PACKET_TAG_BYTES ||
         hdr.encrypted_bytes != hdr.plaintext_bytes + SECURE_PACKET_TAG_BYTES ||
         packet_len != sizeof(SecureControlHdr) + hdr.encrypted_bytes) {
@@ -185,8 +192,11 @@ inline bool parse_secure_control_header(const unsigned char* packet, size_t pack
     }
 
     metadata.sender_id = hdr.sender_id;
+    metadata.target_id = hdr.target_id;
     metadata.sequence = hdr.sequence;
+    metadata.access_epoch = hdr.access_epoch;
     metadata.plaintext_bytes = hdr.plaintext_bytes;
+    metadata.media_key_commitment = media_key_commitment;
     encrypted_bytes = hdr.encrypted_bytes;
     return true;
 }
@@ -196,6 +206,8 @@ inline std::string nonce_replay_key(const performer_join_token::Claims& claims) 
            std::to_string(claims.room_id.size()) + ":" + claims.room_id + "|" +
            std::to_string(claims.room_instance_id.size()) + ":" +
            claims.room_instance_id + "|" + std::to_string(claims.access_epoch) + "|" +
+           std::to_string(claims.media_key_commitment.size()) + ":" +
+           claims.media_key_commitment + "|" +
            std::to_string(claims.profile_id.size()) + ":" + claims.profile_id + "|" +
            std::to_string(claims.nonce.size()) + ":" + claims.nonce;
 }
@@ -215,6 +227,21 @@ inline std::optional<SessionKey> derive_media_key_from_secret(
         return std::nullopt;
     }
     return detail::session_key_from_digest(*digest);
+}
+
+inline std::optional<std::string> media_key_commitment(
+    const std::string& media_secret) {
+    if (media_secret.empty() || media_secret.size() > MEDIA_SECRET_MAX_BYTES) {
+        return std::nullopt;
+    }
+    return performer_join_token::try_sha256_hex(media_secret);
+}
+
+inline bool media_secret_matches_commitment(
+    const std::string& media_secret, const std::string& commitment) {
+    const auto actual = media_key_commitment(media_secret);
+    return actual.has_value() &&
+           performer_join_token::constant_time_equal(*actual, commitment);
 }
 
 inline std::optional<SessionKey> derive_chat_key_from_secret(
@@ -432,7 +459,10 @@ inline bool seal_control_packet(const SessionKey& key,
                   crypto_aead_chacha20poly1305_IETF_KEYBYTES);
 
     bytes_written = 0;
-    if (metadata.sender_id == 0 || metadata.plaintext_bytes != plaintext_len ||
+    if (metadata.sender_id == 0 || metadata.sequence == 0 ||
+        metadata.access_epoch == 0 ||
+        !performer_join_token::valid_sha256_hex(metadata.media_key_commitment) ||
+        metadata.plaintext_bytes != plaintext_len ||
         out == nullptr || (plaintext_len > 0 && plaintext == nullptr) ||
         plaintext_len >
             std::numeric_limits<uint16_t>::max() - SECURE_PACKET_TAG_BYTES ||
@@ -449,9 +479,14 @@ inline bool seal_control_packet(const SessionKey& key,
     SecureControlHdr hdr{};
     hdr.magic = SECURE_CONTROL_MAGIC;
     hdr.sender_id = metadata.sender_id;
+    hdr.target_id = metadata.target_id;
     hdr.sequence = metadata.sequence;
+    hdr.access_epoch = metadata.access_epoch;
     hdr.plaintext_bytes = static_cast<uint16_t>(plaintext_len);
     hdr.encrypted_bytes = static_cast<uint16_t>(encrypted_bytes);
+    std::copy(metadata.media_key_commitment.begin(),
+              metadata.media_key_commitment.end(),
+              hdr.media_key_commitment.begin());
     randombytes_buf(hdr.nonce.data(), hdr.nonce.size());
     std::memcpy(out, &hdr, sizeof(hdr));
 

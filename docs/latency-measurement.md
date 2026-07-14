@@ -75,9 +75,9 @@ On Windows, start the server and two clients with Release binaries:
 
 The helper writes logs under `validation_logs/latency/`, prints `RUN_DIR=...`,
 and defaults to `dev-secret` / `dev-media-secret` for this local validation
-flow. It passes `--join-secret` explicitly, so this helper is unaffected if the
-server later supports auto-generating its own hidden join secret when no
-`--join-secret` is supplied. By default it runs for 3600 seconds, stops the
+flow. It passes `--join-secret` explicitly so repeated local runs use the same
+test key; normal standalone startup auto-generates a hidden signing key when no
+key source is supplied. By default it runs for 3600 seconds, stops the
 server and clients, and runs the strict diagnostics check. Use `-Seconds 600`
 for a shorter debug run or `-Seconds 0` to start the processes without
 auto-stop. Shorter runs still use the strict 60 minute sample threshold and may

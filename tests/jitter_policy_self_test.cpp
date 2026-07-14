@@ -151,6 +151,31 @@ void test_manual_opus_target_is_owned_by_manual_override() {
             "manual Opus jitter should not be overwritten by packet floor updates");
 }
 
+void test_latency_trim_catches_large_bursts_up_to_the_playout_target() {
+    require(opus_latency_trim_goal_packets(24, 4, 8) == 4,
+            "a startup burst above the high-water mark should catch up to the target");
+    require(opus_latency_trim_goal_packets(8, 4, 8) == 8,
+            "normal callback burst headroom should be retained at the high-water mark");
+    require(opus_latency_trim_goal_packets(6, 4, 8) == 6,
+            "a queue inside the burst headroom should not be trimmed");
+}
+
+void test_playout_rate_converges_a_full_packet_queue_error() {
+    require(opus_playout_ratio_for_queue_depth(2.0, 2.0) == 1.0,
+            "playout at the selected queue target should remain neutral");
+    require(opus_playout_ratio_for_queue_depth(1.0, 2.0) < 1.0,
+            "one packet below target must slow playout and rebuild the preset cushion");
+    require(opus_playout_ratio_for_queue_depth(3.0, 2.0) > 1.0,
+            "one packet above target must accelerate playout and remove excess latency");
+    require(opus_playout_ratio_for_queue_depth(1.9, 2.0) == 1.0,
+            "sub-packet measurement noise should remain inside the deadband");
+    require(opus_playout_ratio_for_queue_depth(0.0, 4.0) ==
+                OPUS_PLAYOUT_MIN_RATIO &&
+                opus_playout_ratio_for_queue_depth(8.0, 2.0) ==
+                    OPUS_PLAYOUT_MAX_RATIO,
+            "large queue errors must remain inside the bounded resampling range");
+}
+
 }  // namespace
 
 int main() {
@@ -168,6 +193,8 @@ int main() {
     test_non_auto_target_snaps_to_floor_before_ready();
     test_target_raises_when_floor_increases();
     test_manual_opus_target_is_owned_by_manual_override();
+    test_latency_trim_catches_large_bursts_up_to_the_playout_target();
+    test_playout_rate_converges_a_full_packet_queue_error();
 
     std::cout << "jitter policy self-test passed\n";
     return 0;

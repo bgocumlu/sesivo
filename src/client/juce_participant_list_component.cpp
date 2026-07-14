@@ -39,7 +39,7 @@ juce::String participant_name(const ParticipantInfo& participant) {
 
 juce::String profile_subtitle(const ParticipantInfo& participant) {
     juce::String suffix =
-        "E2E " + juce::String(participant.capture_to_playout_latency_avg_ms, 1) +
+        "App path " + juce::String(participant.capture_to_playout_latency_avg_ms, 1) +
         " ms  PLC " + juce::String(static_cast<int>(participant.plc_count));
     if (!participant.profile_id.empty() &&
         participant.profile_id != participant.display_name) {

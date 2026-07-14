@@ -22,6 +22,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -52,6 +53,7 @@
 #include <spdlog/spdlog.h>
 
 #include "audio_analysis.h"
+#include "audio_backend_policy.h"
 #include "audio_callback_policy.h"
 #include "audio_packet.h"
 #include "audio_stream.h"
@@ -61,8 +63,11 @@
 #include "client_media_state.h"
 #include "client_metronome.h"
 #include "client_network_path.h"
+#include "clock_offset_estimator.h"
+#include "congestion_policy.h"
 #include "client_runtime.h"
 #include "delivery_stall_policy.h"
+#include "delivery_report_feedback.h"
 #include "jitter_policy.h"
 #include "message_validator.h"
 #include "opus_decoder.h"
@@ -77,6 +82,7 @@
 #include "periodic_timer.h"
 #include "post_drop_rate_recovery.h"
 #include "protocol.h"
+#include "replay_window.h"
 #include "session_crypto.h"
 #include "udp_port.h"
 #include "udp_socket_config.h"
@@ -87,7 +93,7 @@ using namespace std::chrono_literals;
 constexpr int OPUS_AUTO_JITTER_CONTROL_WINDOW_CALLBACKS = 200;
 constexpr int OPUS_AUTO_JITTER_EVENTS_BEFORE_INCREASE = 3;
 constexpr size_t CLIENT_CHAT_RETAINED_MESSAGES = 100;
-constexpr bool AUDIO_CALLBACK_NOTIFY_ENABLED = true;
+constexpr bool AUDIO_CALLBACK_NOTIFY_ENABLED = false;
 
 class Client {
 public:
@@ -100,10 +106,10 @@ public:
           join_session_(std::move(performer_join_options), 1s),
           audio_state_(audio_preferences.audio_api),
           audio_preferences_path_(std::move(audio_preferences_path)),
-          ping_timer_(io_context, 500ms, [this]() { ping_timer_callback(); }),
+          ping_timer_(io_context, 250ms, [this]() { ping_timer_callback(); }),
           join_retry_timer_(io_context, 1s, [this]() { join_retry_timer_callback(); }),
-          alive_timer_(io_context, 5s, [this]() { alive_timer_callback(); }),
-          cleanup_timer_(io_context, 10s, [this]() { cleanup_timer_callback(); }),
+          alive_timer_(io_context, 1s, [this]() { alive_timer_callback(); }),
+          cleanup_timer_(io_context, 1s, [this]() { cleanup_timer_callback(); }),
           chat_timer_(io_context, 500ms, [this]() { chat_timer_callback(); }) {
         initialize_e2e_keypair();
         std::error_code socket_error;
@@ -124,6 +130,17 @@ public:
 
         // Server join is resolved by the GUI startup job so the window can
         // show connection progress instead of blocking launch in this constructor.
+    }
+
+    ~Client() {
+        lifetime_token_.reset();
+        audio_stream_requested_.store(false, std::memory_order_release);
+        audio_device_generation_.fetch_add(1, std::memory_order_acq_rel);
+        audio_device_worker_.stop();
+        audio_device_worker_.join();
+        std::lock_guard<std::mutex> lock(audio_lifecycle_mutex_);
+        audio_.stop_audio_stream();
+        stop_audio_sender_thread();
     }
 
     // Start connection to server (or switch to new server)
@@ -168,6 +185,16 @@ public:
             try {
                 join_session_.configure(std::move(options));
                 participant_manager_.clear();
+                delivery_report_accumulators_.clear();
+                downstream_delivery_by_reporter_.clear();
+                downstream_delivery_last_activity_.clear();
+                downstream_delivery_tombstone_since_.clear();
+                downstream_feedback_by_reporter_.clear();
+                downstream_feedback_pending_ = false;
+                delivery_report_generated_baseline_ =
+                    audio_packets_generated_.load(std::memory_order_acquire);
+                next_delivery_report_epoch_ = 1;
+                reset_packet_duration_adaptation();
                 clear_access_request_state();
                 clear_chat_state();
                 start_connection_on_io_context(server_address, server_port);
@@ -225,7 +252,7 @@ public:
         receiving_enabled_.store(true, std::memory_order_release);
         outbound_enabled_.store(true, std::memory_order_release);
 
-        do_receive();
+        start_receive_slots();
 
         spdlog::info("Connected and receiving!");
 
@@ -250,7 +277,7 @@ public:
         std::shared_ptr<const session_crypto::SessionKey> cleared;
         std::atomic_store_explicit(&session_key_, std::move(cleared),
                                    std::memory_order_release);
-        secure_control_highest_sequence_.clear();
+        secure_control_replay_windows_.clear();
         secure_control_sequence_.store(1, std::memory_order_release);
     }
 
@@ -272,6 +299,13 @@ public:
             reset_session_security();
             spdlog::warn("Join token is not usable for E2E media key derivation: {}",
                          reason.empty() ? "room claims unavailable" : reason);
+            return;
+        }
+        if (!session_crypto::media_secret_matches_commitment(
+                join_session_.media_secret(),
+                join_session_.media_key_commitment())) {
+            reset_session_security();
+            spdlog::warn("Media secret does not match the server-authorized room key");
             return;
         }
 
@@ -320,7 +354,7 @@ public:
                     }
                 }
                 for (uint32_t participant_id: pending_ids) {
-                    if (send_media_key_envelope_to_participant_on_io(participant_id)) {
+                    if (queue_media_key_handoff_on_io(participant_id)) {
                         remove_pending_access_request(participant_id);
                     }
                 }
@@ -332,7 +366,7 @@ public:
         auto completed = std::make_shared<std::promise<bool>>();
         auto future = completed->get_future();
         asio::post(io_context_, [this, participant_id, completed]() {
-            const bool ok = send_media_key_envelope_to_participant_on_io(participant_id);
+            const bool ok = queue_media_key_handoff_on_io(participant_id);
             if (ok) {
                 remove_pending_access_request(participant_id);
             }
@@ -357,6 +391,16 @@ public:
     void clear_room_session_state() {
         join_session_.configure({});
         participant_manager_.clear();
+        delivery_report_accumulators_.clear();
+        downstream_delivery_by_reporter_.clear();
+        downstream_delivery_last_activity_.clear();
+        downstream_delivery_tombstone_since_.clear();
+        downstream_feedback_by_reporter_.clear();
+        downstream_feedback_pending_ = false;
+        delivery_report_generated_baseline_ =
+            audio_packets_generated_.load(std::memory_order_acquire);
+        next_delivery_report_epoch_ = 1;
+        reset_packet_duration_adaptation();
         clear_access_request_state();
         clear_chat_state();
         reset_session_security();
@@ -430,6 +474,21 @@ public:
     bool start_audio_stream(AudioStream::DeviceIndex input_device,
                             AudioStream::DeviceIndex output_device,
                             const AudioStream::AudioConfig& config = AudioStream::AudioConfig{}) {
+        std::lock_guard<std::mutex> lock(audio_lifecycle_mutex_);
+        audio_device_generation_.fetch_add(1, std::memory_order_acq_rel);
+        audio_stream_requested_.store(false, std::memory_order_release);
+        const bool success = start_audio_stream_locked(input_device, output_device, config);
+        if (success) {
+            audio_stream_requested_.store(true, std::memory_order_release);
+            audio_recovery_attempts_.store(0, std::memory_order_release);
+            next_audio_recovery_ns_.store(0, std::memory_order_release);
+        }
+        return success;
+    }
+
+    bool start_audio_stream_locked(AudioStream::DeviceIndex input_device,
+                                   AudioStream::DeviceIndex output_device,
+                                   const AudioStream::AudioConfig& config) {
         stop_audio_sender_thread();
         AudioStream::AudioConfig runtime_config = config;
 
@@ -454,6 +513,12 @@ public:
         }
         auto output_info = *output_info_ptr;
 
+        if (!audio_backend::is_latency_certified_api(input_info.api_name)) {
+            spdlog::warn(
+                "Audio backend '{}' is degraded mode; no low-latency certification applies",
+                input_info.api_name);
+        }
+
         audio_state_.set_input_device_info(input_info, runtime_config.input_channel_index);
         audio_state_.set_output_device_info(output_info);
 
@@ -464,6 +529,14 @@ public:
             spdlog::error("Failed to create Opus encoder");
             return false;
         }
+        congestion_max_bitrate_.store(
+            std::max(runtime_config.bitrate, congestion_policy::MIN_BITRATE),
+            std::memory_order_release);
+        congestion_target_bitrate_.store(
+            std::max(runtime_config.bitrate, congestion_policy::MIN_BITRATE),
+            std::memory_order_release);
+        congestion_healthy_intervals_.store(0, std::memory_order_release);
+        adaptive_redundancy_depth_.store(-1, std::memory_order_release);
         publish_audio_config(runtime_config);
 
         // Store encoder info (get actual bitrate from encoder)
@@ -479,6 +552,13 @@ public:
         if (success) {
             start_audio_sender_thread();
             audio_.print_latency_info();
+            const auto latency = audio_.get_latency_info();
+            spdlog::info(
+                "Audio runtime: api={} sample_rate={} requested_buffer={} actual_buffer={} "
+                "input_latency_ms={:.3f} output_latency_ms={:.3f} backend_latency_available={}",
+                input_info.api_name, latency.sample_rate, latency.requested_buffer_frames,
+                latency.actual_buffer_frames, latency.input_latency_ms,
+                latency.output_latency_ms, latency.backend_latency_available);
         } else {
             // Clean up encoder if stream start failed
             audio_encoder_.destroy();
@@ -487,6 +567,10 @@ public:
     }
 
     void stop_audio_stream() {
+        std::lock_guard<std::mutex> lock(audio_lifecycle_mutex_);
+        audio_device_generation_.fetch_add(1, std::memory_order_acq_rel);
+        audio_stream_requested_.store(false, std::memory_order_release);
+        audio_recovery_in_flight_.store(false, std::memory_order_release);
         audio_.stop_audio_stream();
         stop_audio_sender_thread();
         stop_recording();
@@ -850,6 +934,17 @@ public:
             static_cast<uint32_t>(std::max(1, current_audio_sample_rate()));
         const uint16_t normalized =
             opus_network_clock::normalize_frame_count(sample_rate, frame_count);
+        {
+            std::lock_guard lock(packet_duration_mutex_);
+            congestion_policy::configure_packet_duration(packet_duration_state_,
+                                                          normalized);
+        }
+        apply_opus_network_frame_count(normalized);
+    }
+
+    void apply_opus_network_frame_count(uint16_t normalized) {
+        const uint32_t sample_rate =
+            static_cast<uint32_t>(std::max(1, current_audio_sample_rate()));
         const uint16_t previous =
             opus_network_frame_count_.exchange(normalized, std::memory_order_acq_rel);
         if (previous != normalized) {
@@ -860,6 +955,18 @@ public:
             apply_opus_jitter_buffer_ms(
                 opus_jitter_buffer_ms_.load(std::memory_order_acquire));
         }
+    }
+
+    void reset_packet_duration_adaptation() {
+        uint16_t configured_frames = opus_network_clock::DEFAULT_FRAME_COUNT;
+        {
+            std::lock_guard lock(packet_duration_mutex_);
+            configured_frames = static_cast<uint16_t>(
+                packet_duration_state_.configured_frames);
+            congestion_policy::configure_packet_duration(packet_duration_state_,
+                                                          configured_frames);
+        }
+        apply_opus_network_frame_count(configured_frames);
     }
 
     size_t get_opus_jitter_buffer_packets() const {
@@ -957,6 +1064,10 @@ public:
     }
 
     int get_effective_opus_redundancy_depth() const {
+        const int adaptive = adaptive_redundancy_depth_.load(std::memory_order_acquire);
+        if (adaptive >= 0) {
+            return adaptive;
+        }
         return effective_opus_redundancy_depth(
             get_opus_redundancy_depth_setting(),
             static_cast<uint16_t>(get_opus_network_frame_count()));
@@ -1462,11 +1573,19 @@ public:
         std::array<char, 2048> buffer{};
         udp::endpoint endpoint;
         uint64_t generation = 0;
+        bool in_flight = false;
     };
 
+    static constexpr size_t RECEIVE_SLOT_COUNT = 8;
+
     void reset_server_clock_and_ping_state() {
+        {
+            std::lock_guard lock(server_clock_estimator_mutex_);
+            server_clock_estimator_.reset();
+        }
         server_clock_ready_.store(false, std::memory_order_release);
         server_clock_offset_ns_.store(0, std::memory_order_release);
+        server_clock_uncertainty_ns_.store(0, std::memory_order_release);
         ping_tx_sequence_.store(0, std::memory_order_release);
         reset_ping_path_feedback(0);
         rtt_ms_.store(0.0, std::memory_order_relaxed);
@@ -1492,9 +1611,11 @@ public:
         reset_ping_path_feedback(ping_tx_sequence_.load(std::memory_order_acquire));
     }
 
-    void on_receive(const std::shared_ptr<ReceiveState>& state,
+    void on_receive(ReceiveState& state,
                     std::error_code error_code, std::size_t bytes) {
-        if (state->generation != receive_generation_.load(std::memory_order_acquire)) {
+        state.in_flight = false;
+        if (state.generation != receive_generation_.load(std::memory_order_acquire)) {
+            do_receive(state);
             return;
         }
 
@@ -1504,54 +1625,55 @@ public:
 
         if (error_code) {
             if (error_code == asio::error::operation_aborted) {
+                do_receive(state);
                 return;
             }
-            do_receive();  // keep listening
+            do_receive(state);  // keep this receive slot listening
             return;
         }
 
+        // Copy into bounded stack storage, then return the fixed slot to the
+        // kernel before validation, decryption, or queue admission.
+        std::array<char, 2048> packet{};
+        bytes = std::min(bytes, packet.size());
+        std::memcpy(packet.data(), state.buffer.data(), bytes);
+        const auto received_endpoint = state.endpoint;
+        do_receive(state);
+
         const auto expected_endpoint = current_server_endpoint();
-        if (state->endpoint != expected_endpoint) {
+        if (received_endpoint != expected_endpoint) {
             const uint64_t count =
                 stray_udp_packets_.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || count % 100 == 0) {
                 spdlog::warn(
                     "Ignoring UDP packet from unexpected endpoint {}:{} (server is {}:{}, "
                     "ignored={})",
-                    state->endpoint.address().to_string(), state->endpoint.port(),
+                    received_endpoint.address().to_string(), received_endpoint.port(),
                     expected_endpoint.address().to_string(), expected_endpoint.port(), count);
             }
-            do_receive();
             return;
         }
 
         if (bytes < sizeof(MsgHdr)) {
-            do_receive();
             return;
         }
 
         MsgHdr hdr{};
-        std::memcpy(&hdr, state->buffer.data(), sizeof(MsgHdr));
+        std::memcpy(&hdr, packet.data(), sizeof(MsgHdr));
 
         if (hdr.magic == PING_MAGIC && bytes >= sizeof(SyncHdr)) {
-            handle_ping_message(bytes, state->buffer.data());
+            handle_ping_message(bytes, packet.data());
         } else if (hdr.magic == CTRL_MAGIC && bytes >= sizeof(CtrlHdr)) {
-            handle_ctrl_message(bytes, state->buffer.data());
+            handle_ctrl_message(bytes, packet.data());
         } else if (hdr.magic == SECURE_CONTROL_MAGIC &&
                    bytes >= SECURE_CONTROL_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
-            handle_secure_control_message(bytes, state->buffer.data());
+            handle_secure_control_message(bytes, packet.data());
         } else if (hdr.magic == SECURE_AUDIO_MAGIC &&
                    bytes >= SECURE_PACKET_HEADER_BYTES + SECURE_PACKET_TAG_BYTES) {
-            handle_secure_audio_message(bytes, state->buffer.data());
+            handle_secure_audio_message(bytes, packet.data());
         } else if (hdr.magic == E2E_KEY_ENVELOPE_MAGIC &&
                    bytes >= sizeof(E2EKeyEnvelopeHdr)) {
-            handle_e2e_key_envelope(bytes, state->buffer.data());
-        } else if (hdr.magic == AUDIO_REDUNDANT_MAGIC &&
-                   bytes >= sizeof(AudioRedundantHdr)) {
-            handle_audio_message(bytes, state->buffer.data());
-        } else if (hdr.magic == AUDIO_V3_MAGIC &&
-                   bytes >= audio_packet::v3_header_size()) {
-            handle_audio_message(bytes, state->buffer.data());
+            handle_e2e_key_envelope(bytes, packet.data());
         } else {
             // Log unknown message with hex dump for debugging
             std::string hex_dump;
@@ -1559,30 +1681,37 @@ public:
             for (size_t i = 0; i < std::min(bytes, size_t(32)); ++i) {
                 char hex[4];
                 std::snprintf(hex, sizeof(hex), "%02x ",
-                              static_cast<unsigned char>(state->buffer[i]));
+                              static_cast<unsigned char>(packet[i]));
                 hex_dump += hex;
             }
             spdlog::warn("Unknown message (magic=0x{:08x}, bytes={}, hex={}...)", hdr.magic, bytes,
                       hex_dump);
         }
-
-        do_receive();  // keep listening
     }
 
-    void do_receive() {
+    void do_receive(ReceiveState& state) {
         if (!receiving_enabled_.load(std::memory_order_acquire)) {
             return;
         }
-        auto state = std::make_shared<ReceiveState>();
+        if (state.in_flight) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(socket_mutex_);
         if (!receiving_enabled_.load(std::memory_order_acquire)) {
             return;
         }
-        state->generation = receive_generation_.load(std::memory_order_acquire);
-        socket_.async_receive_from(asio::buffer(state->buffer), state->endpoint,
-                                   [this, state](std::error_code error_code, std::size_t bytes) {
+        state.generation = receive_generation_.load(std::memory_order_acquire);
+        state.in_flight = true;
+        socket_.async_receive_from(asio::buffer(state.buffer), state.endpoint,
+                                   [this, &state](std::error_code error_code, std::size_t bytes) {
                                        on_receive(state, error_code, bytes);
                                    });
+    }
+
+    void start_receive_slots() {
+        for (auto& state: receive_states_) {
+            do_receive(state);
+        }
     }
 
 private:
@@ -1590,6 +1719,36 @@ private:
         udp::endpoint endpoint;
         uint64_t generation = 0;
     };
+
+    struct DeliveryReportAccumulator {
+        uint32_t report_epoch = 0;
+        delivery_report_feedback::LifetimeCounter delivered;
+        delivery_report_feedback::LifetimeCounter lost;
+        uint64_t last_sent_delivered = 0;
+        uint64_t last_sent_lost = 0;
+        std::chrono::steady_clock::time_point inactive_since{};
+    };
+
+    struct DownstreamFeedbackInterval {
+        delivery_report_feedback::ResolvedOutcomes outcomes;
+        std::chrono::steady_clock::time_point updated_at{};
+    };
+
+    struct DownstreamDeliveryReporter {
+        delivery_report_feedback::State report;
+        uint64_t claimed_outcomes = 0;
+    };
+
+    static constexpr auto DELIVERY_REPORT_STATE_RETENTION = std::chrono::minutes(5);
+    static constexpr auto DOWNSTREAM_FEEDBACK_RETENTION = std::chrono::seconds(3);
+
+    uint32_t next_delivery_report_epoch() {
+        uint32_t epoch = next_delivery_report_epoch_++;
+        if (epoch == 0) {
+            epoch = next_delivery_report_epoch_++;
+        }
+        return epoch;
+    }
 
     OutboundEndpointSnapshot current_outbound_endpoint_snapshot() const {
         std::lock_guard<std::mutex> lock(server_endpoint_mutex_);
@@ -1677,6 +1836,7 @@ private:
         std::lock_guard<std::mutex> lock(access_request_mutex_);
         participant_key_public_.clear();
         pending_access_requests_.clear();
+        pending_key_handoff_acks_.clear();
     }
 
     struct PendingChatMessage {
@@ -2060,6 +2220,10 @@ private:
         envelope.magic = E2E_KEY_ENVELOPE_MAGIC;
         envelope.sender_id = join_session_.participant_id();
         envelope.target_id = participant_id;
+        envelope.access_epoch = join_session_.access_epoch();
+        std::copy(join_session_.media_key_commitment().begin(),
+                  join_session_.media_key_commitment().end(),
+                  envelope.media_key_commitment.begin());
 
         size_t encrypted_bytes = 0;
         const auto crypto_public_key = to_crypto_public_key(target_public_key);
@@ -2082,11 +2246,58 @@ private:
         return true;
     }
 
+    bool queue_media_key_handoff_on_io(uint32_t participant_id) {
+        {
+            std::lock_guard<std::mutex> lock(access_request_mutex_);
+            pending_key_handoff_acks_.insert(participant_id);
+        }
+        if (send_media_key_envelope_to_participant_on_io(participant_id)) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(access_request_mutex_);
+        pending_key_handoff_acks_.erase(participant_id);
+        return false;
+    }
+
+    void retry_pending_key_handoffs_on_io() {
+        std::vector<uint32_t> participant_ids;
+        {
+            std::lock_guard<std::mutex> lock(access_request_mutex_);
+            participant_ids.assign(pending_key_handoff_acks_.begin(),
+                                   pending_key_handoff_acks_.end());
+        }
+        for (uint32_t participant_id: participant_ids) {
+            (void)send_media_key_envelope_to_participant_on_io(participant_id);
+        }
+    }
+
+    void send_key_handoff_ack_on_io(uint32_t target_id, uint32_t access_epoch,
+                                    const std::string& media_key_commitment) {
+        if (target_id == 0 || target_id == join_session_.participant_id() ||
+            access_epoch == 0 ||
+            !performer_join_token::valid_sha256_hex(media_key_commitment) ||
+            join_session_.participant_id() == 0 ||
+            !outbound_enabled_.load(std::memory_order_acquire)) {
+            return;
+        }
+        RoomKeyHandoffAckHdr ack{};
+        ack.magic = CTRL_MAGIC;
+        ack.type = CtrlHdr::Cmd::ROOM_KEY_HANDOFF_ACK;
+        ack.participant_id = join_session_.participant_id();
+        ack.target_id = target_id;
+        ack.access_epoch = access_epoch;
+        std::copy(media_key_commitment.begin(), media_key_commitment.end(),
+                  ack.media_key_commitment.begin());
+        auto packet = std::make_shared<std::vector<unsigned char>>(sizeof(ack));
+        std::memcpy(packet->data(), &ack, sizeof(ack));
+        send(packet->data(), packet->size(), packet);
+    }
+
     void maybe_auto_share_media_key(uint32_t participant_id) {
         if (join_session_.access_mode() == ROOM_ACCESS_APPROVE) {
             return;
         }
-        if (send_media_key_envelope_to_participant_on_io(participant_id)) {
+        if (queue_media_key_handoff_on_io(participant_id)) {
             spdlog::info("Auto-shared encrypted room key with participant {}",
                          participant_id);
         }
@@ -2100,24 +2311,28 @@ private:
         if (sender_id == 0 || sequence == 0) {
             return false;
         }
-        auto [it, inserted] = secure_control_highest_sequence_.emplace(sender_id, sequence);
-        if (inserted) {
-            return true;
-        }
-        if (sequence <= it->second) {
-            return false;
-        }
-        it->second = sequence;
-        return true;
+        return secure_control_replay_windows_[sender_id].accept(sequence);
     }
 
-    void apply_media_secret_rotation(std::string media_secret, uint32_t access_epoch) {
-        join_session_.set_media_secret(std::move(media_secret));
-        if (access_epoch != 0) {
-            join_session_.set_access_epoch(access_epoch);
+    bool apply_media_secret_rotation(std::string media_secret,
+                                     uint32_t access_epoch,
+                                     const std::string& media_key_commitment) {
+        if (access_epoch == 0 ||
+            !session_crypto::media_secret_matches_commitment(
+                media_secret, media_key_commitment) ||
+            access_epoch < join_session_.access_epoch() ||
+            (access_epoch == join_session_.access_epoch() &&
+             join_session_.has_media_secret()) ||
+            (access_epoch == join_session_.access_epoch() &&
+             media_key_commitment != join_session_.media_key_commitment())) {
+            return false;
         }
+        join_session_.set_media_secret(std::move(media_secret));
+        join_session_.set_access_epoch(access_epoch);
+        join_session_.set_media_key_commitment(media_key_commitment);
         clear_chat_state();
         update_media_key_from_secret();
+        return true;
     }
 
     bool rotate_media_key_on_io_context(const std::string& media_secret,
@@ -2128,6 +2343,11 @@ private:
             join_session_.participant_id() == 0 ||
             access_epoch == 0 ||
             !outbound_enabled_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        const auto media_key_commitment =
+            session_crypto::media_key_commitment(media_secret);
+        if (!media_key_commitment.has_value()) {
             return false;
         }
 
@@ -2147,7 +2367,9 @@ private:
         metadata.sender_id = join_session_.participant_id();
         metadata.sequence =
             secure_control_sequence_.fetch_add(1, std::memory_order_acq_rel);
+        metadata.access_epoch = access_epoch;
         metadata.plaintext_bytes = sizeof(payload);
+        metadata.media_key_commitment = *media_key_commitment;
 
         std::array<unsigned char, 512> sealed{};
         size_t sealed_bytes = 0;
@@ -2161,7 +2383,21 @@ private:
         auto packet = std::make_shared<std::vector<unsigned char>>(
             sealed.begin(), sealed.begin() + static_cast<std::ptrdiff_t>(sealed_bytes));
         send(packet->data(), packet->size(), packet);
-        apply_media_secret_rotation(media_secret, access_epoch);
+        (void)apply_media_secret_rotation(media_secret, access_epoch,
+                                          *media_key_commitment);
+        std::vector<uint32_t> participant_ids;
+        {
+            std::lock_guard<std::mutex> lock(access_request_mutex_);
+            participant_ids.reserve(participant_key_public_.size());
+            for (const auto& [participant_id, _]: participant_key_public_) {
+                if (participant_id != join_session_.participant_id()) {
+                    participant_ids.push_back(participant_id);
+                }
+            }
+        }
+        for (uint32_t participant_id: participant_ids) {
+            (void)queue_media_key_handoff_on_io(participant_id);
+        }
         spdlog::info("Rotated local E2E media key and sent encrypted room rotation");
         return true;
     }
@@ -2488,7 +2724,7 @@ private:
             "UDP path rebind #{} after '{}': local port {} -> {}; rejoining room '{}'",
             rebind_count, reason, old_port, new_port, join_session_.room_id());
 
-        do_receive();
+        start_receive_slots();
         send_join();
     }
 
@@ -2777,6 +3013,7 @@ private:
         ScopedSenderThreadPriority sender_priority;
         TxPacketBufferPool packet_pool;
         std::array<unsigned char, AUDIO_BUF_SIZE> encoded_data{};
+        int applied_bitrate = audio_encoder_.get_actual_bitrate();
 
         while (audio_sender_running_.load(std::memory_order_acquire)) {
             consume_recent_opus_audio_packets_reset_request_on_sender_thread();
@@ -2785,6 +3022,12 @@ private:
             if (opus_send_queue_.try_dequeue(opus_frame)) {
                 if (!join_session_.can_send_audio()) {
                     continue;
+                }
+                const int desired_bitrate =
+                    congestion_target_bitrate_.load(std::memory_order_acquire);
+                if (desired_bitrate != applied_bitrate &&
+                    audio_encoder_.set_bitrate(desired_bitrate)) {
+                    applied_bitrate = desired_bitrate;
                 }
                 observe_opus_send_queue_age(opus_frame.capture_time);
                 uint16_t encoded_bytes = 0;
@@ -2803,6 +3046,7 @@ private:
 
                     const uint32_t seq =
                         audio_tx_sequence_.fetch_add(1, std::memory_order_relaxed);
+                    audio_packets_generated_.fetch_add(1, std::memory_order_release);
                     if (!build_audio_packet_into(
                             *packet, seq, opus_frame.sample_rate,
                             opus_frame.frame_count, 1, encoded_data.data(), encoded_bytes,
@@ -2855,7 +3099,11 @@ private:
             return nullptr;
         }
 
-        const int configured_depth = get_opus_redundancy_depth_setting();
+        const int adaptive_depth =
+            adaptive_redundancy_depth_.load(std::memory_order_acquire);
+        const int configured_depth = adaptive_depth >= 0
+            ? adaptive_depth
+            : get_opus_redundancy_depth_setting();
         const int effective_depth =
             effective_opus_redundancy_depth(configured_depth, parsed.frame_count);
         if (effective_depth <= 0) {
@@ -3049,19 +3297,8 @@ private:
             static_cast<double>(participant.opus_queue.size_approx()) + decoded_packets;
         const double target_packets =
             static_cast<double>(opus_playout_target_queue_packets(participant));
-        const double queue_error = queued_packets - target_packets;
-        constexpr double deadband_packets = 1.0;
-        constexpr double gain = 0.001;
-        constexpr double min_ratio = 0.995;
-        constexpr double max_ratio = 1.005;
-        double correction_error = 0.0;
-        if (queue_error > deadband_packets) {
-            correction_error = queue_error - deadband_packets;
-        } else if (queue_error < -deadband_packets) {
-            correction_error = queue_error + deadband_packets;
-        }
-        double ratio = std::clamp(1.0 + (correction_error * gain),
-                                  min_ratio, max_ratio);
+        double ratio = opus_playout_ratio_for_queue_depth(
+            queued_packets, target_packets);
 
         const uint64_t queue_limit_drops =
             participant.opus_queue_limit_drops.load(std::memory_order_relaxed);
@@ -3074,7 +3311,7 @@ private:
         if (post_drop_rate_recovery::active(
                 now, participant.opus_rate_correction_deadline,
                 queued_packets, target_packets)) {
-            ratio = std::max(ratio, max_ratio);
+            ratio = std::max(ratio, OPUS_PLAYOUT_MAX_RATIO);
         }
 
         participant.opus_playout_rate_ratio_micros.store(
@@ -3339,6 +3576,7 @@ private:
     static void observe_opus_age_limit_drop(ParticipantData& participant) {
         participant.jitter_age_drops.fetch_add(1, std::memory_order_relaxed);
         participant.opus_age_limit_drops.fetch_add(1, std::memory_order_relaxed);
+        participant.receiver_delivery_drops.fetch_add(1, std::memory_order_relaxed);
     }
 
     static bool auto_jitter_is_active(const ParticipantData& participant) {
@@ -3490,13 +3728,22 @@ private:
         }
 
         size_t current_queue_size = participant.opus_queue.size_approx();
+        const size_t target_packets = opus_playout_target_queue_packets(participant);
         const size_t trim_threshold = opus_latency_trim_threshold_packets(participant);
-        while (current_queue_size > trim_threshold) {
-            if (!participant.opus_queue.discard_oldest_actual_packet_for_latency_trim()) {
+        const size_t trim_goal = opus_latency_trim_goal_packets(
+            current_queue_size, target_packets, trim_threshold);
+        while (current_queue_size > trim_goal) {
+            bool receiver_drop_ready = false;
+            if (!participant.opus_queue.discard_oldest_actual_packet_for_latency_trim(
+                    &receiver_drop_ready)) {
                 break;
             }
             --current_queue_size;
             participant.opus_target_trim_drops.fetch_add(1, std::memory_order_relaxed);
+            if (receiver_drop_ready) {
+                participant.receiver_delivery_drops.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
         }
         return current_queue_size;
     }
@@ -3510,11 +3757,17 @@ private:
         size_t current_queue_size = participant.opus_queue.size_approx();
         const size_t target_packets = opus_playout_target_queue_packets(participant);
         while (current_queue_size > target_packets) {
-            if (!participant.opus_queue.discard_oldest_actual_packet_for_latency_trim()) {
+            bool receiver_drop_ready = false;
+            if (!participant.opus_queue.discard_oldest_actual_packet_for_latency_trim(
+                    &receiver_drop_ready)) {
                 break;
             }
             --current_queue_size;
             participant.opus_target_trim_drops.fetch_add(1, std::memory_order_relaxed);
+            if (receiver_drop_ready) {
+                participant.receiver_delivery_drops.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
         }
         return current_queue_size;
     }
@@ -3643,87 +3896,65 @@ private:
         avg_ns.store(next_avg, std::memory_order_relaxed);
     }
 
-    static void observe_capture_to_playout_latency(ParticipantData& participant,
-                                                   const OpusPacket& packet,
-                                                   int64_t playout_server_time_ns) {
-        if (!packet.capture_timestamp_valid || packet.capture_server_time_ns <= 0 ||
-            playout_server_time_ns <= packet.capture_server_time_ns) {
-            return;
-        }
-
-        observe_latency_sample(participant.capture_to_playout_latency_last_ns,
-                               participant.capture_to_playout_latency_avg_ns,
-                               participant.capture_to_playout_latency_max_ns,
-                               playout_server_time_ns - packet.capture_server_time_ns);
-        participant.capture_to_playout_latency_samples.fetch_add(1,
-                                                                 std::memory_order_relaxed);
-    }
-
-    void observe_capture_to_playout_latency_if_clock_ready(
-        ParticipantData& participant,
-        const OpusPacket& packet,
-        std::chrono::steady_clock::time_point playout_time) const {
-        const auto playout_server_time_ns =
-            server_time_for_steady_time_ns_if_ready(playout_time);
-        if (!playout_server_time_ns.has_value()) {
-            return;
-        }
-        observe_capture_to_playout_latency(participant, packet, *playout_server_time_ns);
-    }
-
     static void append_opus_capture_chunk(ParticipantData& participant, size_t frames,
-                                          int64_t capture_server_time_ns, bool valid) {
-        if (frames == 0) {
-            return;
+                                          int64_t capture_server_time_ns, bool valid,
+                                          bool received_media) {
+        if (!participant.opus_pcm_outcomes.append(
+                frames, capture_server_time_ns, valid, received_media)) {
+            const uint64_t lost =
+                participant.opus_pcm_outcomes.discard_overflow_as_lost(
+                    received_media);
+            participant.opus_pcm_buffered_frames = 0;
+            participant.receiver_delivery_drops.fetch_add(
+                lost, std::memory_order_relaxed);
         }
-        if (participant.opus_pcm_capture_chunk_count >=
-            participant.opus_pcm_capture_chunks.size()) {
-            participant.opus_pcm_capture_chunk_head =
-                (participant.opus_pcm_capture_chunk_head + 1) %
-                participant.opus_pcm_capture_chunks.size();
-            --participant.opus_pcm_capture_chunk_count;
-        }
-        const size_t index =
-            (participant.opus_pcm_capture_chunk_head +
-             participant.opus_pcm_capture_chunk_count) %
-            participant.opus_pcm_capture_chunks.size();
-        participant.opus_pcm_capture_chunks[index] =
-            OpusPcmCaptureChunk{frames, capture_server_time_ns, valid};
-        ++participant.opus_pcm_capture_chunk_count;
+    }
+
+    static uint64_t discard_received_opus_capture_chunks(
+        ParticipantData& participant) {
+        return participant.opus_pcm_outcomes.discard_all_as_lost();
     }
 
     static void clear_opus_capture_chunks(ParticipantData& participant) {
-        participant.opus_pcm_capture_chunk_head = 0;
-        participant.opus_pcm_capture_chunk_count = 0;
+        participant.opus_pcm_outcomes.clear();
     }
 
     static void observe_and_consume_opus_capture_chunks(ParticipantData& participant,
                                                         size_t consumed_frames,
                                                         std::optional<int64_t>
                                                             playout_server_time_ns) {
-        size_t remaining = consumed_frames;
-        while (remaining > 0 && participant.opus_pcm_capture_chunk_count > 0) {
-            auto& chunk =
-                participant.opus_pcm_capture_chunks[participant.opus_pcm_capture_chunk_head];
-            if (chunk.valid && chunk.capture_server_time_ns > 0 &&
-                playout_server_time_ns.has_value()) {
-                OpusPacket marker;
-                marker.capture_timestamp_valid = true;
-                marker.capture_server_time_ns = chunk.capture_server_time_ns;
-                observe_capture_to_playout_latency(participant, marker,
-                                                   *playout_server_time_ns);
+        FrameWeightedLatencyAccumulator latency;
+        const uint64_t delivered = participant.opus_pcm_outcomes.consume(
+            consumed_frames, [&](const OpusPcmCaptureChunk& chunk,
+                                 size_t consumed_from_chunk) {
+                if (chunk.received_media && chunk.capture_timestamp_valid &&
+                    chunk.capture_server_time_ns > 0 &&
+                    playout_server_time_ns.has_value() &&
+                    *playout_server_time_ns > chunk.capture_server_time_ns) {
+                    const int64_t sample_ns =
+                        *playout_server_time_ns - chunk.capture_server_time_ns;
+                    latency.observe(sample_ns, consumed_from_chunk,
+                                    consumed_from_chunk == chunk.frames);
+                }
+            });
+        if (!latency.empty()) {
+            observe_latency_sample(participant.capture_to_playout_latency_last_ns,
+                                   participant.capture_to_playout_latency_avg_ns,
+                                   participant.capture_to_playout_latency_max_ns,
+                                   latency.average_ns());
+            int64_t previous_max =
+                participant.capture_to_playout_latency_max_ns.load(
+                    std::memory_order_relaxed);
+            while (latency.max_latency_ns > previous_max &&
+                   !participant.capture_to_playout_latency_max_ns.compare_exchange_weak(
+                       previous_max, latency.max_latency_ns,
+                       std::memory_order_relaxed)) {
             }
-
-            const size_t consumed_from_chunk = std::min(remaining, chunk.frames);
-            chunk.frames -= consumed_from_chunk;
-            remaining -= consumed_from_chunk;
-            if (chunk.frames == 0) {
-                participant.opus_pcm_capture_chunk_head =
-                    (participant.opus_pcm_capture_chunk_head + 1) %
-                    participant.opus_pcm_capture_chunks.size();
-                --participant.opus_pcm_capture_chunk_count;
-            }
+            participant.capture_to_playout_latency_samples.fetch_add(
+                latency.completed_samples, std::memory_order_relaxed);
         }
+        participant.receiver_delivery_delivered.fetch_add(
+            delivered, std::memory_order_relaxed);
     }
 
     void ping_timer_callback() {
@@ -3773,6 +4004,7 @@ private:
         if (join_session_.should_send_join(now)) {
             send_join();
         }
+        retry_pending_key_handoffs_on_io();
     }
 
     void chat_timer_callback() {
@@ -4078,6 +4310,27 @@ private:
                 handle_chat_history_response_message(bytes, recv_data);
                 break;
             }
+            case CtrlHdr::Cmd::ROOM_KEY_HANDOFF_ACK: {
+                if (bytes < sizeof(RoomKeyHandoffAckHdr)) {
+                    break;
+                }
+                RoomKeyHandoffAckHdr ack{};
+                std::memcpy(&ack, recv_data, sizeof(ack));
+                const std::string media_key_commitment(
+                    ack.media_key_commitment.begin(),
+                    ack.media_key_commitment.end());
+                if (ack.target_id == join_session_.participant_id() &&
+                    ack.participant_id != 0 &&
+                    ack.access_epoch == join_session_.access_epoch() &&
+                    media_key_commitment == join_session_.media_key_commitment()) {
+                    std::lock_guard<std::mutex> lock(access_request_mutex_);
+                    pending_key_handoff_acks_.erase(ack.participant_id);
+                    spdlog::info(
+                        "Participant {} acknowledged encrypted room key",
+                        ack.participant_id);
+                }
+                break;
+            }
             default:
                 // Other CTRL messages (JOIN, LEAVE, ALIVE) are not handled by clients
                 break;
@@ -4086,42 +4339,310 @@ private:
 
     void remove_participant(uint32_t participant_id) {
         participant_manager_.remove_participant(participant_id);
+        delivery_report_accumulators_.erase(participant_id);
+        downstream_delivery_by_reporter_.erase(participant_id);
+        downstream_delivery_last_activity_.erase(participant_id);
+        downstream_delivery_tombstone_since_.erase(participant_id);
+        downstream_feedback_by_reporter_.erase(participant_id);
+        secure_control_replay_windows_.erase(participant_id);
         std::lock_guard<std::mutex> lock(access_request_mutex_);
         participant_key_public_.erase(participant_id);
         pending_access_requests_.erase(participant_id);
+        pending_key_handoff_acks_.erase(participant_id);
     }
 
     void log_rt_callback_diagnostics() {
         const uint64_t mix = rt_diag_mix_size_mismatches_.load(std::memory_order_relaxed);
         const uint64_t decode = rt_diag_decode_failures_.load(std::memory_order_relaxed);
+        const uint64_t budget =
+            rt_diag_decode_budget_exhaustions_.load(std::memory_order_relaxed);
         if (mix == rt_diag_logged_mix_size_mismatches_ &&
-            decode == rt_diag_logged_decode_failures_) {
+            decode == rt_diag_logged_decode_failures_ &&
+            budget == rt_diag_logged_decode_budget_exhaustions_) {
             return;
         }
         spdlog::warn(
-            "Audio callback diagnostics: mix_size_mismatches={} decode_failures={}",
-            mix, decode);
+            "Audio callback diagnostics: mix_size_mismatches={} decode_failures={} "
+            "decode_budget_exhaustions={}",
+            mix, decode, budget);
         rt_diag_logged_mix_size_mismatches_ = mix;
         rt_diag_logged_decode_failures_ = decode;
+        rt_diag_logged_decode_budget_exhaustions_ = budget;
+    }
+
+    void snapshot_delivery_outcomes() {
+        participant_manager_.for_each(
+            [&](uint32_t participant_id, ParticipantData& participant) {
+                const auto found = delivery_report_accumulators_.find(participant_id);
+                if (found == delivery_report_accumulators_.end()) {
+                    return;
+                }
+                auto& report = found->second;
+                report.delivered.observe(
+                    participant.receiver_delivery_delivered.load(
+                        std::memory_order_relaxed));
+                report.lost.observe(
+                    participant.sequence_gaps_declared_lost.load(
+                        std::memory_order_relaxed) +
+                    participant.receiver_delivery_drops.load(
+                        std::memory_order_relaxed));
+            });
     }
 
     void cleanup_timer_callback() {
         // Remove participants who haven't sent packets in a while (backup cleanup)
         auto           now                 = std::chrono::steady_clock::now();
-        constexpr auto PARTICIPANT_TIMEOUT = 20s;  // Longer than server timeout (15s)
+        constexpr auto PARTICIPANT_TIMEOUT = 20s;
 
+        snapshot_delivery_outcomes();
         auto removed_ids =
             participant_manager_.remove_timed_out_participants(now, PARTICIPANT_TIMEOUT);
 
         for (uint32_t id: removed_ids) {
+            if (auto report = delivery_report_accumulators_.find(id);
+                report != delivery_report_accumulators_.end()) {
+                report->second.delivered.end_media_lifetime();
+                report->second.lost.end_media_lifetime();
+                report->second.inactive_since = now;
+            }
             spdlog::info(
                 "Removed stale participant {} (no packets for {}s)", id,
                 std::chrono::duration_cast<std::chrono::seconds>(PARTICIPANT_TIMEOUT).count());
         }
 
+        for (auto it = delivery_report_accumulators_.begin();
+             it != delivery_report_accumulators_.end();) {
+            if (it->second.inactive_since !=
+                    std::chrono::steady_clock::time_point{} &&
+                now - it->second.inactive_since >=
+                    DELIVERY_REPORT_STATE_RETENTION) {
+                it = delivery_report_accumulators_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = downstream_delivery_last_activity_.begin();
+             it != downstream_delivery_last_activity_.end();) {
+            if (now - it->second >= DELIVERY_REPORT_STATE_RETENTION) {
+                downstream_delivery_tombstone_since_[it->first] = now;
+                it = downstream_delivery_last_activity_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = downstream_delivery_tombstone_since_.begin();
+             it != downstream_delivery_tombstone_since_.end();) {
+            if (now - it->second >= DELIVERY_REPORT_STATE_RETENTION) {
+                downstream_delivery_by_reporter_.erase(it->first);
+                it = downstream_delivery_tombstone_since_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         log_rt_callback_diagnostics();
         participant_manager_.reap_retired_participants();
         media_state_.reap_retired_wavs();
+        apply_downstream_delivery_feedback();
+        send_audio_delivery_reports();
+        recover_audio_device_if_needed();
+    }
+
+    void recover_audio_device_if_needed() {
+        if (!audio_stream_requested_.load(std::memory_order_acquire) ||
+            audio_.is_stream_active() ||
+            audio_recovery_in_flight_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        const int64_t now_ns = steady_now_ns();
+        if (now_ns < next_audio_recovery_ns_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        const auto input = get_selected_input_device();
+        const auto output = get_selected_output_device();
+        if (input == AudioStream::NO_DEVICE || output == AudioStream::NO_DEVICE) {
+            audio_stream_requested_.store(false, std::memory_order_release);
+            return;
+        }
+
+        const uint32_t attempt =
+            audio_recovery_attempts_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        bool expected = false;
+        if (!audio_recovery_in_flight_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
+        const uint64_t generation =
+            audio_device_generation_.load(std::memory_order_acquire);
+        const auto config = get_audio_config();
+        const std::weak_ptr<int> lifetime = lifetime_token_;
+        spdlog::warn("Audio device stopped unexpectedly; reopen attempt {}", attempt);
+        asio::post(audio_device_worker_,
+                   [this, lifetime, input, output, config, generation, attempt]() {
+            bool success = false;
+            {
+                std::lock_guard<std::mutex> lock(audio_lifecycle_mutex_);
+                if (!lifetime.expired() &&
+                    audio_stream_requested_.load(std::memory_order_acquire) &&
+                    audio_device_generation_.load(std::memory_order_acquire) == generation) {
+                    success = start_audio_stream_locked(input, output, config);
+                }
+            }
+            asio::post(io_context_, [this, lifetime, success, generation, attempt]() {
+                if (lifetime.expired()) {
+                    return;
+                }
+                if (audio_device_generation_.load(std::memory_order_acquire) != generation ||
+                    !audio_stream_requested_.load(std::memory_order_acquire)) {
+                    audio_recovery_in_flight_.store(false, std::memory_order_release);
+                    return;
+                }
+                audio_recovery_in_flight_.store(false, std::memory_order_release);
+                if (success) {
+                    audio_recovery_attempts_.store(0, std::memory_order_release);
+                    next_audio_recovery_ns_.store(0, std::memory_order_release);
+                    spdlog::info("Audio device reopened automatically");
+                    return;
+                }
+
+                const int backoff_seconds =
+                    std::min<int>(4, 1 << std::min<uint32_t>(attempt - 1, 2));
+                next_audio_recovery_ns_.store(
+                    steady_now_ns() +
+                        static_cast<int64_t>(backoff_seconds) * 1'000'000'000LL,
+                    std::memory_order_release);
+            });
+        });
+    }
+
+    void apply_downstream_delivery_feedback() {
+        if (!downstream_feedback_pending_) {
+            return;
+        }
+        downstream_feedback_pending_ = false;
+        std::vector<delivery_report_feedback::ResolvedOutcomes> reporter_outcomes;
+        reporter_outcomes.reserve(downstream_feedback_by_reporter_.size());
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = downstream_feedback_by_reporter_.begin();
+             it != downstream_feedback_by_reporter_.end();) {
+            if (now - it->second.updated_at > DOWNSTREAM_FEEDBACK_RETENTION) {
+                it = downstream_feedback_by_reporter_.erase(it);
+                continue;
+            }
+            reporter_outcomes.push_back(it->second.outcomes);
+            ++it;
+        }
+        const auto loss_rate =
+            delivery_report_feedback::robust_loss_rate(reporter_outcomes);
+        if (!loss_rate.has_value()) {
+            return;
+        }
+        apply_congestion_feedback(
+            *loss_rate,
+            rtt_ms_.load(std::memory_order_relaxed),
+            congestion_policy::FeedbackPath::downstream);
+    }
+
+    void send_audio_delivery_reports() {
+        if (!join_session_.is_join_confirmed() ||
+            !join_session_.server_supports(AUDIO_CAP_DELIVERY_REPORTS) ||
+            !join_session_.server_supports(AUDIO_CAP_SECURE_AUDIO)) {
+            return;
+        }
+        const auto key = current_session_key();
+        if (key == nullptr) {
+            return;
+        }
+        snapshot_delivery_outcomes();
+        for (auto& [sender_id, report]: delivery_report_accumulators_) {
+            const bool participant_exists = participant_manager_.exists(sender_id);
+            if (!participant_exists ||
+                (report.delivered.total == report.last_sent_delivered &&
+                 report.lost.total == report.last_sent_lost)) {
+                continue;
+            }
+            AudioDeliveryReportPayload payload{};
+            payload.report_epoch = report.report_epoch;
+            payload.total_delivered = report.delivered.total;
+            payload.total_lost = report.lost.total;
+
+            session_crypto::SecureControlMetadata metadata;
+            metadata.sender_id = join_session_.participant_id();
+            metadata.target_id = sender_id;
+            metadata.sequence =
+                secure_control_sequence_.fetch_add(1, std::memory_order_acq_rel);
+            metadata.access_epoch = join_session_.access_epoch();
+            metadata.plaintext_bytes = sizeof(payload);
+            metadata.media_key_commitment =
+                join_session_.media_key_commitment();
+
+            std::array<unsigned char, 512> sealed{};
+            size_t sealed_bytes = 0;
+            if (!session_crypto::seal_control_packet(
+                    *key, metadata,
+                    reinterpret_cast<const unsigned char*>(&payload), sizeof(payload),
+                    sealed.data(), sealed.size(), sealed_bytes)) {
+                continue;
+            }
+            auto packet = std::make_shared<std::vector<unsigned char>>(
+                sealed.begin(), sealed.begin() +
+                    static_cast<std::ptrdiff_t>(sealed_bytes));
+            send(packet->data(), packet->size(), packet);
+            report.last_sent_delivered = report.delivered.total;
+            report.last_sent_lost = report.lost.total;
+        }
+    }
+
+    void apply_congestion_feedback(
+        double loss_ratio, double rtt_ms,
+        congestion_policy::FeedbackPath feedback_path) {
+        congestion_policy::State state;
+        state.target_bitrate =
+            congestion_target_bitrate_.load(std::memory_order_relaxed);
+        state.maximum_bitrate =
+            congestion_max_bitrate_.load(std::memory_order_relaxed);
+        state.redundancy_depth =
+            adaptive_redundancy_depth_.load(std::memory_order_relaxed);
+        state.healthy_intervals =
+            congestion_healthy_intervals_.load(std::memory_order_relaxed);
+        const auto next = congestion_policy::update(state, loss_ratio, rtt_ms);
+        congestion_target_bitrate_.store(next.target_bitrate, std::memory_order_release);
+        congestion_healthy_intervals_.store(next.healthy_intervals,
+                                             std::memory_order_release);
+        const int previous_depth = adaptive_redundancy_depth_.exchange(
+            next.redundancy_depth, std::memory_order_acq_rel);
+        if (previous_depth != next.redundancy_depth) {
+            request_recent_opus_audio_packets_reset();
+        }
+
+        const bool impaired = loss_ratio >= 0.01 || rtt_ms >= 150.0;
+        uint16_t desired_frames = opus_network_clock::DEFAULT_FRAME_COUNT;
+        {
+            std::lock_guard lock(packet_duration_mutex_);
+            desired_frames = static_cast<uint16_t>(
+                congestion_policy::update_packet_duration(
+                    packet_duration_state_, feedback_path, impaired,
+                    opus_network_clock::FAST_FRAME_COUNT));
+        }
+        const uint16_t previous_frames = get_opus_network_frame_count();
+        if (desired_frames != previous_frames) {
+            apply_opus_network_frame_count(desired_frames);
+            if (desired_frames > previous_frames) {
+                spdlog::warn(
+                    "Congestion controller increased Opus packet duration to {:.1f} ms "
+                    "after sustained impairment",
+                    opus_network_clock::frame_duration_ms(
+                        opus_network_clock::SAMPLE_RATE, desired_frames));
+            } else {
+                spdlog::info(
+                    "Congestion controller restored configured Opus packet duration to "
+                    "{:.1f} ms after sustained healthy feedback",
+                    opus_network_clock::frame_duration_ms(
+                        opus_network_clock::SAMPLE_RATE, desired_frames));
+            }
+        }
     }
 
     void handle_audio_path_stats_message(std::size_t bytes, const char* recv_data) {
@@ -4144,6 +4665,10 @@ private:
                                               stats.interval_sequence_gaps,
                                               interval_unrecovered_gaps) *
             100.0;
+        apply_congestion_feedback(
+            gap_rate_percent / 100.0,
+            rtt_ms_.load(std::memory_order_relaxed),
+            congestion_policy::FeedbackPath::sender_ingress);
         if (stats.interval_sequence_gaps == 0 && interval_unrecovered_gaps == 0) {
             return;
         }
@@ -4151,12 +4676,14 @@ private:
         spdlog::warn(
             "Server reports sender audio ingress loss: received={} seq_gap={} "
             "net_gap={} net_gap_rate={:.1f}% observed_packet={} total_received={} "
-            "total_gap={} total_net_gap={}; "
-            "manual mode keeps current Opus packet at {} frames",
+            "total_gap={} total_net_gap={}; adaptive_bitrate={} adaptive_redundancy={} "
+            "Opus packet={} frames",
             stats.interval_received, stats.interval_sequence_gaps,
             interval_unrecovered_gaps, gap_rate_percent, stats.observed_frame_count,
             stats.total_received, stats.total_sequence_gaps,
             stats.total_unrecovered_sequence_gaps,
+            congestion_target_bitrate_.load(std::memory_order_relaxed),
+            adaptive_redundancy_depth_.load(std::memory_order_relaxed),
             get_opus_network_frame_count());
         if (client_network_path::should_rebind_after_severe_loss(
                 stats.interval_received, interval_unrecovered_gaps)) {
@@ -4182,8 +4709,8 @@ private:
         }
 
         spdlog::warn(
-            "Server ping replies are missing for {} consecutive sends; manual mode keeps "
-            "current Opus packet at {} frames",
+            "Server ping replies are missing for {} consecutive sends; current Opus packet "
+            "is {} frames",
             missing_replies, get_opus_network_frame_count());
         request_udp_path_rebind("missing server ping replies");
     }
@@ -4227,14 +4754,20 @@ private:
         ping_path_interval_missing_.store(0, std::memory_order_relaxed);
         const double gap_rate_percent =
             client_network_path::gap_rate(received, missing) * 100.0;
+        apply_congestion_feedback(
+            gap_rate_percent / 100.0, rtt_ms,
+            congestion_policy::FeedbackPath::ping);
         if (missing == 0 && rtt_ms < client_network_path::HIGH_RTT_MS) {
             return;
         }
 
         spdlog::warn(
             "Server ping path is unstable: replies={} missing={} gap_rate={:.1f}% "
-            "rtt_ms={:.1f}; manual mode keeps current Opus packet at {} frames",
-            received, missing, gap_rate_percent, rtt_ms, get_opus_network_frame_count());
+            "rtt_ms={:.1f}; adaptive_bitrate={} adaptive_redundancy={} Opus packet={} frames",
+            received, missing, gap_rate_percent, rtt_ms,
+            congestion_target_bitrate_.load(std::memory_order_relaxed),
+            adaptive_redundancy_depth_.load(std::memory_order_relaxed),
+            get_opus_network_frame_count());
         if (client_network_path::should_rebind_after_ping_feedback(
                 received, missing, rtt_ms)) {
             request_udp_path_rebind("severe server ping path loss");
@@ -4268,13 +4801,17 @@ private:
                                                   std::memory_order_relaxed)) {
         }
         observe_ping_path_feedback(hdr.seq, rtt_ms);
-        if (!server_clock_ready_.load(std::memory_order_acquire)) {
-            server_clock_offset_ns_.store(offset, std::memory_order_release);
-            server_clock_ready_.store(true, std::memory_order_release);
-        } else {
-            const int64_t previous = server_clock_offset_ns_.load(std::memory_order_relaxed);
-            server_clock_offset_ns_.store(((previous * 15) + offset) / 16,
+        clock_offset_estimator::Estimate clock_estimate;
+        {
+            std::lock_guard lock(server_clock_estimator_mutex_);
+            clock_estimate = server_clock_estimator_.observe(rtt_ns, offset);
+        }
+        if (clock_estimate.accepted) {
+            server_clock_offset_ns_.store(clock_estimate.offset_ns,
                                           std::memory_order_release);
+            server_clock_uncertainty_ns_.store(clock_estimate.uncertainty_ns,
+                                               std::memory_order_release);
+            server_clock_ready_.store(clock_estimate.ready, std::memory_order_release);
         }
 
         // print live stats
@@ -4311,16 +4848,98 @@ private:
             }
             return;
         }
-        if (plaintext_bytes != sizeof(MediaKeyRotationPayload)) {
+        if (plaintext_bytes == 0) {
             inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
+        const uint8_t command = plaintext[0];
+        if (command == SECURE_CONTROL_AUDIO_DELIVERY_REPORT) {
+            if (metadata.target_id != join_session_.participant_id() ||
+                metadata.sender_id == metadata.target_id ||
+                plaintext_bytes != sizeof(AudioDeliveryReportPayload)) {
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            AudioDeliveryReportPayload report{};
+            std::memcpy(&report, plaintext.data(), sizeof(report));
+            if (report.reserved[0] != 0 || report.reserved[1] != 0 ||
+                report.reserved[2] != 0) {
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (report.total_delivered > UINT64_MAX - report.total_lost) {
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            DownstreamDeliveryReporter candidate;
+            if (const auto previous =
+                    downstream_delivery_by_reporter_.find(metadata.sender_id);
+                previous != downstream_delivery_by_reporter_.end()) {
+                candidate = previous->second;
+            }
+            const bool first_report = !candidate.report.initialized;
+            const bool new_epoch = candidate.report.initialized &&
+                                   candidate.report.report_epoch != report.report_epoch;
+            const uint64_t generated =
+                audio_packets_generated_.load(std::memory_order_acquire) -
+                delivery_report_generated_baseline_;
+            if (first_report &&
+                generated > delivery_report_feedback::MAX_INTERVAL_PACKETS) {
+                candidate.claimed_outcomes =
+                    generated - delivery_report_feedback::MAX_INTERVAL_PACKETS;
+            }
+            const auto delta = delivery_report_feedback::observe(
+                candidate.report, report.report_epoch, metadata.sequence,
+                report.total_delivered, report.total_lost);
+            if (delta.status == delivery_report_feedback::Delta::Status::Stale) {
+                return;
+            }
+            if (delta.status == delivery_report_feedback::Delta::Status::Implausible) {
+                inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            const uint64_t newly_claimed = first_report || new_epoch
+                                               ? report.total_delivered + report.total_lost
+                                               : delta.delivered + delta.lost;
+            if (!delivery_report_feedback::claimed_outcomes_plausible(
+                    candidate.claimed_outcomes, newly_claimed, generated)) {
+                if (delta.status !=
+                    delivery_report_feedback::Delta::Status::Rebaseline) {
+                    inbound_malformed_audio_drops_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    return;
+                }
+                candidate.claimed_outcomes = generated;
+            } else {
+                candidate.claimed_outcomes += newly_claimed;
+            }
+            downstream_delivery_by_reporter_[metadata.sender_id] = candidate;
+            downstream_delivery_last_activity_[metadata.sender_id] =
+                std::chrono::steady_clock::now();
+            downstream_delivery_tombstone_since_.erase(metadata.sender_id);
+            if (delta.status ==
+                delivery_report_feedback::Delta::Status::Rebaseline) {
+                return;
+            }
+            downstream_feedback_by_reporter_[metadata.sender_id] = {
+                {delta.delivered, delta.lost}, std::chrono::steady_clock::now()};
+            downstream_feedback_pending_ = true;
+            return;
+        }
+
+        if (command != SECURE_CONTROL_ROTATE_MEDIA_KEY || metadata.target_id != 0 ||
+            plaintext_bytes != sizeof(MediaKeyRotationPayload)) {
+            inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         MediaKeyRotationPayload payload{};
         std::memcpy(&payload, plaintext.data(), sizeof(payload));
         if (payload.command != SECURE_CONTROL_ROTATE_MEDIA_KEY ||
             payload.reserved8 != 0 ||
             payload.access_epoch == 0 ||
+            payload.access_epoch != metadata.access_epoch ||
             payload.media_secret_bytes == 0 ||
             payload.media_secret_bytes > payload.media_secret.size()) {
             inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
@@ -4330,9 +4949,11 @@ private:
         const std::string media_secret(
             payload.media_secret.begin(),
             payload.media_secret.begin() + payload.media_secret_bytes);
-        apply_media_secret_rotation(media_secret, payload.access_epoch);
-        spdlog::info("Applied encrypted E2E media key rotation from participant {}",
-                     metadata.sender_id);
+        if (apply_media_secret_rotation(media_secret, payload.access_epoch,
+                                        metadata.media_key_commitment)) {
+            spdlog::info("Applied encrypted E2E media key rotation from participant {}",
+                         metadata.sender_id);
+        }
     }
 
     void handle_e2e_key_envelope(std::size_t bytes, const char* recv_data) {
@@ -4347,6 +4968,10 @@ private:
         if (envelope.magic != E2E_KEY_ENVELOPE_MAGIC ||
             envelope.target_id != join_session_.participant_id() ||
             envelope.sender_id == 0 ||
+            envelope.access_epoch == 0 ||
+            !performer_join_token::valid_sha256_hex(std::string(
+                envelope.media_key_commitment.begin(),
+                envelope.media_key_commitment.end())) ||
             envelope.encrypted_bytes <= crypto_box_SEALBYTES ||
             envelope.encrypted_bytes > E2E_KEY_ENVELOPE_MAX_BYTES ||
             envelope.reserved != 0) {
@@ -4376,6 +5001,7 @@ private:
         if (payload.media_secret_bytes == 0 ||
             payload.reserved != 0 ||
             payload.access_epoch == 0 ||
+            payload.access_epoch != envelope.access_epoch ||
             payload.media_secret_bytes > payload.media_secret.size()) {
             inbound_malformed_audio_drops_.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -4384,9 +5010,24 @@ private:
         const std::string media_secret(
             payload.media_secret.begin(),
             payload.media_secret.begin() + payload.media_secret_bytes);
-        apply_media_secret_rotation(media_secret, payload.access_epoch);
-        spdlog::info("Received encrypted room key from participant {}",
-                     envelope.sender_id);
+        const std::string media_key_commitment(
+            envelope.media_key_commitment.begin(),
+            envelope.media_key_commitment.end());
+        const bool applied = apply_media_secret_rotation(
+            media_secret, payload.access_epoch, media_key_commitment);
+        const bool already_applied =
+            payload.access_epoch == join_session_.access_epoch() &&
+            media_key_commitment == join_session_.media_key_commitment() &&
+            media_secret == join_session_.media_secret();
+        if (applied) {
+            spdlog::info("Received encrypted room key from participant {}",
+                         envelope.sender_id);
+        }
+        if (applied || already_applied) {
+            send_key_handoff_ack_on_io(envelope.sender_id,
+                                       payload.access_epoch,
+                                       media_key_commitment);
+        }
     }
 
     void handle_secure_audio_message(std::size_t bytes, const char* recv_data) {
@@ -4560,6 +5201,13 @@ private:
                     parsed_audio.capture_server_time_ns;
                 const auto sequence_delta =
                     participant.sequence_tracker.record(packet.sequence);
+                auto [delivery_it, delivery_inserted] =
+                    delivery_report_accumulators_.try_emplace(sender_id);
+                auto& delivery_report = delivery_it->second;
+                if (delivery_inserted) {
+                    delivery_report.report_epoch = next_delivery_report_epoch();
+                }
+                delivery_report.inactive_since = {};
                 if (sequence_delta.gaps_detected > 0) {
                     participant.sequence_gaps.fetch_add(
                         sequence_delta.gaps_detected,
@@ -4570,9 +5218,10 @@ private:
                         sequence_delta.gaps_recovered,
                         std::memory_order_relaxed);
                 }
-                participant.sequence_unresolved_gaps.store(
-                    participant.sequence_tracker.unresolved_gaps(),
-                    std::memory_order_relaxed);
+                const uint64_t unresolved_gaps =
+                    participant.sequence_tracker.unresolved_gaps();
+                participant.sequence_unresolved_gaps.store(unresolved_gaps,
+                                                           std::memory_order_relaxed);
                 if (sequence_delta.late_or_duplicate &&
                     (count_duplicate_late || sequence_delta.gaps_recovered > 0)) {
                     participant.sequence_late_or_reordered.fetch_add(
@@ -4616,6 +5265,9 @@ private:
                                                                            max_queue_packets)) {
                 participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
                 participant.opus_queue_limit_drops.fetch_add(1, std::memory_order_relaxed);
+                if (!participant.is_muted.load(std::memory_order_relaxed)) {
+                    (void)participant.opus_queue.record_receiver_drop(packet);
+                }
                 return;
             }
 
@@ -4684,7 +5336,7 @@ private:
     }
 
     static int audio_callback(const void* input, void* output, unsigned long frame_count,
-                              void* user_data) {
+                              void* user_data, AudioCallbackWorkBudget& work_budget) {
         const auto* input_buffer  = static_cast<const float*>(input);
         auto*       output_buffer = static_cast<float*>(output);
         auto*       client        = static_cast<Client*>(user_data);
@@ -4727,12 +5379,25 @@ private:
         ParticipantManager::AudioCallbackReadScope participant_snapshot_scope;
 
 #ifdef _WIN32
-        // Boost thread priority on Windows for minimal audio latency
-        thread_local bool priority_set = false;
-        if (!priority_set) {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-            priority_set = true;
-        }
+        struct CallbackThreadPriority {
+            HANDLE handle = nullptr;
+            CallbackThreadPriority() {
+                DWORD task_index = 0;
+                handle = AvSetMmThreadCharacteristicsA("Pro Audio", &task_index);
+                if (handle != nullptr) {
+                    AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL);
+                } else {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+                }
+            }
+            ~CallbackThreadPriority() {
+                if (handle != nullptr) {
+                    AvRevertMmThreadCharacteristics(handle);
+                }
+            }
+        };
+        thread_local CallbackThreadPriority callback_priority;
+        (void)callback_priority;
 #endif
 
         if (output_buffer == nullptr) {
@@ -4745,24 +5410,36 @@ private:
         // Initialize output buffer to silence
         std::memset(output_buffer, 0, bytes_to_copy);
 
-        // Fixed 960-float buffers below cannot hold larger driver callbacks.
-        // The full device buffer was already zeroed above, so the unprocessed
-        // tail stays silent instead of overflowing the stack.
-        if (audio_callback_frames_clamped(frame_count)) {
-            client->callback_frame_clamp_count_.fetch_add(1, std::memory_order_relaxed);
-        }
-        frame_count = audio_callback_process_frame_count(frame_count);
-
         // Mix audio from all active participants (thread-safe iteration)
         int active_count = 0;
+        // Bound burst work even when every participant arrives as 2.5 ms Opus
+        // packets and the device asks for a 20 ms callback.
+        const size_t& remaining_decode_budget = work_budget.remaining_decodes;
         const auto playout_start = std::chrono::steady_clock::now();
         client->participant_manager_.for_each([&](uint32_t         participant_id,
                                                   ParticipantData& participant) {
             observe_opus_pcm_depth(participant);
             participant.last_callback_frame_count.store(frame_count, std::memory_order_relaxed);
             if (participant.is_muted.load(std::memory_order_relaxed)) {
+                participant.opus_queue.discard_all_for_local_mute();
+                participant.opus_pcm_buffered_frames = 0;
+                clear_opus_capture_chunks(participant);
+                participant.opus_resample_phase = 0.0;
+                participant.buffer_ready.store(false, std::memory_order_relaxed);
+                participant.opus_consecutive_empty_callbacks.store(
+                    0, std::memory_order_relaxed);
+                participant.current_level.store(0.0F, std::memory_order_relaxed);
+                participant.current_peak.store(0.0F, std::memory_order_relaxed);
+                participant.is_speaking.store(false, std::memory_order_relaxed);
+                observe_participant_queue_depth(participant,
+                                                participant.opus_queue.size_approx());
+                observe_opus_pcm_depth(participant);
                 return;
             }
+
+            participant.receiver_delivery_drops.fetch_add(
+                participant.opus_queue.take_internal_receiver_drops(),
+                std::memory_order_relaxed);
 
             observe_participant_queue_depth(
                 participant, flush_stalled_delivery_backlog(participant));
@@ -4808,6 +5485,12 @@ private:
                 return;
             }
 
+            if (remaining_decode_budget == 0) {
+                client->rt_diag_decode_budget_exhaustions_.fetch_add(
+                    1, std::memory_order_relaxed);
+                return;
+            }
+
             OpusPacket opus_packet;
             const size_t playout_gap_wait_packets =
                 opus_gap_wait_dequeue_attempts(participant);
@@ -4815,6 +5498,16 @@ private:
                 participant.opus_queue.dequeue(opus_packet, playout_gap_wait_packets);
 
             if (dequeue_status == ParticipantOpusDequeueStatus::Packet) {
+                if (opus_packet.abandoned_receiver_drop_packets > 0) {
+                    participant.receiver_delivery_drops.fetch_add(
+                        opus_packet.abandoned_receiver_drop_packets,
+                        std::memory_order_relaxed);
+                }
+                if (opus_packet.abandoned_gap_packets > 0) {
+                    participant.sequence_gaps_declared_lost.fetch_add(
+                        opus_packet.abandoned_gap_packets,
+                        std::memory_order_relaxed);
+                }
                 auto now = std::chrono::steady_clock::now();
                 auto packet_age = now - opus_packet.timestamp;
                 auto packet_age_ns =
@@ -4837,6 +5530,12 @@ private:
                         std::chrono::duration_cast<std::chrono::nanoseconds>(packet_age).count();
                 }
 
+                if (!consume_audio_decode_budget(work_budget)) {
+                    client->rt_diag_decode_budget_exhaustions_.fetch_add(
+                        1, std::memory_order_relaxed);
+                    return;
+                }
+
                 participant.packet_age_last_ns.store(packet_age_ns, std::memory_order_relaxed);
                 int64_t previous_age_max =
                     participant.packet_age_max_ns.load(std::memory_order_relaxed);
@@ -4853,14 +5552,23 @@ private:
                 participant.last_codec.store(opus_packet.codec, std::memory_order_relaxed);
                 int decoded_samples = 0;
                 if (opus_packet.reset_decoder && opus_packet.codec == AudioCodec::Opus) {
+                    participant.receiver_delivery_drops.fetch_add(
+                        discard_received_opus_capture_chunks(participant),
+                        std::memory_order_relaxed);
                     participant.decoder->reset();
                     participant.opus_pcm_buffered_frames = 0;
-                    clear_opus_capture_chunks(participant);
                     participant.opus_resample_phase = 0.0;
                     observe_auto_jitter_instability(
                         participant, client->get_jitter_packet_age_limit_ms());
                 }
                 if (opus_packet.loss_concealment) {
+                    if (opus_packet.receiver_drop_pending) {
+                        participant.receiver_delivery_drops.fetch_add(
+                            1, std::memory_order_relaxed);
+                    } else {
+                        participant.sequence_gaps_declared_lost.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                     const int decode_frame_count =
                         opus_packet.frame_count > 0 ? static_cast<int>(opus_packet.frame_count)
                                                     : static_cast<int>(frame_count);
@@ -4890,6 +5598,10 @@ private:
                 if (decoded_samples <= 0) {
                     // Decode failed - use silence
                     client->rt_diag_decode_failures_.fetch_add(1, std::memory_order_relaxed);
+                    if (!opus_packet.loss_concealment) {
+                        participant.receiver_delivery_drops.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                     observe_auto_jitter_instability(
                         participant, client->get_jitter_packet_age_limit_ms());
                     return;
@@ -4914,24 +5626,45 @@ private:
                         append_opus_capture_chunk(
                             participant, decoded_frames,
                             opus_packet.capture_server_time_ns,
-                            opus_packet.capture_timestamp_valid);
+                            opus_packet.capture_timestamp_valid,
+                            !opus_packet.loss_concealment);
                         participant.opus_packets_decoded_in_callback.fetch_add(
                             1, std::memory_order_relaxed);
                     } else {
+                        const uint64_t dropped_packets =
+                            discard_received_opus_capture_chunks(participant) +
+                            (opus_packet.loss_concealment ? 0 : 1);
                         participant.opus_pcm_buffered_frames = 0;
-                        clear_opus_capture_chunks(participant);
                         participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
                         participant.opus_decode_buffer_overflow_drops.fetch_add(
                             1, std::memory_order_relaxed);
+                        participant.receiver_delivery_drops.fetch_add(
+                            dropped_packets, std::memory_order_relaxed);
                     }
 
                     double playout_ratio = opus_playout_rate_ratio(participant);
                     size_t required_input_frames = opus_resample_required_input_frames(
                         participant, frame_count, playout_ratio);
-                    while (participant.opus_pcm_buffered_frames < required_input_frames) {
+                    while (participant.opus_pcm_buffered_frames < required_input_frames &&
+                           remaining_decode_budget > 0) {
                         OpusPacket next_packet;
                         if (!participant.opus_queue.try_dequeue(next_packet,
                                                                 playout_gap_wait_packets)) {
+                            break;
+                        }
+                        if (next_packet.abandoned_receiver_drop_packets > 0) {
+                            participant.receiver_delivery_drops.fetch_add(
+                                next_packet.abandoned_receiver_drop_packets,
+                                std::memory_order_relaxed);
+                        }
+                        if (next_packet.abandoned_gap_packets > 0) {
+                            participant.sequence_gaps_declared_lost.fetch_add(
+                                next_packet.abandoned_gap_packets,
+                                std::memory_order_relaxed);
+                        }
+                        if (!consume_audio_decode_budget(work_budget)) {
+                            client->rt_diag_decode_budget_exhaustions_.fetch_add(
+                                1, std::memory_order_relaxed);
                             break;
                         }
 
@@ -4942,14 +5675,23 @@ private:
                         const auto next_decode_start = std::chrono::steady_clock::now();
                         int next_decoded_samples = 0;
                         if (next_packet.reset_decoder) {
+                            participant.receiver_delivery_drops.fetch_add(
+                                discard_received_opus_capture_chunks(participant),
+                                std::memory_order_relaxed);
                             participant.decoder->reset();
                             participant.opus_pcm_buffered_frames = 0;
-                            clear_opus_capture_chunks(participant);
                             participant.opus_resample_phase = 0.0;
                             observe_auto_jitter_instability(
                                 participant, client->get_jitter_packet_age_limit_ms());
                         }
                         if (next_packet.loss_concealment) {
+                            if (next_packet.receiver_drop_pending) {
+                                participant.receiver_delivery_drops.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            } else {
+                                participant.sequence_gaps_declared_lost.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
                             next_decoded_samples = participant.decoder->decode_plc(
                                 participant.pcm_buffer.data(), next_decode_frame_count);
                             if (next_decoded_samples > 0) {
@@ -4966,6 +5708,10 @@ private:
                         client->observe_rx_decode_time(std::chrono::steady_clock::now() -
                                                        next_decode_start);
                         if (next_decoded_samples <= 0) {
+                            if (!next_packet.loss_concealment) {
+                                participant.receiver_delivery_drops.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
                             break;
                         }
 
@@ -4979,11 +5725,15 @@ private:
                         }
                         if (participant.opus_pcm_buffered_frames + next_decoded_frames >
                             participant.opus_pcm_buffer.size()) {
+                            const uint64_t dropped_packets =
+                                discard_received_opus_capture_chunks(participant) +
+                                (next_packet.loss_concealment ? 0 : 1);
                             participant.opus_pcm_buffered_frames = 0;
-                            clear_opus_capture_chunks(participant);
                             participant.jitter_depth_drops.fetch_add(1, std::memory_order_relaxed);
                             participant.opus_decode_buffer_overflow_drops.fetch_add(
                                 1, std::memory_order_relaxed);
+                            participant.receiver_delivery_drops.fetch_add(
+                                dropped_packets, std::memory_order_relaxed);
                             break;
                         }
 
@@ -4995,7 +5745,8 @@ private:
                         append_opus_capture_chunk(
                             participant, next_decoded_frames,
                             next_packet.capture_server_time_ns,
-                            next_packet.capture_timestamp_valid);
+                            next_packet.capture_timestamp_valid,
+                            !next_packet.loss_concealment);
                         participant.opus_packets_decoded_in_callback.fetch_add(
                             1, std::memory_order_relaxed);
                         playout_ratio = opus_playout_rate_ratio(participant);
@@ -5097,6 +5848,11 @@ private:
 
                 int plc_samples = 0;
                 if (participant.last_codec.load(std::memory_order_relaxed) == AudioCodec::Opus) {
+                    if (!consume_audio_decode_budget(work_budget)) {
+                        client->rt_diag_decode_budget_exhaustions_.fetch_add(
+                            1, std::memory_order_relaxed);
+                        return;
+                    }
                     const auto plc_start = std::chrono::steady_clock::now();
                     plc_samples = participant.decoder->decode_plc(participant.pcm_buffer.data(),
                                                                   static_cast<int>(frame_count));
@@ -5259,7 +6015,7 @@ private:
     std::filesystem::path audio_preferences_path_;
     std::shared_ptr<const session_crypto::SessionKey> session_key_;
     std::atomic<uint32_t> secure_control_sequence_{1};
-    std::unordered_map<uint32_t, uint32_t> secure_control_highest_sequence_;
+    std::unordered_map<uint32_t, ReplayWindow> secure_control_replay_windows_;
     session_crypto::E2EPublicKey e2e_public_key_{};
     session_crypto::E2ESecretKey e2e_secret_key_{};
     Bytes<E2E_PUBLIC_KEY_BYTES> e2e_key_public_bytes_{};
@@ -5267,17 +6023,34 @@ private:
     mutable std::mutex access_request_mutex_;
     std::unordered_map<uint32_t, Bytes<E2E_PUBLIC_KEY_BYTES>> participant_key_public_;
     std::unordered_map<uint32_t, ParticipantInfo> pending_access_requests_;
+    std::unordered_set<uint32_t> pending_key_handoff_acks_;
 
     AudioStream              audio_;
+    std::mutex               audio_lifecycle_mutex_;
+    asio::thread_pool        audio_device_worker_{1};
+    std::shared_ptr<int>     lifetime_token_ = std::make_shared<int>(0);
+    std::atomic<uint64_t>    audio_device_generation_{0};
+    std::atomic<bool>        audio_stream_requested_{false};
+    std::atomic<bool>        audio_recovery_in_flight_{false};
+    std::atomic<uint32_t>    audio_recovery_attempts_{0};
+    std::atomic<int64_t>     next_audio_recovery_ns_{0};
     OpusEncoderWrapper       audio_encoder_;
-    std::atomic<uint16_t>    opus_network_frame_count_{opus_network_clock::DEFAULT_FRAME_COUNT};
+    std::atomic<uint16_t>    opus_network_frame_count_{
+        opus_network_clock::DEFAULT_FRAME_COUNT};
+    std::mutex               packet_duration_mutex_;
+    congestion_policy::PacketDurationState packet_duration_state_{};
     std::atomic<int>         opus_jitter_buffer_ms_{DEFAULT_OPUS_JITTER_MS};
     std::atomic<size_t>      opus_queue_limit_packets_{DEFAULT_OPUS_QUEUE_LIMIT_PACKETS};
     std::atomic<int>         jitter_packet_age_limit_ms_{DEFAULT_JITTER_PACKET_AGE_MS};
     std::atomic<bool>        opus_auto_jitter_default_{true};
     std::atomic<int>         opus_redundancy_depth_packets_{
         DEFAULT_OPUS_REDUNDANCY_DEPTH_PACKETS};
+    std::atomic<int>         congestion_max_bitrate_{congestion_policy::DEFAULT_MAX_BITRATE};
+    std::atomic<int>         congestion_target_bitrate_{congestion_policy::DEFAULT_MAX_BITRATE};
+    std::atomic<int>         adaptive_redundancy_depth_{-1};
+    std::atomic<uint32_t>    congestion_healthy_intervals_{0};
     std::atomic<uint32_t>    audio_tx_sequence_{0};
+    std::atomic<uint64_t>    audio_packets_generated_{0};
     float                    output_mix_gain_ = 1.0F;
     // Pre-sized so the audio callback's try_enqueue never allocates
     // (max_send_queue_frames caps useful depth at 8; 64 gives block-pool slack).
@@ -5300,13 +6073,29 @@ private:
     // the io-thread cleanup timer. The callback itself must never log.
     std::atomic<uint64_t> rt_diag_mix_size_mismatches_{0};
     std::atomic<uint64_t> rt_diag_decode_failures_{0};
+    std::atomic<uint64_t> rt_diag_decode_budget_exhaustions_{0};
     uint64_t              rt_diag_logged_mix_size_mismatches_  = 0;  // io thread only
     uint64_t              rt_diag_logged_decode_failures_      = 0;  // io thread only
+    uint64_t              rt_diag_logged_decode_budget_exhaustions_ = 0;  // io thread only
     std::atomic<uint64_t>                     outbound_malformed_audio_drops_{0};
     std::atomic<uint64_t>                     inbound_malformed_audio_drops_{0};
     std::atomic<uint64_t>                     stray_udp_packets_{0};
+    std::unordered_map<uint32_t, DeliveryReportAccumulator>
+        delivery_report_accumulators_;
+    std::unordered_map<uint32_t, DownstreamDeliveryReporter>
+        downstream_delivery_by_reporter_;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
+        downstream_delivery_last_activity_;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
+        downstream_delivery_tombstone_since_;
+    std::unordered_map<uint32_t, DownstreamFeedbackInterval>
+        downstream_feedback_by_reporter_;
+    bool downstream_feedback_pending_ = false;
+    uint64_t delivery_report_generated_baseline_ = 0;
+    uint32_t next_delivery_report_epoch_ = 1;
     std::atomic<bool>                         receiving_enabled_{false};
     std::atomic<uint64_t>                     receive_generation_{0};
+    std::array<ReceiveState, RECEIVE_SLOT_COUNT> receive_states_{};
     std::atomic<bool>                         outbound_enabled_{false};
     std::atomic<uint64_t>                     outbound_generation_{0};
     std::atomic<bool>                         join_denied_room_full_{false};
@@ -5347,7 +6136,10 @@ private:
     std::atomic<int64_t> rtt_avg_ns_{0};
     std::atomic<int64_t> rtt_max_ns_{0};
     std::atomic<int64_t> server_clock_offset_ns_{0};
+    std::atomic<int64_t> server_clock_uncertainty_ns_{0};
     std::atomic<bool>    server_clock_ready_{false};
+    std::mutex server_clock_estimator_mutex_;
+    clock_offset_estimator::Estimator server_clock_estimator_;
     std::atomic<uint32_t> ping_tx_sequence_{0};
     std::atomic<uint32_t> last_ping_reply_sequence_{0};
     std::atomic<bool>     have_ping_reply_sequence_{false};
@@ -5375,8 +6167,6 @@ private:
     std::atomic<int64_t>  callback_deadline_ns_{0};
     std::atomic<uint64_t> callback_count_{0};
     std::atomic<uint64_t> callback_over_deadline_count_{0};
-    std::atomic<uint64_t> callback_frame_clamp_count_{0};
-
     struct ParticipantDropSnapshot {
         uint64_t jitter_depth_drops = 0;
         uint64_t jitter_age_drops   = 0;

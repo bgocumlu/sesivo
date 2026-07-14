@@ -48,7 +48,7 @@ const DEV = {
   frames: "120",
   ttlMs: 10 * 60 * 1000,
   roomInstance: "",
-  accessEpoch: "0",
+  accessEpoch: "1",
   serverExe: process.env.JAM_SERVER_EXE ?? defaultServerExe(),
   clientExe: process.env.JAM_CLIENT_EXE ?? defaultClientExe(),
   clients: {
@@ -89,14 +89,15 @@ function tokenFor(client) {
     client.user,
     DEV.roomInstance,
     DEV.accessEpoch,
+    crypto.createHash("sha256").update(DEV.mediaSecret).digest("hex"),
     nonce,
   ];
   const encodedPayload = tokenPayload(payload);
   const signature = crypto
     .createHmac("sha256", DEV.secret)
-    .update(`v2|${encodedPayload}`)
+    .update(`v3|${encodedPayload}`)
     .digest("hex");
-  return ["v2", base64Url(encodedPayload), signature].join(".");
+  return ["v3", base64Url(encodedPayload), signature].join(".");
 }
 
 function run(command, args) {

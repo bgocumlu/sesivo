@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-set(SESIVO_VERSION "0.4.0")
+set(SESIVO_VERSION "0.5.0")
 
 # Windows release artifacts must run on machines without the Visual C++
 # Redistributable installed. Use /MT for release-like configs and /MTd for Debug.
@@ -25,6 +25,7 @@ include(FetchContent)
 
 option(JAM_BUILD_CLIENT "Build the desktop GUI client" ON)
 option(JAM_BUILD_TESTS "Build and register jam self-tests" OFF)
+option(JAM_ENABLE_FUZZING "Build libFuzzer network parser target" OFF)
 
 set(JAM_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(JAM_COMMON_DIR "${JAM_SRC_DIR}/common")
@@ -59,6 +60,17 @@ if(JAM_BUILD_CLIENT)
     include(cmake/client.cmake)
 endif()
 
+if(JAM_ENABLE_FUZZING)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "JAM_ENABLE_FUZZING requires Clang")
+    endif()
+    add_executable(packet_parser_fuzz ${JAM_TEST_DIR}/packet_parser_fuzz.cpp)
+    jam_add_project_includes(packet_parser_fuzz)
+    target_link_libraries(packet_parser_fuzz PRIVATE token_crypto)
+    target_compile_options(packet_parser_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_options(packet_parser_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+endif()
+
 if(JAM_BUILD_TESTS)
     function(jam_add_self_test target_name source_name)
         add_executable(${target_name} ${JAM_TEST_DIR}/${source_name})
@@ -90,8 +102,21 @@ if(JAM_BUILD_TESTS)
     )
     target_link_libraries(client_config_store_self_test PRIVATE spdlog::spdlog juce::juce_core)
 
+    add_executable(client_network_path_self_test
+        ${JAM_TEST_DIR}/client_network_path_self_test.cpp
+        ${JAM_CLIENT_DIR}/client_network_path.cpp
+    )
+    jam_add_project_includes(client_network_path_self_test)
+
+    jam_add_self_test(congestion_policy_self_test congestion_policy_self_test.cpp)
+    jam_add_self_test(clock_offset_estimator_self_test clock_offset_estimator_self_test.cpp)
+
     jam_add_self_test(server_rate_limiter_self_test server_rate_limiter_self_test.cpp)
     target_link_libraries(server_rate_limiter_self_test PRIVATE asio)
+
+    jam_add_self_test(relay_load_probe relay_load_probe.cpp)
+    target_sources(relay_load_probe PRIVATE ${JAM_CLIENT_DIR}/client_join_session.cpp)
+    target_link_libraries(relay_load_probe PRIVATE asio token_crypto)
 
     jam_add_self_test(server_options_self_test server_options_self_test.cpp)
     target_link_libraries(server_options_self_test PRIVATE spdlog::spdlog token_crypto)
@@ -180,6 +205,9 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(client_manager_self_test)
     jam_add_executable_test(client_startup_self_test)
     jam_add_executable_test(client_config_store_self_test)
+    jam_add_executable_test(client_network_path_self_test)
+    jam_add_executable_test(congestion_policy_self_test)
+    jam_add_executable_test(clock_offset_estimator_self_test)
     jam_add_executable_test(server_rate_limiter_self_test)
     jam_add_executable_test(server_options_self_test)
     jam_add_executable_test(room_registry_self_test)
@@ -210,6 +238,17 @@ if(JAM_BUILD_TESTS)
     jam_add_executable_test(wav_file_playback_self_test)
 
     if(NODE_EXECUTABLE)
+        add_test(NAME room_control_and_relay_smoke
+            COMMAND "${NODE_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/run-relay-load-test.mjs"
+                    --server-exe $<TARGET_FILE:server>
+                    --probe-exe $<TARGET_FILE:relay_load_probe>
+                    --clients 8
+                    --senders 8
+                    --duration-ms 250
+                    --frames 120
+                    --min-delivery 0.99
+                    --max-receive-age-p999-ms 25)
         add_test(NAME latency_measurement_tool_self_test
             COMMAND "${NODE_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/latency-measurement.mjs"

@@ -1,4 +1,5 @@
 #include "session_crypto.h"
+#include "replay_window.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +20,10 @@ void require(bool condition, const char* message) {
     }
 }
 
+std::string test_media_key_commitment() {
+    return performer_join_token::try_sha256_hex("test-media-secret").value_or("");
+}
+
 void test_libsodium_sha256_and_hmac_vectors() {
     const std::vector<unsigned char> abc{'a', 'b', 'c'};
     const auto sha = performer_join_token::try_sha256(abc);
@@ -32,6 +37,34 @@ void test_libsodium_sha256_and_hmac_vectors() {
     require(*hmac ==
                 "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
             "hmac-sha256 vector should match");
+}
+
+void test_maximum_room_join_ticket_fits_wire_format() {
+    performer_join_token::Claims claims;
+    claims.expires_at_ms = performer_join_token::now_ms() + 60'000;
+    claims.server_id = std::string(63, 's');
+    claims.room_id = std::string(63, 'r');
+    claims.profile_id = std::string(63, 'p');
+    claims.room_instance_id = std::string(32, 'i');
+    claims.access_epoch = UINT32_MAX;
+    claims.media_key_commitment = std::string(64, 'a');
+    claims.nonce = std::string(32, 'n');
+
+    const auto token = performer_join_token::create(claims, "ticket-test-secret");
+    require(token.has_value(), "maximum room join ticket should be created");
+    require(token->size() < JOIN_TOKEN_WIRE_BYTES,
+            "maximum room join ticket must fit without truncation");
+
+    JoinHdr join{};
+    require(packet_builder::write_fixed_checked(join.join_token, *token),
+            "maximum room join ticket should pass checked serialization");
+    const auto terminator = std::find(join.join_token.begin(), join.join_token.end(), '\0');
+    require(std::string(join.join_token.begin(), terminator) == *token,
+            "maximum room join ticket must survive wire serialization");
+
+    const std::string oversized(JOIN_TOKEN_WIRE_BYTES, 'x');
+    require(!packet_builder::write_fixed_checked(join.join_token, oversized),
+            "oversized join ticket must be rejected instead of truncated");
 }
 
 bool same_metadata(const session_crypto::SecureAudioMetadata& lhs,
@@ -70,6 +103,12 @@ void test_key_derivation_is_stable() {
     require(*key != *other_instance_key,
             "different room instance should produce different media key");
     require(*key != *other_secret_key, "different secret should produce different media key");
+    require(session_crypto::media_secret_matches_commitment(
+                "test-media-secret", test_media_key_commitment()),
+            "authorized media secret should match its commitment");
+    require(!session_crypto::media_secret_matches_commitment(
+                "attacker-media-secret", test_media_key_commitment()),
+            "participant-supplied replacement key should not match the room commitment");
 
     const auto chat_key = session_crypto::derive_chat_key_from_secret(
         "secure.room", "room.instance.a", "test-media-secret");
@@ -197,8 +236,12 @@ void test_secure_control_round_trip_and_tamper_rejection() {
 
     session_crypto::SecureControlMetadata metadata;
     metadata.sender_id = 7;
+    metadata.target_id = 0;
     metadata.sequence = 3;
+    metadata.access_epoch = payload.access_epoch;
     metadata.plaintext_bytes = sizeof(payload);
+    metadata.media_key_commitment =
+        performer_join_token::try_sha256_hex(next_secret).value_or("");
 
     std::array<unsigned char, 512> sealed{};
     size_t sealed_bytes = 0;
@@ -216,7 +259,11 @@ void test_secure_control_round_trip_and_tamper_rejection() {
                 sealed.data(), sealed_bytes, parsed_metadata, encrypted_bytes),
             "secure control header should parse");
     require(parsed_metadata.sender_id == metadata.sender_id &&
+                parsed_metadata.target_id == metadata.target_id &&
                 parsed_metadata.sequence == metadata.sequence &&
+                parsed_metadata.access_epoch == metadata.access_epoch &&
+                parsed_metadata.media_key_commitment ==
+                    metadata.media_key_commitment &&
                 parsed_metadata.plaintext_bytes == metadata.plaintext_bytes,
             "secure control metadata should round trip");
 
@@ -229,6 +276,7 @@ void test_secure_control_round_trip_and_tamper_rejection() {
             "control open should succeed");
     require(opened_bytes == sizeof(payload), "opened control size should match");
     require(opened_metadata.sender_id == metadata.sender_id &&
+                opened_metadata.target_id == metadata.target_id &&
                 opened_metadata.sequence == metadata.sequence,
             "opened control metadata should match");
     MediaKeyRotationPayload opened_payload{};
@@ -253,12 +301,78 @@ void test_secure_control_round_trip_and_tamper_rejection() {
                 opened.data(), opened.size(), opened_bytes),
             "control header tamper should fail");
 
+    auto tampered_target = sealed;
+    std::memcpy(&header, tampered_target.data(), sizeof(header));
+    header.target_id ^= 0x01;
+    std::memcpy(tampered_target.data(), &header, sizeof(header));
+    require(!session_crypto::open_control_packet(
+                *key, tampered_target.data(), sealed_bytes, opened_metadata,
+                opened.data(), opened.size(), opened_bytes),
+            "control target tamper should fail");
+
     auto tampered_ciphertext = sealed;
     tampered_ciphertext[SECURE_CONTROL_HEADER_BYTES] ^= 0x01;
     require(!session_crypto::open_control_packet(
                 *key, tampered_ciphertext.data(), sealed_bytes, opened_metadata,
                 opened.data(), opened.size(), opened_bytes),
             "control ciphertext tamper should fail");
+}
+
+void test_secure_control_replay_window_accepts_reordering() {
+    ReplayWindow window;
+    require(window.accept(10), "first secure control sequence should pass");
+    require(window.accept(12), "newer secure control sequence should pass");
+    require(window.accept(11), "reordered secure control sequence should pass once");
+    require(!window.accept(11), "reordered secure control replay should fail");
+    require(!window.accept(12), "highest secure control replay should fail");
+    require(window.accept(80), "sequence beyond the replay window should advance it");
+    require(!window.accept(10), "sequence older than the replay window should fail");
+}
+
+void test_secure_delivery_report_round_trip() {
+    const auto key = session_crypto::derive_media_key_from_secret(
+        "secure.room", "room.instance.a", "test-media-secret");
+    require(key.has_value(), "delivery report key derivation should succeed");
+
+    AudioDeliveryReportPayload report{};
+    report.report_epoch = 11;
+    report.total_delivered = 116;
+    report.total_lost = 4;
+    session_crypto::SecureControlMetadata metadata;
+    metadata.sender_id = 7;
+    metadata.target_id = 9;
+    metadata.sequence = 4;
+    metadata.access_epoch = 3;
+    metadata.plaintext_bytes = sizeof(report);
+    metadata.media_key_commitment = test_media_key_commitment();
+
+    std::array<unsigned char, 512> sealed{};
+    size_t sealed_bytes = 0;
+    require(session_crypto::seal_control_packet(
+                *key, metadata,
+                reinterpret_cast<const unsigned char*>(&report), sizeof(report),
+                sealed.data(), sealed.size(), sealed_bytes),
+            "delivery report seal should succeed");
+
+    std::array<unsigned char, 512> opened{};
+    session_crypto::SecureControlMetadata opened_metadata;
+    size_t opened_bytes = 0;
+    require(session_crypto::open_control_packet(
+                *key, sealed.data(), sealed_bytes, opened_metadata,
+                opened.data(), opened.size(), opened_bytes),
+            "delivery report open should succeed");
+    require(opened_metadata.sender_id == metadata.sender_id &&
+                opened_metadata.target_id == metadata.target_id &&
+                opened_metadata.sequence == metadata.sequence,
+            "delivery report routing metadata should be authenticated");
+    require(opened_bytes == sizeof(report), "delivery report size should round trip");
+    AudioDeliveryReportPayload opened_report{};
+    std::memcpy(&opened_report, opened.data(), sizeof(opened_report));
+    require(opened_report.command == SECURE_CONTROL_AUDIO_DELIVERY_REPORT &&
+                opened_report.report_epoch == report.report_epoch &&
+                opened_report.total_delivered == report.total_delivered &&
+                opened_report.total_lost == report.total_lost,
+            "delivery report payload should round trip");
 }
 
 void test_chat_seal_open_and_aad_rejection() {
@@ -322,9 +436,12 @@ void test_chat_seal_open_and_aad_rejection() {
 
 int main() {
     test_libsodium_sha256_and_hmac_vectors();
+    test_maximum_room_join_ticket_fits_wire_format();
     test_key_derivation_is_stable();
     test_seal_open_round_trip_and_tamper_rejection();
     test_secure_control_round_trip_and_tamper_rejection();
+    test_secure_control_replay_window_accepts_reordering();
+    test_secure_delivery_report_round_trip();
     test_chat_seal_open_and_aad_rejection();
     std::cout << "session crypto self-test passed\n";
     return 0;

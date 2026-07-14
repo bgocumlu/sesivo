@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -51,10 +52,6 @@ bool sample_rate_list_contains(const std::vector<double>& rates, int sample_rate
     return std::any_of(rates.begin(), rates.end(), [&](double rate) {
         return std::abs(rate - static_cast<double>(sample_rate)) < 0.5;
     });
-}
-
-bool sample_rate_is_supported_or_unknown(const std::vector<double>& rates, int sample_rate) {
-    return rates.empty() || sample_rate_list_contains(rates, sample_rate);
 }
 
 double choose_default_sample_rate(const std::vector<double>& rates) {
@@ -226,17 +223,6 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
         runtime_config.input_channel_index);
     runtime_config.input_channel_index =
         input_channel_plan.selected_device_channel;
-    if (!sample_rate_is_supported_or_unknown(input_info.sample_rates,
-                                             runtime_config.sample_rate)) {
-        last_error_ = "Selected input device does not report support for required 48000 Hz";
-        return false;
-    }
-    if (!sample_rate_is_supported_or_unknown(output_info.sample_rates,
-                                             runtime_config.sample_rate)) {
-        last_error_ = "Selected output device does not report support for required 48000 Hz";
-        return false;
-    }
-
     current_config_ = runtime_config;
     callback_.store(callback, std::memory_order_release);
     callback_user_data_.store(user_data, std::memory_order_release);
@@ -249,9 +235,7 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
                                   std::memory_order_release);
     output_channel_count_.store(output_info.max_output_channels >= 2 ? 2 : 1,
                                 std::memory_order_release);
-    actual_buffer_frames_.store(std::max(runtime_config.frames_per_buffer, 0),
-                                std::memory_order_release);
-    prepare_callback_buffers(std::max(runtime_config.frames_per_buffer, 0));
+    actual_buffer_frames_.store(0, std::memory_order_release);
 
     juce::AudioDeviceManager::AudioDeviceSetup setup;
     setup.inputDeviceName = input_device_name;
@@ -283,22 +267,34 @@ bool JuceAudioBackend::start_audio_stream(AudioDeviceId input_device, AudioDevic
                                    output_channel_count_.load(std::memory_order_acquire), nullptr,
                                    false, {}, &setup);
     if (juce_error(error)) {
-        last_error_ = "JUCE audio initialise failed: " + to_std_string(error);
+        const auto requested_error = to_std_string(error);
         device_manager_.closeAudioDevice();
-        return false;
-    }
 
-    error = device_manager_.setAudioDeviceSetup(setup, true);
-    if (juce_error(error)) {
-        last_error_ = "JUCE audio setup failed: " + to_std_string(error);
-        device_manager_.closeAudioDevice();
-        return false;
+        // Bluetooth hands-free profiles commonly expose 16 or 24 kHz audio and
+        // larger fixed buffers. Let the device choose its native format, then
+        // bridge that format to the engine's fixed 48 kHz clock in the callback.
+        setup.sampleRate = 0.0;
+        setup.bufferSize = 0;
+        error = device_manager_.initialise(
+            opened_input_channel_count_.load(std::memory_order_acquire),
+            output_channel_count_.load(std::memory_order_acquire), nullptr,
+            false, {}, &setup);
+        if (juce_error(error)) {
+            last_error_ = "JUCE audio initialise failed: " + requested_error +
+                          "; native-format retry failed: " + to_std_string(error);
+            device_manager_.closeAudioDevice();
+            return false;
+        }
     }
 
     if (auto* current_device = device_manager_.getCurrentAudioDevice()) {
         const auto current_buffer_size = current_device->getCurrentBufferSizeSamples();
         actual_buffer_frames_.store(current_buffer_size, std::memory_order_release);
-        prepare_callback_buffers(current_buffer_size);
+        configure_rate_conversion(current_device->getCurrentSampleRate(), current_buffer_size);
+    } else {
+        last_error_ = "JUCE audio initialise did not open a device";
+        device_manager_.closeAudioDevice();
+        return false;
     }
 
     device_manager_.addAudioCallback(this);
@@ -315,6 +311,10 @@ void JuceAudioBackend::stop_audio_stream() {
     callback_.store(nullptr, std::memory_order_release);
     callback_user_data_.store(nullptr, std::memory_order_release);
     opened_input_channel_count_.store(0, std::memory_order_release);
+    input_resample_fifo_frames_ = 0;
+    output_resample_fifo_frames_[0] = 0;
+    output_resample_fifo_frames_[1] = 0;
+    engine_frame_remainder_ = 0.0;
 }
 
 bool JuceAudioBackend::is_stream_active() const {
@@ -338,10 +338,6 @@ AudioLatencyInfo JuceAudioBackend::get_latency_info() const {
     info.sample_rate = current_config_.sample_rate;
     info.requested_buffer_frames = current_config_.frames_per_buffer;
     info.actual_buffer_frames = actual_buffer_frames_.load(std::memory_order_acquire);
-    if (info.sample_rate > 0.0 && info.actual_buffer_frames > 0) {
-        info.buffer_duration_ms =
-            static_cast<double>(info.actual_buffer_frames) * 1000.0 / info.sample_rate;
-    }
 
     if (auto* device = device_manager_.getCurrentAudioDevice()) {
         const auto sample_rate = device->getCurrentSampleRate();
@@ -358,6 +354,11 @@ AudioLatencyInfo JuceAudioBackend::get_latency_info() const {
                 static_cast<double>(output_latency) * 1000.0 / info.sample_rate;
         }
         info.backend_latency_available = input_latency > 0 || output_latency > 0;
+    }
+
+    if (info.sample_rate > 0.0 && info.actual_buffer_frames > 0) {
+        info.buffer_duration_ms =
+            static_cast<double>(info.actual_buffer_frames) * 1000.0 / info.sample_rate;
     }
 
     return info;
@@ -382,9 +383,6 @@ void JuceAudioBackend::audioDeviceIOCallbackWithContext(
     const auto input_channels = std::max(input_channel_count_.load(std::memory_order_acquire), 1);
     const auto output_channels = std::max(output_channel_count_.load(std::memory_order_acquire), 1);
     const auto safe_num_samples = std::max(num_samples, 0);
-    const auto frames_to_process =
-        std::min<std::size_t>(static_cast<std::size_t>(safe_num_samples),
-                              callback_frame_capacity_);
 
     for (int channel = 0; channel < num_output_channels; ++channel) {
         if (output_channel_data != nullptr && output_channel_data[channel] != nullptr) {
@@ -393,6 +391,104 @@ void JuceAudioBackend::audioDeviceIOCallbackWithContext(
         }
     }
 
+    if (safe_num_samples == 0) {
+        return;
+    }
+
+    if (rate_conversion_active_) {
+        const auto device_frames = std::min<std::size_t>(
+            static_cast<std::size_t>(safe_num_samples), device_input_.size());
+        if (device_frames == 0) {
+            return;
+        }
+
+        juce_audio_adapter::copy_selected_input_channel_to_interleaved(
+            input_channel_data, num_input_channels,
+            selected_input_channel_.load(std::memory_order_acquire),
+            static_cast<int>(device_frames), 1, device_input_.data(), device_input_.size());
+
+        if (input_resample_fifo_frames_ + device_frames > input_resample_fifo_.size()) {
+            input_resampler_.reset();
+            input_resample_fifo_frames_ = 0;
+        }
+        std::copy_n(device_input_.data(), device_frames,
+                    input_resample_fifo_.data() + input_resample_fifo_frames_);
+        input_resample_fifo_frames_ += device_frames;
+
+        const auto engine_rate = static_cast<double>(std::max(current_config_.sample_rate, 1));
+        engine_frame_remainder_ +=
+            static_cast<double>(device_frames) * engine_rate / device_sample_rate_;
+        const auto engine_frames = std::min<std::size_t>(
+            static_cast<std::size_t>(engine_frame_remainder_), callback_frame_capacity_);
+        engine_frame_remainder_ -= static_cast<double>(engine_frames);
+        if (engine_frames == 0) {
+            return;
+        }
+
+        const auto input_frames_used = input_resampler_.process(
+            device_sample_rate_ / engine_rate, input_resample_fifo_.data(),
+            interleaved_input_.data(), static_cast<int>(engine_frames),
+            static_cast<int>(input_resample_fifo_frames_), 0);
+        const auto safe_input_frames_used = std::min<std::size_t>(
+            static_cast<std::size_t>(std::max(input_frames_used, 0)),
+            input_resample_fifo_frames_);
+        input_resample_fifo_frames_ -= safe_input_frames_used;
+        std::memmove(input_resample_fifo_.data(),
+                     input_resample_fifo_.data() + safe_input_frames_used,
+                     input_resample_fifo_frames_ * sizeof(float));
+
+        std::fill_n(interleaved_output_.data(),
+                    engine_frames * static_cast<std::size_t>(output_channels), 0.0F);
+        const auto callback = callback_.load(std::memory_order_acquire);
+        if (callback != nullptr) {
+            auto* const user_data = callback_user_data_.load(std::memory_order_acquire);
+            AudioCallbackWorkBudget work_budget;
+            for_each_audio_callback_chunk(
+                static_cast<unsigned long>(engine_frames),
+                [&](unsigned long frame_offset, unsigned long chunk_frames) {
+                    const auto input_offset = static_cast<std::size_t>(frame_offset) *
+                                              static_cast<std::size_t>(input_channels);
+                    const auto output_offset = static_cast<std::size_t>(frame_offset) *
+                                               static_cast<std::size_t>(output_channels);
+                    callback(interleaved_input_.data() + input_offset,
+                             interleaved_output_.data() + output_offset, chunk_frames,
+                             user_data, work_budget);
+                });
+        }
+
+        for (int channel = 0; channel < output_channels; ++channel) {
+            auto& fifo = output_resample_fifo_[channel];
+            auto& fifo_frames = output_resample_fifo_frames_[channel];
+            if (fifo_frames + engine_frames > fifo.size()) {
+                output_resamplers_[channel].reset();
+                fifo_frames = 0;
+            }
+            for (std::size_t frame = 0; frame < engine_frames; ++frame) {
+                fifo[fifo_frames + frame] =
+                    interleaved_output_[frame * static_cast<std::size_t>(output_channels) +
+                                        static_cast<std::size_t>(channel)];
+            }
+            fifo_frames += engine_frames;
+
+            if (output_channel_data == nullptr || channel >= num_output_channels ||
+                output_channel_data[channel] == nullptr) {
+                continue;
+            }
+            const auto output_frames_used = output_resamplers_[channel].process(
+                engine_rate / device_sample_rate_, fifo.data(), output_channel_data[channel],
+                static_cast<int>(device_frames), static_cast<int>(fifo_frames), 0);
+            const auto safe_output_frames_used = std::min<std::size_t>(
+                static_cast<std::size_t>(std::max(output_frames_used, 0)), fifo_frames);
+            fifo_frames -= safe_output_frames_used;
+            std::memmove(fifo.data(), fifo.data() + safe_output_frames_used,
+                         fifo_frames * sizeof(float));
+        }
+        return;
+    }
+
+    const auto frames_to_process =
+        std::min<std::size_t>(static_cast<std::size_t>(safe_num_samples),
+                              callback_frame_capacity_);
     if (frames_to_process == 0) {
         return;
     }
@@ -432,7 +528,7 @@ void JuceAudioBackend::audioDeviceAboutToStart(juce::AudioIODevice* device) {
     if (device != nullptr) {
         const auto current_buffer_size = device->getCurrentBufferSizeSamples();
         actual_buffer_frames_.store(current_buffer_size, std::memory_order_release);
-        prepare_callback_buffers(current_buffer_size);
+        configure_rate_conversion(device->getCurrentSampleRate(), current_buffer_size);
     }
 }
 
@@ -576,12 +672,40 @@ JuceAudioBackend::DeviceCapabilities JuceAudioBackend::query_device_capabilities
 }
 
 void JuceAudioBackend::prepare_callback_buffers(int frame_count) {
-    const auto frames = static_cast<std::size_t>(std::max(frame_count, 0));
-    callback_frame_capacity_ = frames;
-    interleaved_input_.resize(frames *
+    const auto device_frames = static_cast<std::size_t>(std::max(frame_count, 0));
+    const auto engine_rate = static_cast<double>(std::max(current_config_.sample_rate, 1));
+    const auto engine_frames = rate_conversion_active_
+                                   ? static_cast<std::size_t>(std::ceil(
+                                         static_cast<double>(device_frames) * engine_rate /
+                                         device_sample_rate_)) + 8
+                                   : device_frames;
+    callback_frame_capacity_ = engine_frames;
+    interleaved_input_.resize(engine_frames *
                               static_cast<std::size_t>(
                                   std::max(input_channel_count_.load(std::memory_order_acquire), 1)));
-    interleaved_output_.resize(frames *
+    interleaved_output_.resize(engine_frames *
                                static_cast<std::size_t>(
                                    std::max(output_channel_count_.load(std::memory_order_acquire), 1)));
+    device_input_.resize(device_frames);
+    input_resample_fifo_.resize(device_frames * 2 + 16);
+    for (auto& fifo : output_resample_fifo_) {
+        fifo.resize(engine_frames * 2 + 16);
+    }
+}
+
+void JuceAudioBackend::configure_rate_conversion(double device_sample_rate,
+                                                  int device_frame_count) {
+    device_sample_rate_ = device_sample_rate > 0.0
+                              ? device_sample_rate
+                              : static_cast<double>(current_config_.sample_rate);
+    rate_conversion_active_ =
+        std::abs(device_sample_rate_ - static_cast<double>(current_config_.sample_rate)) >= 0.5;
+    engine_frame_remainder_ = 0.0;
+    input_resample_fifo_frames_ = 0;
+    output_resample_fifo_frames_[0] = 0;
+    output_resample_fifo_frames_[1] = 0;
+    input_resampler_.reset();
+    output_resamplers_[0].reset();
+    output_resamplers_[1].reset();
+    prepare_callback_buffers(device_frame_count);
 }

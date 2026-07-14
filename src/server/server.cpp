@@ -23,6 +23,12 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#endif
+
 #include <asio.hpp>
 #include <asio/buffer.hpp>
 #include <asio/io_context.hpp>
@@ -104,6 +110,53 @@ static void append_unique_address(std::vector<std::string>& addresses,
 
 static std::vector<std::string> lan_ipv4_addresses(asio::io_context& io_context) {
     std::vector<std::string> addresses;
+#if defined(__APPLE__)
+    (void)io_context;
+
+    struct InterfaceAddress {
+        std::string interface_name;
+        std::string address;
+    };
+    std::vector<InterfaceAddress> candidates;
+    ifaddrs* interfaces = nullptr;
+    if (getifaddrs(&interfaces) != 0 || interfaces == nullptr) {
+        return addresses;
+    }
+
+    for (auto* interface = interfaces; interface != nullptr; interface = interface->ifa_next) {
+        if (interface->ifa_addr == nullptr || interface->ifa_addr->sa_family != AF_INET ||
+            (interface->ifa_flags & IFF_UP) == 0 ||
+            (interface->ifa_flags & (IFF_LOOPBACK | IFF_POINTOPOINT)) != 0) {
+            continue;
+        }
+
+        const auto* socket_address =
+            reinterpret_cast<const sockaddr_in*>(interface->ifa_addr);
+        const auto ipv4 = asio::ip::address_v4(ntohl(socket_address->sin_addr.s_addr));
+        if (!is_lan_ipv4(ipv4)) {
+            continue;
+        }
+        candidates.push_back({interface->ifa_name != nullptr ? interface->ifa_name : "",
+                              ipv4.to_string()});
+    }
+    freeifaddrs(interfaces);
+
+    // macOS physical network devices use en* names. Put Wi-Fi/Ethernet ahead
+    // of virtual bridge interfaces while still reporting every usable LAN IP.
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const InterfaceAddress& lhs, const InterfaceAddress& rhs) {
+                         const bool lhs_physical = lhs.interface_name.starts_with("en");
+                         const bool rhs_physical = rhs.interface_name.starts_with("en");
+                         if (lhs_physical != rhs_physical) {
+                             return lhs_physical;
+                         }
+                         return lhs.interface_name < rhs.interface_name;
+                     });
+    for (auto& candidate : candidates) {
+        append_unique_address(addresses, std::move(candidate.address));
+    }
+    return addresses;
+#else
     std::error_code ec;
     const auto hostname = asio::ip::host_name(ec);
     if (ec || hostname.empty()) {
@@ -127,6 +180,7 @@ static std::vector<std::string> lan_ipv4_addresses(asio::io_context& io_context)
         }
     }
     return addresses;
+#endif
 }
 
 static void log_server_addresses(asio::io_context& io_context, uint16_t port) {

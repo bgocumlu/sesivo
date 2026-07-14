@@ -2,6 +2,7 @@
 
 #include "audio_backend.h"
 
+#include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_events/juce_events.h>
 
@@ -66,6 +67,7 @@ private:
     DeviceCapabilities query_device_capabilities(juce::AudioIODeviceType& type,
                                                  const juce::String& device_name,
                                                  bool input);
+    void configure_rate_conversion(double device_sample_rate, int device_frame_count);
     void prepare_callback_buffers(int frame_count);
 
     JuceRuntime juce_runtime_;
@@ -77,6 +79,16 @@ private:
     std::atomic<void*> callback_user_data_{nullptr};
     std::vector<float> interleaved_input_;
     std::vector<float> interleaved_output_;
+    std::vector<float> device_input_;
+    std::vector<float> input_resample_fifo_;
+    std::vector<float> output_resample_fifo_[2];
+    std::size_t input_resample_fifo_frames_ = 0;
+    std::size_t output_resample_fifo_frames_[2] = {0, 0};
+    juce::LagrangeInterpolator input_resampler_;
+    juce::LagrangeInterpolator output_resamplers_[2];
+    double device_sample_rate_ = AudioConfig::DEFAULT_SAMPLE_RATE;
+    double engine_frame_remainder_ = 0.0;
+    bool rate_conversion_active_ = false;
     std::atomic<int> input_channel_count_{0};
     std::atomic<int> opened_input_channel_count_{0};
     std::atomic<int> selected_input_channel_{0};

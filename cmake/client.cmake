@@ -116,11 +116,6 @@ if(APPLE)
     )
 endif()
 
-add_executable(ui_style_sandbox
-    ${JAM_CLIENT_DIR}/ui_style_sandbox.cpp
-)
-jam_add_project_includes(ui_style_sandbox)
-
 target_compile_definitions(client PRIVATE
     JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1
     JUCE_ASIO=${JUCE_CLIENT_ENABLE_ASIO}
@@ -129,12 +124,6 @@ target_compile_definitions(client PRIVATE
     JUCE_JACK=${JUCE_CLIENT_ENABLE_JACK}
     JUCE_ALSA=1
     JUCE_USE_ANDROID_OBOE=1
-    JUCE_WEB_BROWSER=0
-    JUCE_USE_CURL=0
-)
-
-target_compile_definitions(ui_style_sandbox PRIVATE
-    JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
 )
@@ -154,12 +143,6 @@ target_link_libraries(client PRIVATE
     token_crypto
     juce::juce_audio_devices
     juce::juce_audio_basics
-    juce::juce_core
-    juce::juce_events
-    juce::juce_gui_basics
-)
-
-target_link_libraries(ui_style_sandbox PRIVATE
     juce::juce_core
     juce::juce_events
     juce::juce_gui_basics

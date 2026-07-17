@@ -15,5 +15,6 @@
 
 - The downloads page provides the latest macOS and Windows app downloads.
 - Current direct downloads are `sesivo-0.5.1-macos-arm64.dmg` and `sesivo-0.5.1-windows-x64-portable.zip`.
+- Linux x64 and ARM64 users can self-host a Sesivo server; see the Docs for installation instructions.
 - The homepage uses `assets/session.png` as the current app screenshot.
 - Use the GitHub repository for the latest source code and project details.

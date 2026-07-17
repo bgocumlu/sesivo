@@ -79,8 +79,6 @@ endif()
 unset(_JAM_PRE_FETCH_BUILD_TESTING)
 unset(_JAM_PRE_FETCH_BUILD_TESTING_DEFINED)
 
-target_compile_definitions(spdlog PUBLIC SPDLOG_USE_STD_FORMAT)
-
 # ============================================================
 # Common Wrappers
 # ============================================================

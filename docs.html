@@ -52,6 +52,12 @@
       <p><a href="https://github.com/bgocumlu/sesivo">GitHub repository</a></p>
       <h2>Build</h2>
       <p>Build with CMake. Run tests with CTest. Releases include macOS and Windows desktop builds.</p>
+      <h2>Host a server on Linux</h2>
+      <p>On a systemd-based x64 or ARM64 server, download and run the installer:</p>
+      <pre><code>curl -fsSLO https://raw.githubusercontent.com/bgocumlu/sesivo/main/tools/install-server.sh
+sudo bash install-server.sh</code></pre>
+      <p>Allow and forward UDP port <code>9999</code>, then check the service with <code>systemctl status sesivo-server</code>.</p>
+      <p>To list your server in Sesivo, add its name, public address, and port to <a href="https://github.com/bgocumlu/sesivo/blob/gh-pages/api/servers.json"><code>api/servers.json</code></a> and open a pull request.</p>
       <p><a href="info.json">Site information JSON</a></p>
     </main>
   </body>

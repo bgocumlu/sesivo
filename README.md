@@ -1,7 +1,5 @@
 # Sesivo
 
-[Documentation](docs/README.md)
-
 ```sh
 cmake -B build
 cmake --build build --config Release

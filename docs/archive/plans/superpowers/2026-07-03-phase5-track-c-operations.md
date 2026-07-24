@@ -185,7 +185,7 @@ Expected: all registered tests pass.
 Commit:
 
 ```powershell
-git add server_metrics.h server_metrics_self_test.cpp server.cpp CMakeLists.txt docs/superpowers/plans/2026-07-03-phase5-track-c-operations.md
+git add server_metrics.h server_metrics_self_test.cpp server.cpp CMakeLists.txt docs/archive/plans/superpowers/2026-07-03-phase5-track-c-operations.md
 git commit -m "feat: export server metrics as jsonl"
 ```
 

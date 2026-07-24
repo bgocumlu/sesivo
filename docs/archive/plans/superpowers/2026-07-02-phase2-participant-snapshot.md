@@ -551,7 +551,7 @@ git commit -m "Publish participant info snapshots"
 
 **Files:**
 - Modify: `LOW_LATENCY_ACTION_PLAN.md:56-72`
-- Modify: `docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md`
+- Modify: `docs/archive/plans/superpowers/2026-07-02-phase2-participant-snapshot.md`
 
 **Interfaces:**
 - Consumes: Tasks 1 and 2 implementation.
@@ -631,7 +631,7 @@ Append a short "Execution Evidence" section to this file with the exact command 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add LOW_LATENCY_ACTION_PLAN.md docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md
+git add LOW_LATENCY_ACTION_PLAN.md docs/archive/plans/superpowers/2026-07-02-phase2-participant-snapshot.md
 git commit -m "Mark Phase 2 participant snapshots done"
 ```
 

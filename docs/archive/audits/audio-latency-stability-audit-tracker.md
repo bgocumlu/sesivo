@@ -1,6 +1,6 @@
 # Audio Latency / Stability Audit Tracker
 
-Source audit: `docs/audio-latency-stability-audit.md`
+Source audit: `docs/archive/audits/audio-latency-stability-audit.md`
 
 Use this file as the live execution board. A finding is complete only when its
 checkbox is checked and its status is `VERIFIED` or `ACCEPTED`.

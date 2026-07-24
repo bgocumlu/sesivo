@@ -1,22 +1,26 @@
 # Latency Measurement
 
-This turns latency and audio-quality claims into artifacts. CI verifies only the
-parser and harness logic; acoustic, impairment, and soak runs still require a
-machine with real or virtual audio routing.
+This turns latency and audio-quality claims into local, reviewable artifacts.
+Acoustic, impairment, and soak runs still require a machine with real or
+virtual audio routing.
 
-## CI Gate
+## Local Tool Check
 
-CI configures with `-DJAM_BUILD_TESTS=ON` and runs:
+Run the parser and synthetic-fixture self-test directly:
 
 ```powershell
-ctest --test-dir build -C Release --output-on-failure --no-tests=error
+node tools/latency-measurement.mjs self-test
 ```
 
-This prevents the old zero-test pass.
+It is also registered in CTest when the project is configured with
+`-DJAM_BUILD_TESTS=ON`:
 
-The CI self-test completes in well under one second because it uses synthetic
-WAV/log fixtures. It does not run the acoustic loopback, network impairment
-matrix, or 60 minute drift soak.
+```powershell
+ctest --test-dir build -C Release -R latency_measurement_tool_self_test --output-on-failure --no-tests=error
+```
+
+The self-test uses synthetic WAV and log fixtures. It does not run acoustic
+loopback, network impairment, or the 60-minute drift soak.
 
 ## Acoustic Loopback
 
@@ -127,5 +131,5 @@ node tools/latency-measurement.mjs matrix `
 ```
 
 `validation_logs/` is git-ignored. Keep raw recordings and logs there locally;
-copy accepted summaries into a tracked report path, or attach them to the CI/run
-artifact, when a measurement run needs to be preserved.
+copy accepted summaries into a tracked evidence document or attach them to the
+relevant work item or release record when a measurement run must be preserved.

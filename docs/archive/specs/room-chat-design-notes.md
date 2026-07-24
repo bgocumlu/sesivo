@@ -1,6 +1,6 @@
 # Room Chat Design
 
-Status: Final scoped design, not implemented.
+Status: Implemented by `7793728`; archived as the implementation design.
 
 ## Goals
 

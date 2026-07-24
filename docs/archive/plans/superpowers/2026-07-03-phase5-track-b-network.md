@@ -424,7 +424,7 @@ git commit -m "feat: enable udp qos and dual-stack sockets"
 Add Track B to the detailed plans list:
 
 ```markdown
-- Phase 5 Track B: `docs/superpowers/plans/2026-07-03-phase5-track-b-network.md` (written)
+- Phase 5 Track B: `docs/archive/plans/superpowers/2026-07-03-phase5-track-b-network.md` (written)
 ```
 
 - [ ] **Step 2: Mark Track B done**

@@ -24,6 +24,6 @@ compatibility contract, and no need to keep old protocol behavior alive.
 
 ## Scope Hygiene
 
-- Ignore `archive/`, historical specs/plans, and validation artifacts unless the
-  user specifically asks to edit them.
+- Ignore `docs/archive/`, historical specs/plans, and validation artifacts
+  unless the user specifically asks to edit them.
 - Do not preserve code only because old docs mention it.

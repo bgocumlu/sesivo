@@ -2,7 +2,7 @@
 
 Date: 2026-07-02 (rev b: corrected device-buffer default after cross-review — the client requests 120 frames, not 240; see the "Defaults" finding)
 Scope: `main` @ `23aebf8` ("Build native release dependencies statically"), Windows 11, fresh Release build.
-Method: full source read of the hot paths (`client.cpp`, `server.cpp`, `participant_info.h`, `participant_manager.h`, `juce_audio_backend.cpp`, `opus_encoder.h`, `opus_decoder.h`, `logger.h`, `jitter_policy.h`, `protocol.h`), pattern sweeps for locks/sleeps/allocations, a full Release build, and a full `ctest` run (31/31 pass). Older artifacts (`docs/audio-latency-stability-audit.md` @ `b539a85`, `archive/`) were treated as historical claims and re-verified against HEAD, not trusted.
+Method: full source read of the hot paths (`client.cpp`, `server.cpp`, `participant_info.h`, `participant_manager.h`, `juce_audio_backend.cpp`, `opus_encoder.h`, `opus_decoder.h`, `logger.h`, `jitter_policy.h`, `protocol.h`), pattern sweeps for locks/sleeps/allocations, a full Release build, and a full `ctest` run (31/31 pass). Older artifacts (`docs/archive/audits/audio-latency-stability-audit.md` @ `b539a85`, `docs/archive/`) were treated as historical claims and re-verified against HEAD, not trusted.
 
 Important context: the 2026-06-12 audit's critical findings (rate-controller targeting `queue_limit/2`, gap-wait of ~32 callbacks, packet-denominated jitter defaults, upward-only auto-jitter ratchet) are **genuinely fixed at HEAD** — I verified this in code, not just in the tracker: the playout rate controller now targets the jitter floor with a ±1-packet deadband and a ±0.5 % clamp (`client.cpp:2190-2233`), gap-wait is one packet interval (`client.cpp:2437-2446`), the queue is trimmed to `target + 3` (`client.cpp:2576-2606`), PLC runs are capped at 2 (`protocol.h:31`), and defaults are ms-denominated (20 ms jitter floor, 120 ms age limit, `protocol.h:23,32`). This audit is about what is *still* in the way.
 
@@ -158,7 +158,7 @@ What blocks production: no CI, no transport authentication/encryption (identity 
 ### [Low] Repo/runtime hygiene
 - Severity: Low
 - Category: Production readiness
-- Evidence: stale root artifacts `server-watch-20260606-*.log` (106 KB), `imgui.ini`, `validation_logs/`, `archive/` (all untracked — `git ls-files` confirms none are committed); 20+ stale branches; sockets are IPv4-only (`client.cpp:254`, `server.cpp:86` — `udp::v4()`); logger `flush_every(3s)` thread and JUCE runtime intentionally leaked at exit (`juce_audio_backend.cpp:26-31`, commented, acceptable).
+- Evidence: stale root artifacts `server-watch-20260606-*.log` (106 KB), `imgui.ini`, `validation_logs/`, `docs/archive/`; 20+ stale branches; sockets are IPv4-only (`client.cpp:254`, `server.cpp:86` — `udp::v4()`); logger `flush_every(3s)` thread and JUCE runtime intentionally leaked at exit (`juce_audio_backend.cpp:26-31`, commented, acceptable).
 - Why it matters: IPv6 absence will bite CGNAT/mobile users; stale artifacts mislead future audits (this one included, by design of the exercise).
 - Recommendation: delete/relocate stale artifacts, prune branches, add dual-stack socket support when hosting matters.
 - Effort: Small

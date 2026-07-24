@@ -1,80 +1,91 @@
-# Client/Server Critical Hardening Notes
+# Client/server hardening notes
 
-Status: critical abuse risks to track if the current ephemeral-room design is
-kept.
+Status: reviewed against `main` on 2026-07-24.
 
-Scope: this document is only about abusable user-originated network traffic to
-the server. It does not cover room visibility, private rooms, accounts, durable
-identity, or long-term moderation systems.
+This tracks current server-abuse and control-plane hardening work. It is not a
+protocol compatibility document.
 
-## Current Risk Level
+## Current protections
 
-- Small trusted use: low to moderate risk.
-- Public internet use: moderate to high abuse risk.
-- Strong secrecy claims: out of scope for now.
+- Authenticated audio has protocol-aware rate limiting that preserves valid
+  low-latency traffic while bounding floods.
+- Status, room-control, general control, chat-send, secure-control, and unknown
+  endpoint traffic use separate rate limits.
+- Rate-limiter state and unknown-endpoint tracking are bounded to 4096
+  endpoints and expire inactive entries.
+- Each room is capped at the current supported envelope of 32 participants.
+- Audio and room chat use authenticated encryption for signed sessions. Chat
+  has separate key derivation, fixed plaintext/ciphertext limits, a bounded
+  server history, and send-rate limiting.
+- Signed join tokens, secure packet nonces, and replay tracking protect the
+  authenticated session paths they cover.
+- Room admin authority uses a server-generated bearer token whose hash is
+  stored by the server.
+- Fixed packet structures and bounded relay pools constrain per-packet memory
+  use on the media path.
 
-The main concern is not valuable stored data or network-path packet sniffing.
-The main concern is attackers making the server noisy, expensive, unstable, or
-bad for low-latency audio.
+## Open priorities
 
-## Critical Items
+### 1. Global resource ceilings
 
-1. Abuse / DoS from UDP control traffic
+Per-room, endpoint, and rate-limiter limits exist, but the server still needs
+reviewed hard ceilings for:
 
-   Public clients can spam status, create-room, join-token, JOIN, admin, chat,
-   metronome, and invalid packets. Existing rate limits help, but public use
-   needs tighter per-command limits and quieter repeated-invalid-packet logging.
+- Total connected clients.
+- Total rooms.
+- Pending or empty rooms.
+- Aggregate retained room state.
 
-2. Resource exhaustion
+Enforce limits before expensive room or client setup. Rejections must remain
+cheap and rate-limited.
 
-   Add hard caps for total rooms, pending empty rooms, total clients,
-   participants per room, unknown endpoints, and rate-limiter entries. Set the
-   participant cap to 7 per room and enforce it before accepting a join/token
-   request so audio relay work stays predictable. Without global caps, public
-   source-port churn or room creation can grow server memory and work.
+### 2. Text and fixed-field validation
 
-3. User input weirdness
+Review every user-controlled room name, display name, profile id, invite field,
+chat field, server address, and fixed string before storing, logging,
+forwarding, or displaying it.
 
-   Fixed packet sizes prevent simple oversized-field overflow, but long or
-   malformed names can still be truncated or displayed/logged badly. Room name,
-   display name, room password, chat text, invite text, server address, and all
-   fixed string fields should have explicit limits and should be rejected when
-   overlong or malformed.
+Current byte-size bounds are not a complete text-validation policy. Define and
+test the current contract for:
 
-   Allow Unicode display text, but reject invalid UTF-8, null bytes, control
-   characters, terminal escape sequences, and bidi override controls before
-   storing, logging, forwarding, or displaying it.
+- Invalid UTF-8.
+- Embedded nulls.
+- Control and terminal-escape characters.
+- Bidirectional override controls.
+- Truncation versus rejection.
 
-4. UDP reflection and amplification
+### 3. Reflection, amplification, and noisy failures
 
-   Small unauthenticated requests can cause larger server responses, especially
-   server status responses and room-control errors. Public servers should rate
-   limit these paths, cap response sizes, and avoid producing repeated large
-   responses for unauthenticated abusive traffic.
+Re-audit unauthenticated and invalid request paths for response amplification.
+Status and room-control responses should remain bounded and separately
+rate-limited. Repeated invalid traffic must not produce unbounded logging or
+expensive formatting.
 
-5. Low-latency audio protection
+### 4. Control-plane security claims
 
-   Keep expensive checks out of the audio relay path and the client audio
-   callback. Enforce room and participant caps before accepting a client into a
-   room. Audio forwarding should stay limited to cheap packet validation,
-   endpoint lookup, and relay to the room's current participants.
+Do not make one broad secrecy claim for every UDP control path. Secure media
+and chat have stronger guarantees than room discovery and room-control
+metadata.
 
-## Accepted Limitations
+The room password hash acts as a bearer value on the current room-control path.
+The room admin token is also bearer authority. Neither value may be logged,
+echoed to unrelated clients, placed in invites, or exposed through metrics.
 
-- Network-path packet sniffing and replay are out of scope for now. This app is
-  not a banking app and should not be described as secure against someone who
-  can observe client/server traffic.
-- The client does not send the plaintext room password. It sends
-  `SHA-256(password)` as `password_hash`, and that hash currently acts like the
-  password on the room-control UDP path. Never log or echo it.
-- Each room has one server-generated admin bearer token. The server stores only
-  a hash and returns the plaintext token once in the create-room response. Never
-  log, echo, or include the admin token in invites.
+If stronger private-room control security becomes a product requirement,
+design it as a clean current protocol rather than adding a legacy fallback.
 
-## Acceptable For Now
+### 5. Protect the realtime path
 
-- Kick-only moderation is acceptable for the current design.
-- Weak room passwords are acceptable for ephemeral casual rooms as long as they
-  are length-bounded and not described as strong security.
-- Full encrypted room-control transport or PAKE-style password auth can wait if
-  the app is positioned as ephemeral casual rooms, not secure private rooms.
+New validation, abuse accounting, chat work, metrics, and logging must stay out
+of the client audio callback and the server relay hot path. Capacity rejection
+belongs at admission boundaries. Media forwarding should remain bounded packet
+validation, endpoint lookup, and fan-out to the current room snapshot.
+
+## Current accepted limits
+
+- The supported room capacity is 32 participants, matching the current
+  low-latency operating envelope.
+- Room state and chat history are ephemeral and memory-only.
+- There is no ICE, STUN, TURN, or TCP media fallback.
+- Full account, moderation, durable identity, and permanent chat systems are
+  outside the current product scope.

@@ -366,7 +366,7 @@ All commands were read-only inspection commands. No build, test executable, pack
 
 1. `Get-ChildItem -Force` — list repository root contents.
 2. `git status --short --branch` — establish branch/worktree state before inspection.
-3. `rg --files -g '!archive/**' -g '!LOW_LATENCY_AUDIT.md'` — inventory current files while excluding archives and the report.
+3. `rg --files -g '!docs/archive/**' -g '!LOW_LATENCY_AUDIT.md'` — inventory current files while excluding archives and the report.
 4. `rg -n "^" AGENTS.md CMakeLists.txt cmake\common.cmake cmake\client.cmake cmake\server.cmake` — inspect repository/build instructions with line numbers.
 5. `rg -n "add_executable|add_library|add_test|target_link_libraries|find_package|FetchContent|option\(" CMakeLists.txt cmake src tests -g '*.cmake' -g 'CMakeLists.txt' -g '*.cpp' -g '*.h'` — map targets, dependencies, and tests.
 6. `Get-ChildItem src,tests,tools -Recurse -File | Where-Object { $_.Extension -in '.cpp','.h','.mjs','.ps1' } | Sort-Object FullName | Select-Object FullName,Length` — size and enumerate current source/test/tool files.

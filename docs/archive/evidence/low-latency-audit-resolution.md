@@ -1,7 +1,7 @@
 # Low-latency audit resolution map
 
 This maps the findings maintained in
-`archive/md-artifacts/root/LOW_LATENCY_AUDIT_2026-07-14.md` to the current implementation and evidence.
+`docs/archive/audits/LOW_LATENCY_AUDIT_2026-07-14.md` to the current implementation and evidence.
 “Real gate” means the scenario requires physical hardware or a real network. Those gates are
 marked `NOT RUN` and block production readiness until measured evidence passes.
 

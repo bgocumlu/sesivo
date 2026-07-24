@@ -5,7 +5,7 @@ Date: 2026-07-14. Branch: `low-latency-audit-fixes`. Configuration: Release.
 Host: Windows 11 Pro 10.0.26200 x64, Intel Core Ultra 9 285K (24 cores / 24 logical
 processors), 48 GB RAM. The configured client artifact reported JUCE ASIO enabled and JACK
 disabled. No physical audio interface or real WAN was exercised; those rows are recorded in
-`archive/md-artifacts/root/REAL_NETWORK_VALIDATION_2026-07-14.md` as `NOT RUN`
+`docs/archive/evidence/REAL_NETWORK_VALIDATION_2026-07-14.md` as `NOT RUN`
 and remain production blockers.
 
 ## Automated results

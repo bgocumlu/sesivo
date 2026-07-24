@@ -2,20 +2,20 @@
 
 Source: `LOW_LATENCY_AUDIT.md` rev b, verified against `main` at `23aebf8`.
 Structure: this file is the phase tracker. Each phase gets its own detailed, executable
-implementation plan under `docs/superpowers/plans/` when it is next up; phases are not
+implementation plan under `docs/archive/plans/superpowers/` when it is next up; phases are not
 executed from this file directly.
 
 Detailed plans:
 
-- Phase 0 + 1: `docs/superpowers/plans/2026-07-02-phase0-1-ci-rt-safety.md` (written)
-- Phase 2: `docs/superpowers/plans/2026-07-02-phase2-participant-snapshot.md` (written)
-- Phase 5 Track A: `docs/superpowers/plans/2026-07-03-phase5-track-a-security.md` (written)
-- Phase 5 Track B: `docs/superpowers/plans/2026-07-03-phase5-track-b-network.md` (written)
-- Phase 5 Track C: `docs/superpowers/plans/2026-07-03-phase5-track-c-operations.md` (written)
-- Phase 5 Track D: `docs/superpowers/plans/2026-07-03-phase5-track-d-testing.md` (written)
-- Phase 5 Track E: `docs/superpowers/plans/2026-07-03-phase5-track-e-devices.md` (written)
+- Phase 0 + 1: `docs/archive/plans/superpowers/2026-07-02-phase0-1-ci-rt-safety.md` (written)
+- Phase 2: `docs/archive/plans/superpowers/2026-07-02-phase2-participant-snapshot.md` (written)
+- Phase 5 Track A: `docs/archive/plans/superpowers/2026-07-03-phase5-track-a-security.md` (written)
+- Phase 5 Track B: `docs/archive/plans/superpowers/2026-07-03-phase5-track-b-network.md` (written)
+- Phase 5 Track C: `docs/archive/plans/superpowers/2026-07-03-phase5-track-c-operations.md` (written)
+- Phase 5 Track D: `docs/archive/plans/superpowers/2026-07-03-phase5-track-d-testing.md` (written)
+- Phase 5 Track E: `docs/archive/plans/superpowers/2026-07-03-phase5-track-e-devices.md` (written)
 - Ready-to-paste prompts for the sessions that finish each phase:
-  `docs/superpowers/plans/2026-07-02-session-prompts.md`
+  `docs/archive/plans/superpowers/2026-07-02-session-prompts.md`
 
 ## Current State
 

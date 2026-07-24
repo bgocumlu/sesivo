@@ -890,7 +890,7 @@ Expected: build succeeds, device inventory prints, and commit succeeds.
 ## Task 6: Validation Matrix
 
 **Files:**
-- Modify: `archive/md-artifacts/root/LOW_LATENCY_AUDIO_AUDIT.md` if validation results are recorded.
+- Modify: `docs/archive/audits/LOW_LATENCY_AUDIO_AUDIT.md` if validation results are recorded.
 
 - [ ] **Step 1: Run local automated checks**
 
@@ -965,7 +965,7 @@ Expected: all checks pass.
 
 - [ ] **Step 5: Record validation notes if needed**
 
-If validation is recorded in the audit file, append a dated section to `archive/md-artifacts/root/LOW_LATENCY_AUDIO_AUDIT.md` with:
+If validation is recorded in the audit file, append a dated section to `docs/archive/audits/LOW_LATENCY_AUDIO_AUDIT.md` with:
 
 ```markdown
 ### 2026-06-05 JUCE Audio Backend Validation
